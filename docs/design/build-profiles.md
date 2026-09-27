@@ -4,6 +4,14 @@
 
 Keep ordinary tensor4all-rs development and verification builds small while retaining an explicit full-debug release profile for debugger sessions and detailed Rust diagnostics through Tensor4all.jl or the C API.
 
+## Workspace dependency lock
+
+Commit the root `Cargo.lock` to keep workspace CI and contributor builds on the
+same resolved dependency graph, and pass `--locked` to CI Cargo build and test
+commands. Refresh dependency versions deliberately with `cargo update` in a
+reviewed change. The lockfile governs this workspace; downstream projects that
+depend on an individual tensor4all crate continue to resolve their own graph.
+
 ## Profile contract
 
 Ordinary profiles generate no Rust debug information:
@@ -52,6 +60,21 @@ strip = "symbols"
 Run release-equivalent CI tests locally with `cargo test --profile ci` or
 `cargo nextest run --cargo-profile ci`. Coverage remains on its
 instrumentation-owned profile and does not use `ci`.
+
+Coverage includes ordinary library artifacts, including the C API shared
+library. Check the full C API package, including unit and integration tests,
+when validating coverage locally:
+
+```bash
+cargo llvm-cov nextest --locked --release -p tensor4all-capi --json --output-path coverage.json
+```
+
+C API entry points use `#[cfg_attr(not(test), unsafe(no_mangle))]`. This retains
+C ABI symbols in the ordinary library while giving unit-test functions distinct
+symbols, so LLVM can combine both builds without collisions between coverage
+records. Integration tests exercise the ordinary library through its public
+boundary; unit tests also cover private validation and error paths. Hosted
+workspace coverage and the unchanged per-file thresholds remain authoritative.
 
 ## Rationale
 
