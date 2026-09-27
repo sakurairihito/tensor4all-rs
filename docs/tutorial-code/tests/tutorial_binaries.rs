@@ -19,7 +19,9 @@ fn scratch_dir(name: &str) -> PathBuf {
 
 fn run_binary(binary_path: &str, data_dir: &Path, extra_env: &[(&str, &str)]) {
     let mut command = Command::new(binary_path);
-    command.env("TENSOR4ALL_DATA_DIR", data_dir);
+    command
+        .env("TENSOR4ALL_DATA_DIR", data_dir)
+        .env_remove("QTT_R_SWEEP_MAX_BITS");
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -97,7 +99,7 @@ fn tutorial_binaries_run_current_api_flows() -> Result<(), Box<dyn Error>> {
         TutorialBinary {
             name: "qtt_r_sweep",
             path: env!("CARGO_BIN_EXE_qtt_r_sweep"),
-            env: &[],
+            env: &[("QTT_R_SWEEP_MAX_BITS", "10")],
             expected_csvs: &["qtt_r_sweep_samples.csv", "qtt_r_sweep_stats.csv"],
         },
         TutorialBinary {
@@ -186,5 +188,85 @@ fn tutorial_binaries_run_current_api_flows() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    Ok(())
+}
+
+#[test]
+fn qtt_r_sweep_depth_override_validates_bounds() -> Result<(), Box<dyn Error>> {
+    let binary = env!("CARGO_BIN_EXE_qtt_r_sweep");
+    let data_dir = scratch_dir("qtt_r_sweep_bounds");
+    for value in ["not-an-integer", "0", "16"] {
+        let output = Command::new(binary)
+            .env("TENSOR4ALL_DATA_DIR", &data_dir)
+            .env("QTT_R_SWEEP_MAX_BITS", value)
+            .output()?;
+        assert!(
+            !output.status.success(),
+            "accepted invalid bit depth {value}"
+        );
+        if value != "not-an-integer" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("must be in 2..=15"));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let output = Command::new(binary)
+            .env("TENSOR4ALL_DATA_DIR", &data_dir)
+            .env(
+                "QTT_R_SWEEP_MAX_BITS",
+                std::ffi::OsString::from_vec(vec![0xff]),
+            )
+            .output()?;
+        assert!(!output.status.success(), "accepted a non-UTF-8 bit depth");
+    }
+
+    run_binary(binary, &data_dir, &[("QTT_R_SWEEP_MAX_BITS", "2")]);
+    let stats = fs::read_to_string(data_dir.join("qtt_r_sweep_stats.csv"))?;
+    let rows: Vec<_> = stats.lines().collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the minimum depth produces one statistics row"
+    );
+    assert!(
+        rows[1].starts_with("2,4,"),
+        "R=2 must contain four grid points"
+    );
+    fs::remove_dir_all(data_dir)?;
+    Ok(())
+}
+
+#[test]
+fn qtt_r_sweep_defaults_to_full_depth() -> Result<(), Box<dyn Error>> {
+    let binary = env!("CARGO_BIN_EXE_qtt_r_sweep");
+    let data_dir = scratch_dir("qtt_r_sweep_default");
+
+    // The helper explicitly removes this variable before launching the binary,
+    // so this run exercises the documented default rather than inheriting a
+    // CI override from the parent process.
+    run_binary(binary, &data_dir, &[]);
+
+    let stats = fs::read_to_string(data_dir.join("qtt_r_sweep_stats.csv"))?;
+    let rows: Vec<_> = stats.lines().collect();
+    assert_eq!(
+        rows.len(),
+        15,
+        "the default sweep covers depths 2 through 15"
+    );
+    let final_row: Vec<_> = rows
+        .last()
+        .expect("depth-15 statistics row")
+        .split(',')
+        .take(2)
+        .collect();
+    assert_eq!(
+        final_row,
+        ["15", "32768"],
+        "the default sweep must emit its depth-15, 32768-point result"
+    );
+
+    fs::remove_dir_all(data_dir)?;
     Ok(())
 }
