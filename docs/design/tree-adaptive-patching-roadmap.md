@@ -55,9 +55,10 @@ Related prior work:
   on the full graph, does not recycle pivots, and accepts on error alone
   without requiring a converged termination. It is reference material for
   milestone M3, not a merge candidate as is.
-- A name search on `main` found no TreeTN element-wise (Hadamard) product
-  entry point and no contraction API that reports bond-cap saturation. Both
-  must be confirmed in M1.
+- TreeTN already provides an element-wise product,
+  `tensor4all_treetn::hadamard`, built on structured copy tensors. No
+  contraction API reports bond-cap saturation. Details are in
+  [tree-patching-m1-prerequisites.md](./tree-patching-m1-prerequisites.md).
 
 ## Milestones
 
@@ -85,19 +86,26 @@ approved design record for M2/M3.
 Outcome: the lower layers provide the primitives that patching needs, so the
 partitioned layer does not reach through or reimplement them.
 
-Scope:
+Scope (detailed plan:
+[tree-patching-m1-prerequisites.md](./tree-patching-m1-prerequisites.md)):
 
-- contraction (zip-up and fit) can report that a requested bond cap was
-  reached and optionally stop early, instead of completing a probe that is
-  then discarded;
-- a TreeTN element-wise (Hadamard) product on shared site indices, or a
-  documented diagonal-operator path with the same cost;
-- a compact representation for fixed sites: absorb nodes whose sites are all
-  fixed into a neighbor, or a structured copy-selector embedding analogous to
-  the chain implementation, so deep patches do not sweep dimension-one sites.
+- a contraction outcome API that reports realized ranks and cap saturation,
+  with opt-in early abort (zip-up first; fit after PR #656 is resolved);
+- the existing `hadamard` element-wise product is verified to work with that
+  outcome API (no new primitive);
+- fixed sites stay dimension-one TreeTCI vertices during interpolation, and
+  nodes are never removed, so every patch keeps the original topology;
+- a compact patch representation (projected indices removed instead of
+  masked) is evaluated behind a measurement gate and a robustness gate before
+  any change to the #648 invariant;
+- a result-preserving reorder in `contract_adaptive` skips the group sum when
+  a single contribution is already saturated;
+- sparse and block-sparse storage are evaluated and not adopted for this
+  roadmap.
 
-Exit: each primitive is available through the TreeTN public API with tests and
-rustdoc; missing pieces are filed as issues against the owning crate first.
+Exit: the outcome API and zip-up early abort are merged with tests,
+`contract_adaptive` uses them, and the compact-representation gates have a
+recorded result.
 
 ### M2. Interpolation engine seam (M)
 
@@ -138,7 +146,8 @@ Scope:
 - acceptance only for a converged patch within tolerance and strictly below
   the bond cap;
 - opt-in pivot recycling, per-patch deterministic seeds, sampled-zero policy,
-  and one-pass sample-cache transfer to children;
+  and a driver-level evaluation cache with one-pass transfer to children
+  (TreeTCI itself has no evaluation cache);
 - fixed-site handling through the M1 primitive.
 
 Exit: accepted patches reproduce the source function within the requested
@@ -179,7 +188,9 @@ Scope:
 - a pivot-based split heuristic generalized from the chain algorithm to tree
   edge bipartitions: fix a candidate site in the pivot multi-indices of the
   highest-rank edge, estimate the resulting ranks, and pick the cheapest site;
-- `ExactParameterGain` remains the algebra-side reference strategy;
+- `ExactParameterGain` remains the algebra-side reference strategy, but its
+  cost (about `L * d` truncations per split decision when `patch_order` is
+  empty) motivates a cheaper default for large patch counts;
 - a minimum patch size option and an in-loop merge of sibling patches, reusing
   the reconstruction merge logic.
 
@@ -197,7 +208,10 @@ Scope:
 - early abort at the bond cap through M1;
 - patched element-wise products that pair only overlapping patches;
 - refine only the input patches that contributed to unconverged output
-  patches, recompute only those outputs, then merge converged neighbors.
+  patches, recompute only those outputs, then merge converged neighbors;
+- a prefix-tree index over projectors, replacing pairwise disjointness
+  validation and `N_A * N_B` pair enumeration, and per-operation norm
+  caching.
 
 Exit: tests cover the worst, best, and general patch layouts; a benchmark
 reproduces the qualitative ordering of those layouts.
