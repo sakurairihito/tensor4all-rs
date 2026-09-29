@@ -206,7 +206,8 @@ meaning of `rtol` and `reference_scale`.
    reused for every patch: from all exact values when the root itself is
    handled exactly by step 8, otherwise from its candidate samples. An exact
    root never needs the scale, and an all-zero exact root returns an empty
-   partition with its projector in `zero_projectors`. A non-exact root with
+   partition with its projector in `zero_projectors`; if no `reference_scale`
+   was given, `report.reference_scale` is `0.0` in that case. A non-exact root with
    all candidate samples exactly zero cannot pin a scale and returns
    `InvalidInput` with the remedy to pass `reference_scale` or pivots in the
    support.
@@ -332,7 +333,8 @@ lineage through `tensor4all-partitionedtt`. The M2 PR:
 - A one-site patch whose local dimension exceeds `n_initial_pivots` and is
   nonzero at a single coordinate is accepted, not screened as zero, both below
   the root and as the root without `reference_scale` (the scale is pinned from
-  the exact values); an all-zero exact root returns an empty partition.
+  the exact values); an all-zero exact root returns an empty partition and,
+  without `reference_scale`, reports `reference_scale == 0.0`.
 - Random candidate coordinates follow the documented SplitMix64 and Lemire
   mapping (a fixed seed gives a fixed candidate list).
 - Reports are in canonical path order.
