@@ -89,10 +89,12 @@ partitioned layer does not reach through or reimplement them.
 Scope (detailed plan:
 [tree-patching-m1-prerequisites.md](./tree-patching-m1-prerequisites.md)):
 
-- a contraction outcome API that reports realized ranks and cap saturation,
-  with opt-in early abort (zip-up first; fit after PR #656 is resolved);
-- the existing `hadamard` element-wise product is verified to work with that
-  outcome API (no new primitive);
+- a contraction outcome API that reports final per-edge bond dimensions and
+  threshold saturation, with early abort on the tree zip-up path and post-hoc
+  detection elsewhere (design:
+  [treetn-contraction-outcome.md](./treetn-contraction-outcome.md));
+- the existing `hadamard` element-wise product needs no new primitive; its
+  outcome variant is deferred to M6;
 - fixed sites stay dimension-one TreeTCI vertices during interpolation, and
   nodes are never removed, so every patch keeps the original topology;
 - a compact patch representation (projected indices removed instead of

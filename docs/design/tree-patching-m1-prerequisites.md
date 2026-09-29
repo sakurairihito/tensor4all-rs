@@ -37,28 +37,33 @@ before implementation.
 
 ### Plan
 
+Design record: [treetn-contraction-outcome.md](./treetn-contraction-outcome.md).
+
 1. **Outcome API in treetn.** Add a contraction entry point that returns an
    outcome instead of a bare `TreeTN`: either a completed network with a
-   report (realized rank per edge, edges whose rank reached the cap), or a
-   saturated result naming the first saturated edge. The existing `contract`
+   report of final per-edge bond dimensions, or a saturated result naming the
+   first edge at or above a caller-given threshold. The existing `contract`
    keeps its signature and delegates to the new entry point.
-2. **Early abort.** An opt-in policy stops zip-up at the first edge whose
-   factorization reaches the cap. This is the case `contract_adaptive`
-   needs: a saturated probe is discarded anyway.
-3. **Method coverage.** Zip-up first, because it is the default and the
-   method used by partitioned contraction. Adaptive SRC maps naturally
-   (maximum rank reached before `rtol` is met). Fit is deferred: the open
-   draft PR #656 restructures `fit.rs`, and its fate should be settled first.
+2. **Early abort.** On the tree zip-up path, where each factorization rank is
+   the final link dimension, the contraction stops at the first edge that
+   reaches the threshold. This is the case `contract_adaptive` needs: a
+   saturated probe is discarded anyway.
+3. **Method coverage.** The chain zip-up path, Src, Naive, and Fit evaluate
+   saturation after completion in the first version: the chain path runs a
+   final truncation sweep, so its per-edge ranks are only upper bounds, and
+   Fit waits for the open draft PR #656, which restructures `fit.rs`.
 4. **Exact binding detection (optional, core).** Rank equal to the cap is a
    conservative saturation signal and can cause unnecessary splits when the
    true rank equals the cap. Exact detection needs core `factorize` to report
    whether the cap discarded nonzero weight. This is a core feature request,
    to be filed as an issue and implemented only if the conservative signal
    proves costly in M9 measurements.
-5. **Adopt in `contract_adaptive`.** Replace the post-hoc maximum-bond check
-   with the outcome API, keeping the project-first recursion unchanged.
+5. **Adopt in `contract_adaptive`.** Group pairs by output projector before
+   contracting, and for `Sequential` groups with a split candidate contract
+   with the patch cap as threshold, stopping at the first saturated pair. The
+   partition layout and values stay unchanged. Depends on #788 (PR #789).
 
-Exit: the outcome API and early abort for zip-up are merged with tests on
+Exit: the outcome API and tree-path early abort are merged with tests on
 chain and branched trees, including a test that an aborted probe performs
 fewer factorizations than a completed one; `contract_adaptive` uses it.
 
@@ -78,8 +83,9 @@ fewer factorizations than a completed one; `contract_adaptive` uses it.
 
 ### Plan
 
-- No new primitive. Confirm that `hadamard` forwards to the P1 outcome API so
-  patched element-wise products can abort early as well.
+- No new primitive. `hadamard` reaches `contraction::contract` through
+  `partial_contract`; an outcome variant for it is deferred to M6, when
+  patched element-wise products need it.
 - Patch compatibility for Hadamard pairs distinct index identities
   (`left_index`, `right_index`); the projector-matching rule for such pairs is
   an M6 design item, not an M1 item.
