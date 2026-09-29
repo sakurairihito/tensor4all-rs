@@ -24,7 +24,8 @@
 | [partitioned-treetn.md](./partitioned-treetn.md) | Issue #648 migration design for TreeTN-native eager partitioning and adaptive patching |
 | [tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md) | Milestone roadmap for adaptive patched interpolation, contraction, and parallel execution on arbitrary trees |
 | [treetn-contraction-outcome.md](./treetn-contraction-outcome.md) | Proposal: TreeTN contraction outcome report and rank-threshold early abort (tree patching M6) |
-| [tree-interpolation-engine-seam.md](./tree-interpolation-engine-seam.md) | Proposal: engine-agnostic tree interpolation contract in treetn and its TreeTCI implementation (tree patching M1) |
+| [tree-interpolation-engine-seam.md](./tree-interpolation-engine-seam.md) | Engine-agnostic tree interpolation contract in treetn and its TreeTCI implementation (tree patching M1, implemented) |
+| [tree-pqtci-driver.md](./tree-pqtci-driver.md) | Proposal: sequential adaptive patched interpolation driver in partitionedtreetn (tree patching M2) |
 | [tree-patching-findings.md](./tree-patching-findings.md) | Verified facts about current code used by the tree patching milestones: contraction reporting, element-wise product, fixed sites, patch representation, avoidable overhead, sparse storage decision |
 | [orthogonal-target-reconstruction.md](./orthogonal-target-reconstruction.md) | Fixed global L2 target, gain-driven reconstruction, superpositions, subset-QFT integration, and the level-coupled merge-refine schedule |
 | [gse-chain-mps-algorithm.md](./gse-chain-mps-algorithm.md) | Chain MPS global subspace expansion analysis for TreeTN GSE-TDVP planning |
