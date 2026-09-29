@@ -12,7 +12,9 @@
 //!
 //! Code that runs an engine (for example a patch driver) depends only on this
 //! module; each engine implements the trait in its own crate. The TreeTCI
-//! engine is `tensor4all_treetci::TreeTciInterpolator`.
+//! engine is `tensor4all_treetci::TreeTciInterpolator`. Such code checks its
+//! topology and sites with [`validate_layout`], the same checks
+//! [`InterpolationProblem::new`] performs.
 //!
 //! # Site order
 //!
@@ -150,7 +152,8 @@ where
     /// appears more than once or has dimension zero, there is no active site,
     /// `initial_pivots` is not a 2D array with one row per active site and at
     /// least one column, a pivot coordinate is out of range for its site, or
-    /// `absolute_tolerance` is negative or not finite.
+    /// `absolute_tolerance` is negative or not finite. The topology and site
+    /// checks are those of [`validate_layout`], which runs first.
     ///
     /// # Examples
     ///
@@ -185,9 +188,8 @@ where
         max_bond_dim: Option<NonZeroUsize>,
         seed: u64,
     ) -> Result<Self, InterpolationError> {
-        validate_topology(&topology, &node_sites)?;
+        validate_layout(&topology, &node_sites)?;
         let site_order = Self::derive_site_order(&node_sites);
-        validate_sites(&site_order)?;
         validate_pivots(&initial_pivots, &site_order)?;
         if !absolute_tolerance.is_finite() || absolute_tolerance < 0.0 {
             return Err(invalid(format!(
@@ -398,6 +400,78 @@ fn invalid(message: String) -> InterpolationError {
     InterpolationError::InvalidProblem { message }
 }
 
+/// Check the topology and site layout of an interpolation problem.
+///
+/// These are the layout checks of [`InterpolationProblem::new`], which calls
+/// this function, exposed so that callers such as a patch driver validate
+/// their inputs with the same code before any evaluation. The initial pivots
+/// and the tolerance are not part of the layout and are not checked here.
+///
+/// # Arguments
+///
+/// * `topology` - Tree topology with named nodes. Its node set must equal the
+///   keys of `node_sites`.
+/// * `node_sites` - Site indices of every node, possibly none for a node.
+///
+/// # Returns
+///
+/// `Ok(())` when the topology is a tree whose node set equals the keys of
+/// `node_sites`, every site index appears once (full identity: ID, tags, and
+/// prime level) with a positive dimension, and at least one site exists.
+///
+/// # Errors
+///
+/// Returns [`InterpolationError::InvalidProblem`] when the topology has no
+/// node, is not a tree (disconnected, or an edge count other than the node
+/// count minus one), or its node set differs from the keys of `node_sites`;
+/// when a site index appears more than once or has dimension zero; or when
+/// there is no site at all. The message names the violated condition.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use tensor4all_core::DynIndex;
+/// use tensor4all_treetn::interpolation::{validate_layout, InterpolationError};
+/// use tensor4all_treetn::NodeNameNetwork;
+///
+/// // A star whose center 0 has degree three; the center carries no site.
+/// let mut topology = NodeNameNetwork::new();
+/// for node in 0..4usize {
+///     topology.add_node(node)?;
+/// }
+/// for leaf in 1..4usize {
+///     topology.add_edge(&0, &leaf)?;
+/// }
+/// let sites: Vec<DynIndex> = (0..3).map(|_| DynIndex::new_dyn(2)).collect();
+/// let mut node_sites = BTreeMap::from([(0usize, vec![])]);
+/// for (leaf, site) in (1..4usize).zip(&sites) {
+///     node_sites.insert(leaf, vec![site.clone()]);
+/// }
+/// assert!(validate_layout(&topology, &node_sites).is_ok());
+///
+/// // The same full index on two nodes is rejected.
+/// node_sites.insert(0, vec![sites[0].clone()]);
+/// let error = validate_layout(&topology, &node_sites).unwrap_err();
+/// match error {
+///     InterpolationError::InvalidProblem { message } => {
+///         assert!(message.contains("appears more than once"));
+///     }
+///     other => panic!("unexpected error {other:?}"),
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn validate_layout<V>(
+    topology: &NodeNameNetwork<V>,
+    node_sites: &BTreeMap<V, Vec<DynIndex>>,
+) -> Result<(), InterpolationError>
+where
+    V: Clone + Hash + Eq + Ord + Debug + Send + Sync,
+{
+    validate_topology(topology, node_sites)?;
+    validate_sites(node_sites.values().flatten())
+}
+
 fn validate_topology<V>(
     topology: &NodeNameNetwork<V>,
     node_sites: &BTreeMap<V, Vec<DynIndex>>,
@@ -435,12 +509,9 @@ where
     Ok(())
 }
 
-fn validate_sites(site_order: &[DynIndex]) -> Result<(), InterpolationError> {
-    if site_order.is_empty() {
-        return Err(invalid("the problem has no active site".to_string()));
-    }
-    let mut seen = HashSet::with_capacity(site_order.len());
-    for site in site_order {
+fn validate_sites<'a>(sites: impl Iterator<Item = &'a DynIndex>) -> Result<(), InterpolationError> {
+    let mut seen = HashSet::new();
+    for site in sites {
         if site.dim() == 0 {
             return Err(invalid(format!("site index {site:?} has dimension zero")));
         }
@@ -449,6 +520,9 @@ fn validate_sites(site_order: &[DynIndex]) -> Result<(), InterpolationError> {
                 "site index {site:?} appears more than once"
             )));
         }
+    }
+    if seen.is_empty() {
+        return Err(invalid("the problem has no active site".to_string()));
     }
     Ok(())
 }

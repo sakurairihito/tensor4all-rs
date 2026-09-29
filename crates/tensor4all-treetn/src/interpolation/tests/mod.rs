@@ -235,6 +235,72 @@ fn new_rejects_invalid_sites() {
 }
 
 #[test]
+fn validate_layout_matches_the_layout_checks_of_new() {
+    let (chain, chain_sites, _) = chain_parts();
+    let shared = DynIndex::new_dyn(2);
+    let cases = vec![
+        (
+            network(&[0, 1], &[(0, 1)]),
+            chain_sites.clone(),
+            "node_sites has 3 entries",
+        ),
+        (
+            network(&[0, 1, 7], &[(0, 1), (1, 7)]),
+            chain_sites.clone(),
+            "not in the topology",
+        ),
+        (NodeNameNetwork::new(), BTreeMap::new(), "no nodes"),
+        (
+            network(&[0, 1, 2], &[(0, 1)]),
+            chain_sites.clone(),
+            "has 2 edges, got 1",
+        ),
+        (
+            network(&[0, 1, 2], &[(0, 0), (1, 2)]),
+            chain_sites.clone(),
+            "not connected",
+        ),
+        (
+            network(&[0, 1], &[(0, 1)]),
+            BTreeMap::from([(0usize, vec![]), (1, vec![])]),
+            "no active site",
+        ),
+        (
+            network(&[0], &[]),
+            BTreeMap::from([(0usize, vec![DynIndex::new_dyn(0)])]),
+            "dimension zero",
+        ),
+        (
+            network(&[0, 1], &[(0, 1)]),
+            BTreeMap::from([(0usize, vec![shared.clone()]), (1, vec![shared])]),
+            "more than once",
+        ),
+    ];
+    for (topology, node_sites, needle) in cases {
+        let layout = validate_layout(&topology, &node_sites);
+        let Err(InterpolationError::InvalidProblem { message }) = layout else {
+            panic!("validate_layout accepted a layout that must fail with {needle:?}");
+        };
+        assert!(message.contains(needle), "{message:?} lacks {needle:?}");
+        let n_sites = InterpolationProblem::derive_site_order(&node_sites).len();
+        match InterpolationProblem::new(
+            topology,
+            node_sites,
+            pivots(vec![0; n_sites], vec![n_sites, 1]),
+            0.0,
+            None,
+            0,
+        ) {
+            Err(InterpolationError::InvalidProblem { message: from_new }) => {
+                assert_eq!(from_new, message)
+            }
+            other => panic!("new must fail like validate_layout, got {other:?}"),
+        }
+    }
+    assert!(validate_layout(&chain, &chain_sites).is_ok());
+}
+
+#[test]
 fn new_rejects_invalid_initial_pivots() {
     let cases = [
         (pivots(vec![0, 0, 0], vec![3]), "must be a 2D array"),
