@@ -1083,13 +1083,11 @@ where
         cache: PatchCache<T>,
         projector: &Projector,
     ) -> Result<Verdict<T, V>, PatchedInterpolationError> {
-        let (points, shape): (Vec<usize>, [usize; 2]) = match active {
-            [position] => {
-                let dim = self.layout.dims[*position];
-                ((0..dim).collect(), [1, dim])
-            }
-            _ => (Vec::new(), [0, 1]),
-        };
+        // Every point of the patch: `0..d` for one active site of dimension
+        // `d`, or the single empty point when no site is active.
+        let n_points: usize = active.iter().map(|&p| self.layout.dims[p]).product();
+        let points: Vec<usize> = active.iter().flat_map(|_| 0..n_points).collect();
+        let shape = [active.len(), n_points];
         let sampler = self.sampler(fixed, active.len(), cache);
         let batch = ColMajorArrayRef::new(&points, &shape).map_err(internal)?;
         let values = sampler
