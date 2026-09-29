@@ -99,7 +99,8 @@ Scope (detailed plan:
   masked) is evaluated behind a measurement gate and a robustness gate before
   any change to the #648 invariant;
 - a result-preserving reorder in `contract_adaptive` skips the group sum when
-  a single contribution is already saturated;
+  a single contribution is already saturated and the split strategy is
+  `Sequential` ([#788](https://github.com/tensor4all/tensor4all-rs/issues/788));
 - sparse and block-sparse storage are evaluated and not adopted for this
   roadmap.
 
