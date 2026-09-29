@@ -10,6 +10,8 @@ Computes tensor cross interpolation on tree-structured graphs, producing TreeTN 
 - `crossinterpolate2()` — high-level entry point for tree TCI
 - `TreeTCI2` — algorithm state
 - `TreeTciGraph` — graph structure definition
+- `TreeTciInterpolator` — TreeTCI engine for the engine-independent
+  `tensor4all_treetn::interpolation::TreeInterpolator` contract
 
 ## Documentation
 

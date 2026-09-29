@@ -80,6 +80,7 @@ pub mod error;
 pub mod globalpivot;
 /// Tree graph helpers and edge-bipartition utilities for TreeTCI.
 pub mod graph;
+mod interpolator;
 /// Canonical subtree-key types.
 pub mod key;
 /// TreeTN materialization from converged TreeTCI pivots.
@@ -104,6 +105,7 @@ pub use batch::{GlobalIndexBatch, OwnedGlobalIndexBatch};
 pub use error::{Result as TreeTciResult, TreeTciError};
 pub use globalpivot::find_global_pivots;
 pub use graph::{TreeTciEdge, TreeTciGraph};
+pub use interpolator::TreeTciInterpolator;
 pub use key::SubtreeKey;
 pub use materialize::to_treetn;
 pub use optimize::{

@@ -1,4 +1,4 @@
-use super::{cartesian_entries, to_treetn, FullPivLuScalar};
+use super::{cartesian_entries, to_named_treetn, to_treetn, FullPivLuScalar};
 use crate::test_support::{assert_complex_slice_close, assert_scalar_close};
 use crate::{
     optimize_default, GlobalIndexBatch, SubtreeKey, TreeTCI2, TreeTciEdge, TreeTciGraph,
@@ -7,7 +7,7 @@ use crate::{
 use anyhow::Result;
 use num_complex::Complex64;
 use std::collections::HashMap as StdHashMap;
-use tensor4all_core::{ColMajorArray, ColMajorArrayRef};
+use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex};
 
 fn two_site_graph() -> TreeTciGraph {
     TreeTciGraph::new(2, &[TreeTciEdge::new(0, 1)]).unwrap()
@@ -173,4 +173,44 @@ fn to_treetn_emits_zero_core_for_zero_pivot_matrix() {
     let dense = tn.to_dense().unwrap();
     let values = dense.to_vec::<f64>().unwrap();
     assert_eq!(values, vec![0.0; 4]);
+}
+
+#[test]
+fn to_named_treetn_rejects_mismatched_names_and_site_dimensions() {
+    let mut tci = TreeTCI2::<f64>::new(vec![2, 2], two_site_graph()).unwrap();
+    tci.add_global_pivots(&[vec![0, 0]]).unwrap();
+    let constant =
+        |batch: GlobalIndexBatch<'_>| -> Result<Vec<f64>> { Ok(vec![1.0; batch.n_points()]) };
+    optimize_default(&mut tci, constant, &TreeTciOptions::default()).unwrap();
+
+    let sites = vec![vec![DynIndex::new_dyn(2)], vec![DynIndex::new_dyn(2)]];
+    let error = to_named_treetn(&tci, constant, None, &["a"], &sites).unwrap_err();
+    assert!(error.to_string().contains("1 names, 2 site-index lists"));
+
+    let wrong = vec![vec![DynIndex::new_dyn(2)], vec![DynIndex::new_dyn(3)]];
+    let error = to_named_treetn(&tci, constant, None, &["a", "b"], &wrong).unwrap_err();
+    assert!(error.to_string().contains("dimension product 3"));
+
+    let overflow = vec![
+        vec![DynIndex::new_dyn(2)],
+        vec![DynIndex::new_dyn(usize::MAX), DynIndex::new_dyn(2)],
+    ];
+    let error = to_named_treetn(&tci, constant, None, &["a", "b"], &overflow).unwrap_err();
+    assert!(error.to_string().contains("overflowed usize"));
+
+    // Valid names and a site split into a dimension-one leg plus a
+    // dimension-two leg; the site indices are used as given.
+    let (first, unit, second) = (
+        DynIndex::new_dyn(2),
+        DynIndex::new_dyn(1),
+        DynIndex::new_dyn(2),
+    );
+    let split = vec![vec![first.clone()], vec![unit.clone(), second.clone()]];
+    let tree = to_named_treetn(&tci, constant, None, &["a", "b"], &split).unwrap();
+    assert_eq!(tree.site_space(&"a").unwrap().len(), 1);
+    assert!(tree.site_space(&"b").unwrap().contains(&unit));
+    let value = tree
+        .evaluate_point(&[first, unit, second], &[1, 0, 1])
+        .unwrap();
+    assert_scalar_close(value.real(), 1.0, 1.0, 1e-12);
 }
