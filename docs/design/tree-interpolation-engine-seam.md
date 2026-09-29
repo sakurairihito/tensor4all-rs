@@ -39,14 +39,18 @@ Verified against `main` at `b63e13de`.
   global pivots were added, and the last rank equals the window minimum; or
   when the rank reached `max_bond_dim` in all of the last three sweeps; or
   when `max_iter` is exhausted. The return value does not say which.
-- **The bond-cap stop is broken on `main`.** Global pivots are injected after
-  a sweep and the saturation check then stops the loop without sweeping them,
-  so `ijset` keeps unswept, per-side deduplicated pivot columns and the two
-  sides of an edge no longer pair up. Reproduced: on a four-vertex tree whose
-  center has degree three, local dimensions `[2, 4, 4, 4]`,
-  `f = cos(0.3 i0 + 0.5 i1 + 0.7 i2 + 0.9 i3) + 0.1` (rank three),
-  `max_bond_dim = 2`, `crossinterpolate2` failed for all 40 seeds with
-  "bond ranks disagree across edge (0, 1)"; without a cap it succeeds.
+- **The bond-cap stop can return an unswept state on `main`**
+  ([#692](https://github.com/tensor4all/tensor4all-rs/issues/692)). Global
+  pivots are injected after a sweep, and the saturation stop could then exit
+  before a sweep re-paired the two sides of each edge, so
+  `crossinterpolate2` failed with "bond ranks disagree across edge". A
+  reproduction on a four-vertex tree whose center has degree three failed for
+  all 40 seeds tried. The fix
+  ([PR #790](https://github.com/tensor4all/tensor4all-rs/pull/790)) decides
+  the saturation stop before the global pivot search and skips the search when
+  it fires; the convergence stop is unchanged and still requires that the
+  current search added no pivots. With it, every exit of the loop happens after
+  a sweep.
 - `TreeTCI2` keeps `max_sample_value` and per-subtree pivot sets `ijset`
   (`SubtreeKey -> [n_subtree_sites, n_pivots]`). The two keys of an edge
   partition all vertices, and a completed edge update writes both sides in
@@ -67,16 +71,14 @@ Verified against `main` at `b63e13de`.
 - When an LU step selects nothing, the edge update falls back to candidate 0,
   so recycled pivots may be points where the function is zero.
 
-## Prerequisite: fix the TreeTCI bond-cap stop
+## Dependency: #692 fix
 
-Before the seam, a separate issue and PR fix the stopping logic of
-`optimize_with_proposer`: the termination decision is taken before global
-pivots are injected (or injection is skipped on the stopping sweep), so that
-every stored pivot column has been swept. The PR adds a regression test on a
-branched tree with a cap (the reproduction above) and asserts equal pivot
-column counts on both sides of every edge after optimization. Existing
-callers (`crossinterpolate2`, `tensor4all-quanticstci`) are updated in the
-same PR.
+The M1 implementation starts after
+[PR #790](https://github.com/tensor4all/tensor4all-rs/pull/790) is merged. The
+seam relies on its guarantee that every exit of `optimize_with_proposer` leaves
+a swept state, so that a run stopped at the bond cap has consistent pivot sets
+and can be materialized. A capped run may be an inaccurate approximation; the
+seam only needs it to stop cleanly and report `BondCapReached`.
 
 ## Contract in `tensor4all-treetn`
 
@@ -104,6 +106,10 @@ impl<V: Clone + Hash + Eq + Ord + Debug + Send + Sync> InterpolationProblem<V> {
     ) -> Result<Self, InterpolationError>;
     // accessors: topology(), node_sites(), site_order(), initial_pivots(),
     // absolute_tolerance(), max_bond_dim(), seed()
+
+    /// The site order `new` derives from `node_sites`, so callers can lay
+    /// out `initial_pivots` before constructing the problem.
+    pub fn derive_site_order(node_sites: &BTreeMap<V, Vec<DynIndex>>) -> Vec<DynIndex>;
 }
 
 #[non_exhaustive]
@@ -118,7 +124,8 @@ pub struct InterpolationOutcome<V> {
     /// engine does not produce pivots.
     pub pivots: Option<ColMajorArray<usize>>,
 }
-// plus InterpolationOutcome::new(...) for engines in other crates
+// A plain struct with public fields: engines in other crates build it with a
+// struct literal, so it is not `#[non_exhaustive]` and has no constructor.
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -144,10 +151,13 @@ pub trait TreeInterpolator<T> {
 ### Validation in `InterpolationProblem::new`
 
 The topology is a tree whose node set equals the keys of `node_sites`; every
-site index appears once; at least one active site exists; `initial_pivots`
-has one row per active site, at least one column, and coordinates within the
-site dimensions; `absolute_tolerance` is finite and nonnegative. Engines rely
-on these invariants and do not repeat the checks.
+site index appears once and has a positive dimension; at least one active
+site exists; `initial_pivots` has one row per active site, at least one
+column, and coordinates within the site dimensions; `absolute_tolerance` is
+finite and nonnegative. Engines rely on these invariants and do not repeat
+the checks. Sizes an engine derives for itself (for TreeTCI, the product of a
+node's site dimensions) are validated by that engine with checked arithmetic
+and reported as `InvalidProblem`.
 
 ### Semantics
 
@@ -182,28 +192,35 @@ on these invariants and do not repeat the checks.
 
 ## TreeTCI implementation in `tensor4all-treetci`
 
-1. **Termination report.** After the prerequisite fix,
-   `optimize_with_proposer` returns a report with `ranks`, `errors`, and a
-   reason (`Converged`, `MaxBondDimension`, `MaxIterations`), mapped to
-   `InterpolationTermination` with the precedence above.
-   `crossinterpolate2` keeps its current signature. The implementation runs
-   with `normalize_error = false` and requires `max_iter >= 3`, because
-   convergence needs three sweeps of history.
-2. **Vertices.** Each node becomes one vertex whose local dimension is the
+1. **Termination report.** `optimize_with_proposer` returns a report with
+   `ranks`, `errors`, and a reason (`Converged`, `MaxBondDimension`,
+   `MaxIterations`), mapped to `InterpolationTermination` with the precedence
+   above. `crossinterpolate2` keeps its current signature. The other caller of
+   `optimize_with_proposer`, `tensor4all-quanticstci`, is updated in the same
+   M1 PR. The implementation runs with `normalize_error = false` and requires
+   `max_iter >= 3`, because convergence needs three sweeps of history.
+2. **Evaluator errors.** TreeTCI wraps callback errors into its own operation
+   error. The implementation wraps each evaluator error in a private marker
+   type before returning it to TreeTCI, and on failure searches the error
+   chain with `downcast_ref` for that marker: found maps to `Evaluator`,
+   otherwise `Engine`.
+3. **Vertices.** Each node becomes one vertex whose local dimension is the
    product of its active site dimensions, fused column-major in the node's
    site order, or one for a node without active sites. Vertex coordinates
    are translated to site-order rows for `evaluate`; this is a copy, not a
    view.
-3. **Pivots.** Initial pivots are converted to vertex coordinates and passed
+4. **Pivots.** Initial pivots are converted to vertex coordinates and passed
    through `add_global_pivots`. After optimization, each edge's two pivot sets
    are joined column by column (after checking equal column counts), converted
    back to site order, and deduplicated.
-4. **Network.** A crate-internal generalization of `to_treetn` materializes
+5. **Network.** A crate-internal generalization of `to_treetn` materializes
    directly with the problem's node names and final site indices, splitting
    fused vertices and omitting the dimension-one index of nodes without active
    sites, instead of renaming and replacing indices after the fact.
-5. **Single-node topology.** `TreeTCI2` needs two vertices; a single-node
-   problem is evaluated exactly on its full index set.
+6. **Single-node topology.** `TreeTCI2` needs two vertices; a single-node
+   problem is evaluated exactly on its full index set and returns
+   `Converged`, an error estimate of zero, the largest evaluated magnitude,
+   and no pivots.
 
 ## Other engines
 
@@ -218,13 +235,15 @@ does not show that TreeACI needs no work.
 
 ## Tests
 
-- The prerequisite regression test (branched tree with a cap).
 - Chain and branched trees (at least one node of degree three or more),
   compared with dense references on small cases.
 - A node with several active sites (fused vertex), a node without active
   sites, and a single-node topology.
 - Each termination variant, including an error criterion met at a rank equal
-  to the cap (`BondCapReached`) and an iteration limit.
+  to the cap (`BondCapReached`), a capped run on a branched tree that stops
+  cleanly with `BondCapReached` (no accuracy assertion), and an iteration
+  limit.
+- An evaluator failure is reported as `Evaluator`, not `Engine`.
 - Returned pivots are valid full-domain points and seed a second run.
 - Node names and site identities of the result equal the problem's, including
   site indices that share an ID but differ in prime level or tags.
@@ -244,7 +263,10 @@ this seam the driver depends only on the trait in `tensor4all-treetn`, so the
 reason still holds. The M1 implementation PR amends both statements. The M2
 driver derives its patch queue from TCIAlgorithms.jl through
 `tensor4all-partitionedtt`; the M2 PR records that in
-`docs/PROVENANCE_AND_CITATION_POLICY.md`.
+`docs/PROVENANCE_AND_CITATION_POLICY.md` and follows the license and
+derivation-notice obligations that
+[partitioned-treetn.md](./partitioned-treetn.md) states for code derived from
+that crate (`LICENSE-TCIALGORITHMS-MIT`).
 
 ## Open question for review
 
