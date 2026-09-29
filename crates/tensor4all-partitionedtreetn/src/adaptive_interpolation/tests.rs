@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex, IdxTensor, IndexLike};
 use tensor4all_treetn::{NodeNameNetwork, TreeTN};
 
-use super::cache::{Counters, KeyLayout, PatchCache, PatchSampler};
+use super::cache::{is_finite, Counters, KeyLayout, PatchCache, PatchSampler};
 use super::embed::{check_outcome_layout, embed_fixed_sites, exact_active_network};
 use super::layout::SiteLayout;
 use super::sampling::{
@@ -422,6 +422,53 @@ fn exact_network_rejects_more_than_one_active_site() {
     assert!(matches!(error, PartitionedTreeTNError::TreeTN { .. }));
 }
 
+/// Build an exact network with site c active and a, b fixed, re-embed it, and
+/// check that every node tensor (values, ones, and one-hot factors) has the
+/// scalar type `T`.
+fn assert_embedding_keeps_dtype<T>(value: T, is_dtype: fn(&IdxTensor) -> bool)
+where
+    T: tensor4all_core::CommonScalar + tensor4all_core::TensorElement,
+{
+    let (layout, _) = chain_layout();
+    for (active, fixed) in [
+        (vec![2], [Some(1), Some(2), None]),
+        (vec![], [Some(0), Some(1), Some(1)]),
+    ] {
+        let values = vec![value; if active.is_empty() { 1 } else { 2 }];
+        let network = exact_active_network(&layout, &active, values).unwrap();
+        let embedded = embed_fixed_sites::<T, usize>(&network, &layout, &fixed).unwrap();
+        assert_eq!(embedded.node_count(), 3);
+        for name in embedded.node_names() {
+            let tensor = embedded
+                .tensor(embedded.node_index(&name).unwrap())
+                .unwrap();
+            assert!(is_dtype(tensor), "node {name} has another dtype");
+        }
+    }
+}
+
+#[test]
+fn exact_and_embedded_networks_keep_the_scalar_type() {
+    assert_embedding_keeps_dtype(2.0_f32, IdxTensor::is_f32);
+    assert_embedding_keeps_dtype(2.0_f64, IdxTensor::is_f64);
+    assert_embedding_keeps_dtype(num_complex::Complex32::new(1.0, 2.0), IdxTensor::is_c32);
+    assert_embedding_keeps_dtype(num_complex::Complex64::new(1.0, 2.0), IdxTensor::is_c64);
+}
+
+#[test]
+fn finiteness_is_checked_per_component() {
+    use num_complex::Complex64;
+    assert!(is_finite(1.0_f64));
+    assert!(!is_finite(f64::NAN));
+    assert!(!is_finite(f64::NEG_INFINITY));
+    // Finite parts whose magnitude overflows are finite.
+    let large = Complex64::new(1.5e308, 1.5e308);
+    assert!(!tensor4all_core::CommonScalar::abs_val(large).is_finite());
+    assert!(is_finite(large));
+    assert!(!is_finite(Complex64::new(1.0, f64::INFINITY)));
+    assert!(!is_finite(Complex64::new(f64::NAN, 0.0)));
+}
+
 #[test]
 fn outcome_layout_check_rejects_every_mismatch() {
     let (layout, sites) = chain_layout();
@@ -536,9 +583,18 @@ fn one_site_patch<T: tensor4all_core::TensorElement>(
     values: Vec<T>,
     coordinate: usize,
 ) -> SubDomainTreeTN<usize> {
+    named_one_site_patch(0, site, values, coordinate)
+}
+
+fn named_one_site_patch<T: tensor4all_core::TensorElement>(
+    node: usize,
+    site: &DynIndex,
+    values: Vec<T>,
+    coordinate: usize,
+) -> SubDomainTreeTN<usize> {
     let tree = TreeTN::from_tensors(
         vec![IdxTensor::from_dense(vec![site.clone()], values).unwrap()],
-        vec![0usize],
+        vec![node],
     )
     .unwrap();
     SubDomainTreeTN::new(
@@ -578,4 +634,22 @@ fn disjoint_assembly_checks_structure_and_dtype() {
         error,
         PartitionedTreeTNError::DTypeMismatch { .. }
     ));
+
+    let error = PartitionedTreeTN::from_disjoint_subdomains(vec![
+        named_one_site_patch(0, &site, vec![1.0_f64, 0.0], 0),
+        named_one_site_patch(1, &site, vec![0.0_f64, 2.0], 1),
+    ])
+    .unwrap_err();
+    assert!(matches!(error, PartitionedTreeTNError::TopologyMismatch));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pairwise disjoint projectors")]
+fn disjoint_assembly_asserts_disjointness_in_debug_builds() {
+    let site = DynIndex::new_dyn(2);
+    let _ = PartitionedTreeTN::from_disjoint_subdomains(vec![
+        one_site_patch(&site, vec![1.0_f64, 0.0], 0),
+        one_site_patch(&site, vec![1.0_f64, 0.0], 0),
+    ]);
 }

@@ -47,13 +47,7 @@ fn max_abs(problem: &Problem, f: &dyn Fn(&[usize]) -> f64) -> f64 {
 #[test]
 fn treetci_patches_a_localized_function_on_a_quantics_chain() {
     // 128 points; two narrow peaks give the whole domain a rank above the cap.
-    let names: Vec<String> = (0..7).map(|k| format!("q{k}")).collect();
-    let nodes: Vec<(&str, &[usize])> = names.iter().map(|n| (n.as_str(), &[2usize][..])).collect();
-    let edges: Vec<(&str, &str)> = names
-        .windows(2)
-        .map(|w| (w[0].as_str(), w[1].as_str()))
-        .collect();
-    let problem = Problem::new(&nodes, &edges);
+    let problem = chain("q", 7, 2);
     let f = |p: &[usize]| {
         let x = quantics(p);
         gaussian(x, 0.3, 0.02) + 0.5 * gaussian(x, 0.71, 0.05)
@@ -138,6 +132,13 @@ fn treetci_patches_a_function_on_a_branched_tree_deterministically() {
         let options = quantics_tree_options(&problem, recycle);
         let result = run(&engine, &problem, &tree_peak, &pivots, &options).unwrap();
         assert!(result.report.splits >= 1, "the root must not converge");
+        // Some patch is accepted from the engine on the degree-three tree,
+        // not only from the exact small-patch path.
+        assert!(result
+            .report
+            .accepted
+            .iter()
+            .any(|record| record.max_bond_dim >= 2));
         assert_accurate(&result, &problem, &tree_peak, options.rtol);
         runs.push(result);
     }
@@ -227,13 +228,7 @@ impl TreeInterpolator<f64> for FiberEngine {
 #[test]
 fn the_cache_supports_domains_wider_than_128_bits() {
     // Three variables of 43 bits each on a chain of 129 binary sites.
-    let names: Vec<String> = (0..129).map(|k| format!("s{k:03}")).collect();
-    let nodes: Vec<(&str, &[usize])> = names.iter().map(|n| (n.as_str(), &[2usize][..])).collect();
-    let edges: Vec<(&str, &str)> = names
-        .windows(2)
-        .map(|w| (w[0].as_str(), w[1].as_str()))
-        .collect();
-    let problem = Problem::new(&nodes, &edges);
+    let problem = chain("s", 129, 2);
     // exp(x + y + z) is a product over the bits.
     let f = |p: &[usize]| p.chunks(43).map(quantics).sum::<f64>().exp();
     let options = PatchedInterpolationOptions::new(2).with_reference_scale(20.0);

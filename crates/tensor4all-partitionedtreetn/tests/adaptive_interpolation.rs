@@ -30,7 +30,7 @@ use tensor4all_treetn::interpolation::{
     validate_layout, InterpolationError, InterpolationOutcome, InterpolationProblem,
     InterpolationTermination, TreeInterpolator,
 };
-use tensor4all_treetn::{factorize_tensor_to_treetn_with, NodeNameNetwork, TreeTN, TreeTopology};
+use tensor4all_treetn::{factorize_tensor_to_treetn_with, TreeTN, TreeTopology};
 
 #[test]
 fn branched_topology_is_a_genuine_tree_with_a_degree_three_node() {
@@ -60,6 +60,8 @@ enum Fault {
     AllZero,
     /// Stop with `IterationLimit` instead of converging.
     IterationLimit,
+    /// Report `Converged` whatever the rank, even at the cap.
+    ConvergedAtCap,
     /// Send a batch with the wrong number of rows.
     BadBatch,
     /// Send a batch with an out-of-range coordinate.
@@ -216,6 +218,8 @@ where
         let rank = network.link_dims().into_iter().max().unwrap_or(1);
         let termination = if self.fault == Fault::IterationLimit {
             InterpolationTermination::IterationLimit
+        } else if self.fault == Fault::ConvergedAtCap {
+            InterpolationTermination::Converged
         } else if problem.max_bond_dim().is_some_and(|cap| rank >= cap.get()) {
             InterpolationTermination::BondCapReached
         } else {
@@ -597,6 +601,23 @@ fn a_zero_root_that_needs_the_engine_uses_the_given_scale_or_fails() {
 // Scalar types, recycling, determinism, and the cache
 // ---------------------------------------------------------------------------
 
+/// Every node tensor of every patch is `Complex64`: re-embedded one-hot
+/// factors and the ones of exact patches must not fall back to `f64`.
+fn assert_all_complex(result: &PatchedInterpolationResult<Name>) {
+    assert!(!result.partition.is_empty());
+    for patch in result.partition.values() {
+        let data = patch.data();
+        for name in data.node_names() {
+            let tensor = data.tensor(data.node_index(&name).unwrap()).unwrap();
+            assert!(
+                tensor.is_c64(),
+                "node {name} of {:?} is not Complex64",
+                patch.projector()
+            );
+        }
+    }
+}
+
 #[test]
 fn complex_patches_have_one_dtype() {
     let problem = branched();
@@ -613,20 +634,14 @@ fn complex_patches_have_one_dtype() {
         .with_patch_order(vec![j0]);
     let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
     assert_eq!(result.report.accepted.len(), 2);
-    for patch in result.partition.values() {
-        let data = patch.data();
-        for name in data.node_names() {
-            let tensor = data.tensor(data.node_index(&name).unwrap()).unwrap();
-            assert!(
-                tensor.to_vec::<Complex64>().is_ok(),
-                "node {name} is not complex"
-            );
-        }
-    }
+    assert_all_complex(&result);
     assert_accurate(&result, &problem, &f, 1e-12);
+}
 
-    // The exact path builds complex patches too.
-    let problem = single_node(&[3]);
+#[test]
+fn complex_exact_patches_have_one_dtype() {
+    // An exact root on two nodes: the site-free node holds a complex one.
+    let problem = Problem::new(&[("a", &[]), ("b", &[4])], &[("a", "b")]);
     let g = |p: &[usize]| Complex64::new(p[0] as f64, 1.0);
     let result = run(
         &DenseEngine::new(),
@@ -636,17 +651,40 @@ fn complex_patches_have_one_dtype() {
         &PatchedInterpolationOptions::new(2),
     )
     .unwrap();
-    assert_eq!(result.report.reference_scale, 5.0_f64.sqrt());
+    assert_eq!(result.report.reference_scale, 10.0_f64.sqrt());
+    assert_all_complex(&result);
     let (residual, _) = dense_residual(&result, &problem, &g);
     assert_eq!(residual, 0.0);
+
+    // Splits down to one-site children: one-hot factors on two nodes.
+    let problem = chain3();
+    let mut rng = ChaCha8Rng::seed_from_u64(12);
+    let phases: Vec<f64> = (0..4)
+        .map(|_| rng.random_range(0.0..std::f64::consts::TAU))
+        .collect();
+    let f = move |p: &[usize]| {
+        Complex64::from_polar(product(p, 2 * p[0] + p[1]), phases[2 * p[0] + p[1]])
+    };
+    let options = PatchedInterpolationOptions::new(2).with_reference_scale(10.0);
+    let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+    assert_eq!(result.report.splits, 3);
+    assert_eq!(result.report.accepted.len(), 4);
+    assert!(result
+        .report
+        .accepted
+        .iter()
+        .all(|record| record.projector.len() == 2));
+    assert_all_complex(&result);
+    let (residual, _) = dense_residual(&result, &problem, &f);
+    assert!(residual < 1e-12, "residual {residual}");
 }
+
+/// Initial pivots of each child problem, one list per child.
+type ChildPivots = Vec<Vec<Vec<usize>>>;
 
 /// The initial pivots each child problem received, in child coordinates,
 /// and the ones recycling would give: the parent's returned pivots with the
 /// split coordinate, the split site removed.
-/// Initial pivots of each child problem, one list per child.
-type ChildPivots = Vec<Vec<Vec<usize>>>;
-
 fn recycling_run(recycle: bool) -> (ChildPivots, ChildPivots) {
     let problem = chain3();
     let s0 = problem.site("n0", 0);
@@ -824,14 +862,8 @@ fn run_faulty(
     engine: &DenseEngine,
     evaluate: impl Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<f64>> + Send + Sync,
 ) -> Result<PatchedInterpolationResult<Name>, PatchedInterpolationError> {
-    patched_interpolate(
-        engine,
-        problem.topology.clone(),
-        problem.node_sites.clone(),
-        ColMajorArray::new(vec![], vec![problem.sites.len(), 0]).unwrap(),
-        evaluate,
-        &PatchedInterpolationOptions::new(2).with_reference_scale(1.0),
-    )
+    let options = PatchedInterpolationOptions::new(2).with_reference_scale(1.0);
+    run_with(engine, problem, evaluate, &[], &options)
 }
 
 #[test]
@@ -917,16 +949,6 @@ fn never(batch: ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<f64>> {
 
 #[test]
 fn invalid_layouts_are_rejected_before_any_evaluation() {
-    let network = |nodes: &[&str], edges: &[(&str, &str)]| {
-        let mut topology = NodeNameNetwork::new();
-        for node in nodes {
-            topology.add_node(node.to_string()).unwrap();
-        }
-        for (a, b) in edges {
-            topology.add_edge(&a.to_string(), &b.to_string()).unwrap();
-        }
-        topology
-    };
     let site = DynIndex::new_dyn(2);
     let sites = |entries: &[(&str, Vec<DynIndex>)]| -> BTreeMap<Name, Vec<DynIndex>> {
         entries
@@ -937,29 +959,39 @@ fn invalid_layouts_are_rejected_before_any_evaluation() {
     // Every root here has at most one site, so an unvalidated exact path
     // would evaluate it.
     let cases = [
-        (network(&[], &[]), sites(&[]), "no nodes"),
+        (topology(&[], &[]), sites(&[]), "no nodes"),
         (
-            network(&["a"], &[]),
+            topology(&["a", "b"], &[("a", "b")]),
+            sites(&[("a", vec![site.clone()])]),
+            "node_sites has 1 entries",
+        ),
+        (
+            topology(&["a"], &[]),
             sites(&[("b", vec![site.clone()])]),
             "not in the topology",
         ),
         (
-            network(&["a", "b"], &[]),
+            topology(&["a", "b"], &[]),
             sites(&[("a", vec![site.clone()]), ("b", vec![])]),
             "edges",
         ),
         (
-            network(&["a"], &[]),
+            topology(&["a", "b", "c"], &[("a", "a"), ("b", "c")]),
+            sites(&[("a", vec![site.clone()]), ("b", vec![]), ("c", vec![])]),
+            "not connected",
+        ),
+        (
+            topology(&["a"], &[]),
             sites(&[("a", vec![])]),
             "no active site",
         ),
         (
-            network(&["a"], &[]),
+            topology(&["a"], &[]),
             sites(&[("a", vec![DynIndex::new_dyn(0)])]),
             "dimension zero",
         ),
         (
-            network(&["a", "b"], &[("a", "b")]),
+            topology(&["a", "b"], &[("a", "b")]),
             sites(&[("a", vec![site.clone()]), ("b", vec![site.clone()])]),
             "more than once",
         ),
@@ -1101,4 +1133,25 @@ fn an_overflowing_absolute_tolerance_is_reported_for_the_root() {
     assert!(projector.is_empty());
     assert!(matches!(source, InterpolationError::InvalidProblem { .. }));
     assert!(source.to_string().contains("absolute_tolerance"));
+}
+
+#[test]
+fn converged_outcomes_at_the_cap_are_engine_errors() {
+    let problem = branched();
+    let f = switch_on(problem.position(&problem.site("a", 0)));
+    let options = PatchedInterpolationOptions::new(2).with_reference_scale(10.0);
+    let engine = DenseEngine::with_fault(Fault::ConvergedAtCap);
+    let (projector, source) = expect_interpolation(run(&engine, &problem, &f, &[], &options));
+    assert!(projector.is_empty());
+    assert!(matches!(source, InterpolationError::Engine { .. }));
+    assert!(
+        source.to_string().contains("not strictly below the cap 2"),
+        "{source}"
+    );
+
+    // A rank-one function converges strictly below the same cap.
+    let product_only = |p: &[usize]| product(p, 0);
+    let result = run(&engine, &problem, &product_only, &[], &options).unwrap();
+    assert_eq!(result.report.accepted.len(), 1);
+    assert_eq!(result.report.accepted[0].max_bond_dim, 1);
 }

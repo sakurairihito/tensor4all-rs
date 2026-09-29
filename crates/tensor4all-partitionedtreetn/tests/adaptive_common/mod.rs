@@ -54,15 +54,8 @@ impl Problem {
         node_sites: BTreeMap<Name, Vec<DynIndex>>,
         edges: &[(&str, &str)],
     ) -> Self {
-        let mut topology = NodeNameNetwork::new();
-        for node in node_sites.keys() {
-            topology.add_node(node.clone()).unwrap();
-        }
-        for (left, right) in edges {
-            topology
-                .add_edge(&left.to_string(), &right.to_string())
-                .unwrap();
-        }
+        let nodes: Vec<&str> = node_sites.keys().map(String::as_str).collect();
+        let topology = topology(&nodes, edges);
         let sites = InterpolationProblem::derive_site_order(&node_sites);
         Self {
             topology,
@@ -129,12 +122,40 @@ pub(crate) fn branched() -> Problem {
     )
 }
 
+/// A topology with the given node names and edges; it need not be a tree.
+pub(crate) fn topology(nodes: &[&str], edges: &[(&str, &str)]) -> NodeNameNetwork<Name> {
+    let mut topology = NodeNameNetwork::new();
+    for node in nodes {
+        topology.add_node(node.to_string()).unwrap();
+    }
+    for (left, right) in edges {
+        topology
+            .add_edge(&left.to_string(), &right.to_string())
+            .unwrap();
+    }
+    topology
+}
+
+/// A chain of `n` nodes named `{prefix}{k}` (zero-padded to sort in chain
+/// order), each with one site of dimension `dim`.
+pub(crate) fn chain(prefix: &str, n: usize, dim: usize) -> Problem {
+    let width = (n.max(2) - 1).to_string().len();
+    let names: Vec<String> = (0..n).map(|k| format!("{prefix}{k:0width$}")).collect();
+    let dims = [dim];
+    let nodes: Vec<(&str, &[usize])> = names
+        .iter()
+        .map(|name| (name.as_str(), &dims[..]))
+        .collect();
+    let edges: Vec<(&str, &str)> = names
+        .windows(2)
+        .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+        .collect();
+    Problem::new(&nodes, &edges)
+}
+
 /// Chain n0 - n1 - n2 with binary sites.
 pub(crate) fn chain3() -> Problem {
-    Problem::new(
-        &[("n0", &[2]), ("n1", &[2]), ("n2", &[2])],
-        &[("n0", "n1"), ("n1", "n2")],
-    )
+    chain("n", 3, 2)
 }
 
 pub(crate) fn single_node(dims: &[usize]) -> Problem {
@@ -280,6 +301,34 @@ pub(crate) fn check_invariants(
     }
 }
 
+/// Run the driver with the given batch evaluator and full-domain pivots.
+pub(crate) fn run_with<T, E, F>(
+    engine: &E,
+    problem: &Problem,
+    evaluate: F,
+    pivots: &[Vec<usize>],
+    options: &PatchedInterpolationOptions,
+) -> Result<PatchedInterpolationResult<Name>, PatchedInterpolationError>
+where
+    T: CommonScalar + TensorElement,
+    E: TreeInterpolator<T> + Sync,
+    F: Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<T>> + Send + Sync,
+{
+    let initial = if pivots.is_empty() {
+        ColMajorArray::new(vec![], vec![problem.sites.len(), 0]).unwrap()
+    } else {
+        problem.pivots(pivots)
+    };
+    patched_interpolate(
+        engine,
+        problem.topology.clone(),
+        problem.node_sites.clone(),
+        initial,
+        evaluate,
+        options,
+    )
+}
+
 /// Run the driver with a recording evaluator. On success, check the
 /// invariants and that the reported evaluation count matches the evaluator.
 pub(crate) fn run<T, E>(
@@ -294,19 +343,8 @@ where
     E: TreeInterpolator<T> + Sync,
 {
     let recorder = Recorder::default();
-    let initial = if pivots.is_empty() {
-        ColMajorArray::new(vec![], vec![problem.sites.len(), 0]).unwrap()
-    } else {
-        problem.pivots(pivots)
-    };
-    let result = patched_interpolate(
-        engine,
-        problem.topology.clone(),
-        problem.node_sites.clone(),
-        initial,
-        recording_evaluator(f, problem.sites.len(), &recorder),
-        options,
-    );
+    let evaluate = recording_evaluator(f, problem.sites.len(), &recorder);
+    let result = run_with(engine, problem, evaluate, pivots, options);
     if let Ok(result) = &result {
         assert_eq!(result.report.function_evaluations, recorder.points());
         check_invariants(result, problem, options);
