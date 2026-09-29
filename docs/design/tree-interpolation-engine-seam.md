@@ -203,7 +203,8 @@ and reported as `InvalidProblem`.
    error. The implementation wraps each evaluator error in a private marker
    type before returning it to TreeTCI, and on failure searches the error
    chain with `downcast_ref` for that marker: found maps to `Evaluator`,
-   otherwise `Engine`.
+   otherwise `Engine`. The same wrapper checks that the evaluator returned
+   exactly one value per point and reports a wrong length as `Evaluator`.
 3. **Vertices.** Each node becomes one vertex whose local dimension is the
    product of its active site dimensions, fused column-major in the node's
    site order, or one for a node without active sites. Vertex coordinates
@@ -218,9 +219,10 @@ and reported as `InvalidProblem`.
    fused vertices and omitting the dimension-one index of nodes without active
    sites, instead of renaming and replacing indices after the fact.
 6. **Single-node topology.** `TreeTCI2` needs two vertices; a single-node
-   problem is evaluated exactly on its full index set and returns
-   `Converged`, an error estimate of zero, the largest evaluated magnitude,
-   and no pivots.
+   problem first applies the zero-patch rule (all initial pivots zero returns
+   `AllSamplesZero`, as for every topology); otherwise it is evaluated exactly
+   on its full index set and returns `Converged`, an error estimate of zero,
+   the largest evaluated magnitude, and no pivots.
 
 ## Other engines
 
@@ -243,7 +245,10 @@ does not show that TreeACI needs no work.
   to the cap (`BondCapReached`), a capped run on a branched tree that stops
   cleanly with `BondCapReached` (no accuracy assertion), and an iteration
   limit.
-- An evaluator failure is reported as `Evaluator`, not `Engine`.
+- An evaluator failure and an evaluator returning the wrong number of values
+  are both reported as `Evaluator`, not `Engine`.
+- A single-node problem with all-zero initial pivots returns
+  `AllSamplesZero`.
 - Returned pivots are valid full-domain points and seed a second run.
 - Node names and site identities of the result equal the problem's, including
   site indices that share an ID but differ in prime level or tags.
