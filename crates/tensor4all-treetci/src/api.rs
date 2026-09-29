@@ -148,8 +148,8 @@ where
         return Err(anyhow::anyhow!("initial pivots must not all evaluate to zero").into());
     }
 
-    let (ranks, errors) = optimize_with_proposer(&mut tci, &evaluate, &options, proposer)?;
+    let report = optimize_with_proposer(&mut tci, &evaluate, &options, proposer)?;
     let treetn = to_treetn(&tci, &evaluate, center_site)?;
 
-    Ok((treetn, ranks, errors))
+    Ok((treetn, report.ranks, report.errors))
 }

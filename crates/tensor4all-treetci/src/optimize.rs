@@ -178,10 +178,108 @@ impl Default for TreeTciOptions {
     }
 }
 
+/// Reason why a TreeTCI optimization loop stopped.
+///
+/// Reported in [`TreeTciOptimizeReport::termination`] by
+/// [`optimize_with_proposer`] and [`optimize_default`].
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_treetci::{
+///     optimize_default, GlobalIndexBatch, TreeTCI2, TreeTciEdge, TreeTciGraph,
+///     TreeTciOptions, TreeTciTermination,
+/// };
+/// use anyhow::Result;
+///
+/// // The 3x3 identity has rank 3; a cap of 1 cannot reach the tolerance, so
+/// // the loop stops once the rank has sat at the cap for three sweeps.
+/// let graph = TreeTciGraph::new(2, &[TreeTciEdge::new(0, 1)]).unwrap();
+/// let mut state = TreeTCI2::<f64>::new(vec![3, 3], graph).unwrap();
+/// state.add_global_pivots(&[vec![0, 0]]).unwrap();
+/// state.max_sample_value = 1.0;
+///
+/// let evaluate = |batch: GlobalIndexBatch<'_>| -> Result<Vec<f64>> {
+///     Ok((0..batch.n_points())
+///         .map(|p| if batch.get(0, p) == batch.get(1, p) { 1.0 } else { 0.0 })
+///         .collect())
+/// };
+/// let options = TreeTciOptions {
+///     tolerance: 1e-12,
+///     max_iter: 10,
+///     max_bond_dim: Some(1),
+///     ..Default::default()
+/// };
+/// let report = optimize_default(&mut state, evaluate, &options).unwrap();
+/// assert_eq!(report.termination, TreeTciTermination::MaxBondDimension);
+/// assert_eq!(report.ranks, vec![1, 1, 1]);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeTciTermination {
+    /// Over the last three sweeps every bond error was below
+    /// [`TreeTciOptions::tolerance`], no global pivots were added, and the
+    /// last rank equals the minimum rank of the window. The final rank may
+    /// equal [`TreeTciOptions::max_bond_dim`].
+    Converged,
+    /// [`TreeTciOptions::max_bond_dim`] is set and the maximal bond dimension
+    /// reached it in each of the last three sweeps. This stop is checked
+    /// before the convergence criterion.
+    MaxBondDimension,
+    /// [`TreeTciOptions::max_iter`] sweeps ran without either stop.
+    MaxIterations,
+}
+
+/// Result of a TreeTCI optimization loop.
+///
+/// Returned by [`optimize_with_proposer`] and [`optimize_default`]. `ranks`
+/// and `errors` hold one entry per sweep actually run.
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_treetci::{
+///     optimize_default, GlobalIndexBatch, TreeTCI2, TreeTciEdge, TreeTciGraph,
+///     TreeTciOptions, TreeTciTermination,
+/// };
+/// use anyhow::Result;
+///
+/// let graph = TreeTciGraph::new(2, &[TreeTciEdge::new(0, 1)]).unwrap();
+/// let mut state = TreeTCI2::<f64>::new(vec![2, 2], graph).unwrap();
+/// state.add_global_pivots(&[vec![0, 0]]).unwrap();
+/// state.max_sample_value = 1.0;
+///
+/// // f(i, j) = i + j + 1 has rank 2.
+/// let evaluate = |batch: GlobalIndexBatch<'_>| -> Result<Vec<f64>> {
+///     Ok((0..batch.n_points())
+///         .map(|p| (batch.get(0, p).unwrap() + batch.get(1, p).unwrap() + 1) as f64)
+///         .collect())
+/// };
+/// let options = TreeTciOptions { tolerance: 1e-10, max_iter: 10, ..Default::default() };
+/// let report = optimize_default(&mut state, evaluate, &options).unwrap();
+///
+/// assert_eq!(report.termination, TreeTciTermination::Converged);
+/// assert_eq!(report.ranks.len(), report.errors.len());
+/// assert_eq!(report.ranks.last().copied(), Some(2));
+/// assert!(report.errors.last().copied().unwrap_or(1.0) < 1e-10);
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeTciOptimizeReport {
+    /// Maximal bond dimension after each sweep.
+    pub ranks: Vec<usize>,
+    /// Maximal bond error after each sweep, divided by
+    /// [`TreeTCI2::max_sample_value`] when
+    /// [`TreeTciOptions::normalize_error`] is set and the maximum is positive;
+    /// the raw bond error otherwise.
+    pub errors: Vec<f64>,
+    /// Why the loop stopped.
+    pub termination: TreeTciTermination,
+}
+
 /// Optimize a TreeTCI state with the MVP strategy choices:
 /// `AllEdges` visitation and [`DefaultProposer`](crate::DefaultProposer).
 ///
-/// Returns `(ranks_per_iter, normalized_errors_per_iter)`.
+/// Returns a [`TreeTciOptimizeReport`] with the per-sweep ranks and errors
+/// and the reason the loop stopped.
 ///
 /// This is a convenience wrapper around [`optimize_with_proposer`] with the
 /// default neighbor-product proposer.
@@ -197,7 +295,7 @@ impl Default for TreeTciOptions {
 /// ```
 /// use tensor4all_treetci::{
 ///     optimize_default, GlobalIndexBatch, TreeTCI2, TreeTciEdge,
-///     TreeTciGraph, TreeTciOptions,
+///     TreeTciGraph, TreeTciOptions, TreeTciTermination,
 /// };
 /// use anyhow::Result;
 ///
@@ -218,19 +316,21 @@ impl Default for TreeTciOptions {
 /// };
 ///
 /// let options = TreeTciOptions { tolerance: 1e-10, max_iter: 5, ..Default::default() };
-/// let (ranks, errors) = optimize_default(&mut state, evaluate, &options).unwrap();
+/// let report = optimize_default(&mut state, evaluate, &options).unwrap();
 ///
-/// // One entry per sweep actually run; the loop stops early once converged,
-/// // so this may be less than max_iter (5).
-/// assert!(!ranks.is_empty() && ranks.len() <= 5);
-/// assert_eq!(ranks.len(), errors.len());
-/// assert!(errors.last().copied().unwrap_or(1.0) < 1e-8);
+/// // The rank-2 identity converges within the sweep budget: one entry per
+/// // sweep actually run, at least the three-sweep convergence window.
+/// assert_eq!(report.termination, TreeTciTermination::Converged);
+/// assert!(report.ranks.len() >= 3 && report.ranks.len() <= 5);
+/// assert_eq!(report.ranks.len(), report.errors.len());
+/// assert_eq!(report.ranks.last().copied(), Some(2));
+/// assert!(report.errors.last().copied().unwrap_or(1.0) < 1e-8);
 /// ```
 pub fn optimize_default<T, F>(
     state: &mut TreeTCI2<T>,
     evaluate: F,
     options: &TreeTciOptions,
-) -> TreeTciResult<(Vec<usize>, Vec<f64>)>
+) -> TreeTciResult<TreeTciOptimizeReport>
 where
     T: Scalar + CommonScalar + FullPivLuScalar + tensor4all_core::TensorElement + ScalarParts,
     F: Fn(GlobalIndexBatch<'_>) -> Result<Vec<T>>,
@@ -242,7 +342,20 @@ where
 /// Optimize a TreeTCI state with `AllEdges` visitation and a caller-supplied
 /// pivot candidate proposer.
 ///
-/// Returns `(ranks_per_iter, normalized_errors_per_iter)`.
+/// Returns a [`TreeTciOptimizeReport`]: the maximal bond dimension and the
+/// bond error after each sweep, and the [`TreeTciTermination`] reason. The
+/// loop stops with
+///
+/// - [`TreeTciTermination::MaxBondDimension`] when `max_bond_dim` is set and
+///   the rank reached it in each of the last three sweeps (checked first);
+/// - [`TreeTciTermination::Converged`] when, over the last three sweeps, every
+///   error is below `tolerance`, no global pivots were added, and the last
+///   rank equals the window minimum;
+/// - [`TreeTciTermination::MaxIterations`] when `max_iter` sweeps ran without
+///   either stop.
+///
+/// Every exit happens after a sweep, so the state can be materialized with
+/// [`to_treetn`](crate::to_treetn) whatever the reason.
 ///
 /// Use this when you need a custom proposer (e.g., [`SimpleProposer`](crate::SimpleProposer)
 /// or [`TruncatedDefaultProposer`](crate::TruncatedDefaultProposer)).
@@ -258,7 +371,7 @@ where
 /// ```
 /// use tensor4all_treetci::{
 ///     optimize_with_proposer, GlobalIndexBatch, SimpleProposer,
-///     TreeTCI2, TreeTciEdge, TreeTciGraph, TreeTciOptions,
+///     TreeTCI2, TreeTciEdge, TreeTciGraph, TreeTciOptions, TreeTciTermination,
 /// };
 /// use anyhow::Result;
 ///
@@ -278,22 +391,23 @@ where
 /// };
 ///
 /// let proposer = SimpleProposer::seeded(42);
-/// let options = TreeTciOptions { tolerance: 1e-10, max_iter: 3, ..Default::default() };
-/// let (ranks, errors) = optimize_with_proposer(
+/// let options = TreeTciOptions { tolerance: 1e-10, max_iter: 2, ..Default::default() };
+/// let report = optimize_with_proposer(
 ///     &mut state, evaluate, &options, &proposer,
 /// ).unwrap();
 ///
-/// // One entry per sweep actually run; the loop stops early once converged,
-/// // so this may be less than max_iter (3).
-/// assert!(!ranks.is_empty() && ranks.len() <= 3);
-/// assert_eq!(ranks.len(), errors.len());
+/// // Convergence needs three sweeps of history, so a two-sweep budget always
+/// // ends at the iteration limit, with one entry per sweep.
+/// assert_eq!(report.termination, TreeTciTermination::MaxIterations);
+/// assert_eq!(report.ranks.len(), 2);
+/// assert_eq!(report.errors.len(), 2);
 /// ```
 pub fn optimize_with_proposer<T, F, P>(
     state: &mut TreeTCI2<T>,
     evaluate: F,
     options: &TreeTciOptions,
     proposer: &P,
-) -> TreeTciResult<(Vec<usize>, Vec<f64>)>
+) -> TreeTciResult<TreeTciOptimizeReport>
 where
     T: Scalar + CommonScalar + FullPivLuScalar + tensor4all_core::TensorElement + ScalarParts,
     F: Fn(GlobalIndexBatch<'_>) -> Result<Vec<T>>,
@@ -314,6 +428,7 @@ where
     // global pivots: an iteration that injected pivots has not yet swept them,
     // so its error estimate is stale with respect to those pivots.
     const NCHECK_HISTORY: usize = 3;
+    let mut termination = TreeTciTermination::MaxIterations;
 
     for _iter in 0..options.max_iter {
         for _pass in 0..INNER_EDGE_PASSES {
@@ -366,6 +481,7 @@ where
                     .all(|&r| r >= cap)
             });
         if bond_dim_saturated {
+            termination = TreeTciTermination::MaxBondDimension;
             break;
         }
 
@@ -426,12 +542,17 @@ where
             let rank_stable = last_ranks.iter().min().copied().unwrap_or(0)
                 == last_ranks.last().copied().unwrap_or(0);
             if errors_converged && no_global_pivots && rank_stable {
+                termination = TreeTciTermination::Converged;
                 break;
             }
         }
     }
 
-    Ok((ranks, errors))
+    Ok(TreeTciOptimizeReport {
+        ranks,
+        errors,
+        termination,
+    })
 }
 
 #[cfg(test)]

@@ -106,7 +106,10 @@ pub use globalpivot::find_global_pivots;
 pub use graph::{TreeTciEdge, TreeTciGraph};
 pub use key::SubtreeKey;
 pub use materialize::to_treetn;
-pub use optimize::{optimize_default, optimize_with_proposer, TreeTciOptions};
+pub use optimize::{
+    optimize_default, optimize_with_proposer, TreeTciOptimizeReport, TreeTciOptions,
+    TreeTciTermination,
+};
 pub use proposer::{
     DefaultProposer, PivotCandidateProposer, SimpleProposer, TruncatedDefaultProposer,
 };

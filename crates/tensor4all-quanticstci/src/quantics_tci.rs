@@ -166,8 +166,8 @@ where
     }
 
     let tree_opts = options.to_treetci_options();
-    let (ranks, errors) =
-        optimize_with_proposer(&mut tci, &evaluate, &tree_opts, &DefaultProposer)?;
+    let report = optimize_with_proposer(&mut tci, &evaluate, &tree_opts, &DefaultProposer)?;
+    let (ranks, errors) = (report.ranks, report.errors);
     let treetn = to_treetn(&tci, &evaluate, Some(0))?;
 
     // Convert TreeTN → SimpleTensorTrain<V> via the sanctioned bridge

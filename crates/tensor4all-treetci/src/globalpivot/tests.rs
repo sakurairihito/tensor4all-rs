@@ -89,12 +89,11 @@ fn tree_value(tree: &TreeTN<IdxTensor, usize>, index: &[usize]) -> f64 {
 fn run(enable_global_pivots: bool) -> (Vec<usize>, Vec<f64>, f64, f64) {
     let mut tci = seeded_state();
     let opts = options(enable_global_pivots);
-    let (ranks, errors) =
-        optimize_with_proposer(&mut tci, evaluate, &opts, &DefaultProposer).unwrap();
+    let report = optimize_with_proposer(&mut tci, evaluate, &opts, &DefaultProposer).unwrap();
     let tree = to_treetn(&tci, evaluate, None).unwrap();
     (
-        ranks,
-        errors,
+        report.ranks,
+        report.errors,
         tree_value(&tree, &PEAK_A),
         tree_value(&tree, &PEAK_B),
     )
