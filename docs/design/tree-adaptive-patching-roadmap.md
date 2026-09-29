@@ -67,17 +67,18 @@ PRs).
 
 ### M0. Architecture decisions (S)
 
-Outcome: the open decisions below are settled and recorded, so later
+Outcome: the decisions below are settled and recorded, so later
 milestones do not reopen them.
 
 Scope:
 
-- crate placement of the interpolation driver (see Decision 1);
-- interpolation-engine abstraction (see Decision 2);
-- primary error contract (see Decision 3).
+- trait, adapter, and driver placement (Decision 1);
+- interpolation-engine abstraction (Decision 2);
+- primary error contract (Decision 3);
+- chain crate retirement (Decision 4: out of scope).
 
-Exit: this document is updated with the chosen options, and a design record for
-M2/M3 is approved.
+Exit: all four decisions are recorded below (done). The next gate is the
+approved design record for M2/M3.
 
 ### M1. TreeTN prerequisites (M)
 
@@ -109,19 +110,29 @@ Scope:
   tolerance; outputs are a `TreeTN`, a convergence verdict that distinguishes
   "converged" from "reached cap or iteration limit", an error estimate, the
   maximum sampled magnitude, and recyclable full-domain pivots;
-- a TreeTCI implementation of the trait; TreeACI (and later RSI) are optional
-  implementations after the first one is proven;
-- `partitionedtreetn` keeps no dependency on any interpolation crate.
+- the trait is defined in `tensor4all-treetn` (Decision 1);
+- a TreeTCI implementation of the trait inside `tensor4all-treetci`. TreeACI
+  and RSI follow later as implementations in their own crates; adding one
+  must not modify the trait, the driver, or the TreeTCI implementation
+  (Decision 2);
+- `partitionedtreetn` keeps no dependency on any interpolation crate;
+- the design record for this milestone amends the scope statement of
+  [partitioned-treetn.md](./partitioned-treetn.md).
 
 Exit: the trait and the TreeTCI adapter are merged with tests on chain and
-branched topologies.
+branched topologies. A test-only mock engine exercises the trait through the
+driver, demonstrating that a second engine can be added without changing
+existing code.
 
-### M3. Sequential tree pQTCI with chain parity (L)
+### M3. Sequential tree pQTCI (L)
 
 Outcome: adaptive patched interpolation on arbitrary trees with the behavior of
 `partitionedtt::adaptiveinterpolate`, returning a `PartitionedTreeTN`.
 
 Scope:
+
+- the driver is generic over the M2 trait and lives in
+  `tensor4all-partitionedtreetn`;
 
 - FIFO/BFS patch queue keyed by `Projector` over full `DynIndex` identities;
 - acceptance only for a converged patch within tolerance and strictly below
@@ -130,19 +141,26 @@ Scope:
   and one-pass sample-cache transfer to children;
 - fixed-site handling through the M1 primitive.
 
-Exit: on chain topologies the result matches `partitionedtt` (patch set, ranks,
-and sampled error) for fixed seeds; branched-tree tests cover splits at leaf,
-internal, and multi-site nodes; the driver is deterministic.
+Exit: accepted patches reproduce the source function within the requested
+tolerance against dense or independently converged references, on chain and
+branched topologies; tests cover splits at leaf, internal, and multi-site
+nodes; the driver is deterministic for fixed seeds. The deprecated chain crate
+is design lineage only, not a verification baseline.
 
 ### M4. Unified error contract (M)
 
 Outcome: a user can state one accuracy requirement and get a reported,
-measured bound for interpolation and patched algebra.
+measured bound for interpolation and patched algebra. Verified L2 is the
+primary contract (Decision 3).
 
 Scope:
 
-- interpolation: optional global normalization by a pinned `||F||_inf`
-  shared by all patches, instead of per-patch maximum samples;
+- a user-selectable error-norm option shared by interpolation and patched
+  algebra, with L2 as the default; unimplemented norms are typed
+  placeholders that return an explicit error;
+- interpolation: acceptance and reporting in the selected norm, with the
+  reference scale pinned once for all patches instead of per-patch maximum
+  samples (the sampled max-norm is one selectable option);
 - patched contraction and addition: an optional global-budget mode (per-patch
   tolerance on the order of `tau / N_p`) verified with the difference-network
   norms already used by reconstruction;
@@ -193,6 +211,8 @@ Scope:
 
 - Hataori Rayon domains supplied explicitly by the caller, following
   [adaptive-tci-parallel-execution.md](./adaptive-tci-parallel-execution.md);
+  Hataori becomes an optional dependency of `tensor4all-partitionedtreetn`,
+  shared by the interpolation driver and patched contraction;
 - dynamic scheduling of patches with very different costs instead of strict
   level-synchronous waves;
 - parallel contraction over independent output-projector groups and their
@@ -224,7 +244,7 @@ Outcome: evidence that the tree implementation is correct and useful.
 
 Scope:
 
-- chain parity against `partitionedtt` (M3);
+- correctness against dense or independently converged references (M3);
 - the paper's workloads: 2D Green's function compression, bubble diagram via
   element-wise product, and Bethe-Salpeter vertex contraction;
 - every runtime comparison is made at matched measured accuracy against an
@@ -234,17 +254,17 @@ Scope:
 Exit: benchmark records under `benchmarks/` for each milestone that claims a
 performance gain.
 
-### M10. Migration and bindings (S-M)
+### M10. Bindings (S-M, deferred)
 
-Outcome: one supported implementation.
+Outcome: the tree implementation is reachable from other languages.
 
 Scope:
 
-- propose retiring `partitionedtt::adaptiveinterpolate` once M3 and M7 reach
-  parity (removal requires a separate maintainer decision);
-- C API and Tensor4all.jl exposure after the Rust API stabilizes.
+- C API and Tensor4all.jl exposure after the Rust API stabilizes;
+- `tensor4all-partitionedtt` is not retired or modified by this roadmap
+  (Decision 4).
 
-Exit: a maintainer decision is recorded; binding work is tracked separately.
+Exit: binding work is tracked in its own issues.
 
 ## Dependencies
 
@@ -254,24 +274,42 @@ M0 ──► M2 ──► M3 ──► M4 ──► M5
  └──► M1 ─────┴──► M6 ◄┘
                M3, M6 ──► M7 ──► M8
                M3 ... M8 ──► M9 (continuous)
-               M3, M7 ──► M10
+               M3, M7 ──► M10 (deferred)
 ```
 
 M1 and M2 can proceed in parallel. M4 must precede M7 because parallel
 acceptance depends on a pinned global normalization.
 
-## Open decisions
+## Decisions
 
-1. **Driver crate.** A new orchestration crate that depends on both
-   `tensor4all-partitionedtreetn` and the interpolation engines, or an optional
-   feature of an existing crate. The migration record requires
-   `partitionedtreetn` itself to stay free of interpolation dependencies.
-2. **Engine scope.** TreeTCI only, or a trait designed from the start for
-   TreeTCI, TreeACI, and RSI.
-3. **Primary error norm.** Sampled max-norm (TCI convention) or verified L2
-   (reconstruction convention) as the guarantee advertised by the public API.
-4. **Chain crate retirement.** Whether and when `tensor4all-partitionedtt` is
-   removed after parity.
+1. **Placement.** Decided: no new crate and no dependency change.
+   - The interpolation-engine trait lives in `tensor4all-treetn`, the layer
+     that every engine and `tensor4all-partitionedtreetn` already depend on.
+   - Each engine implements the trait in its own crate (TreeTCI in
+     `tensor4all-treetci`; later engines likewise). Engines adapt to the
+     contract; the driver never adapts to an engine.
+   - The patch driver lives in `tensor4all-partitionedtreetn` and sees only
+     the trait, so that crate still depends on no interpolation engine. The
+     statement in [partitioned-treetn.md](./partitioned-treetn.md) that
+     adaptive interpolation is outside that crate must be amended by the M2
+     design record; its rationale (no TCI dependency) remains satisfied.
+   - Rejected: a new orchestration crate that owns engine adapters (the driver
+     side would change for every new engine and adds a public crate); putting
+     engine dependencies into `partitionedtreetn` (violates the migration
+     record); making engines depend on `partitionedtreetn` (inverts the
+     layering).
+2. **Engine scope.** Decided: implement TreeTCI first. The engine trait and
+   driver must be designed so that adding TreeACI or RSI later means adding a
+   new adapter only, without modifying the driver, the trait, or the TreeTCI
+   adapter.
+3. **Error norm.** Decided: verified L2 is the primary guarantee of the public
+   API. Other norms (for example the sampled max-norm used by TCI) are
+   user-selectable options. A selectable norm whose implementation does not
+   exist yet is a placeholder that returns an explicit typed "not implemented"
+   error; it must never silently fall back to another norm.
+4. **Chain crate retirement.** Decided: out of scope. `tensor4all-partitionedtt`
+   is left untouched; its fate is deferred to a future repository-wide
+   restructuring.
 
 ## Non-goals
 
