@@ -170,7 +170,9 @@ meaning of `rtol` and `reference_scale`.
    checked by a public helper added to the M1 module,
    `tensor4all_treetn::interpolation::validate_layout(&topology, &node_sites)`,
    which `InterpolationProblem::new` also calls, so the driver and the
-   contract share one validator and no fast path can skip it. Then:
+   contract share one validator and no fast path can skip it. Its
+   `InterpolationError::InvalidProblem` is reported as
+   `PatchedInterpolationError::InvalidInput` with the same message. Then:
    `patch_order` entries are distinct site indices of
    the problem (full identity); `rtol` is finite and nonnegative;
    `reference_scale`, if given, is finite and positive; `max_bond_dim >= 2`;
@@ -193,15 +195,21 @@ meaning of `rtol` and `reference_scale`.
    `n_initial_pivots`. The number of points in a patch is computed with
    saturating arithmetic (it only needs to be compared with the target).
    Random candidates use bounded rejection attempts and then fall back to the
-   first unused points in column-major order.
+   first unused points in column-major order. Each random coordinate in
+   `0..d` is drawn from the SplitMix64 stream with Lemire's multiply-shift
+   method with rejection (unbiased), which fixes the reproducible stream.
 5. **Sample checks.** Every value the driver samples (candidates and the
    exact values of step 8) is checked for finiteness before it is used; a
    non-finite value is reported as
    `Interpolation { projector, source: InterpolationError::Evaluator }`.
-6. **Reference scale.** If not given, it is pinned from the root patch's
-   candidate samples and reused for every patch. A root with all candidate
-   samples exactly zero cannot pin a scale and returns `InvalidInput` with the
-   remedy to pass `reference_scale` or pivots in the support.
+6. **Reference scale.** If not given, it is pinned from the root patch and
+   reused for every patch: from all exact values when the root itself is
+   handled exactly by step 8, otherwise from its candidate samples. An exact
+   root never needs the scale, and an all-zero exact root returns an empty
+   partition with its projector in `zero_projectors`. A non-exact root with
+   all candidate samples exactly zero cannot pin a scale and returns
+   `InvalidInput` with the remedy to pass `reference_scale` or pivots in the
+   support.
 7. **Zero screening.** Patches handled exactly by step 8 are screened on all
    their values instead of candidates. For other patches, if every candidate
    sample is exactly zero,
@@ -255,7 +263,8 @@ sub-seeds, one for candidate sampling and one for the engine, by mixing the
 root seed with the patch path, encoded as pairs of (position in the derived
 site order, coordinate); the path never uses `DynIndex` IDs, so the encoding
 survives the adaptive split sites of M5. Tests that need random data use
-`ChaCha8Rng`, through a dev-only dependency on the workspace `rand_chacha`;
+`ChaCha8Rng`, through dev-only dependencies on the workspace `rand` and
+`rand_chacha`;
 the library itself gains no dependency.
 
 Exception to the caller-owned `&mut R` rule: a single caller stream would make
@@ -281,7 +290,9 @@ lineage through `tensor4all-partitionedtt`. The M2 PR:
 
 - `tensor4all_treetn::interpolation::validate_layout` (new public helper, with
   rustdoc and an asserted example); `InterpolationProblem::new` delegates its
-  topology and site checks to it without changing behavior.
+  topology and site checks to it without changing behavior. The M1 record
+  [tree-interpolation-engine-seam.md](./tree-interpolation-engine-seam.md)
+  lists the helper in its contract and validation sections.
 - `crates/tensor4all-partitionedtreetn/README.md` and the crate docs in
   `src/lib.rs`, which say the crate provides no TCI or sampled-zero inference.
 - `docs/book/src/guides/partitioned-treetn.md` (same statement; add the entry
@@ -319,7 +330,11 @@ lineage through `tensor4all-partitionedtt`. The M2 PR:
 - A cache over a domain wider than 128 bits (for example three variables of
   43 bits) works.
 - A one-site patch whose local dimension exceeds `n_initial_pivots` and is
-  nonzero at a single coordinate is accepted, not screened as zero.
+  nonzero at a single coordinate is accepted, not screened as zero, both below
+  the root and as the root without `reference_scale` (the scale is pinned from
+  the exact values); an all-zero exact root returns an empty partition.
+- Random candidate coordinates follow the documented SplitMix64 and Lemire
+  mapping (a fixed seed gives a fixed candidate list).
 - Reports are in canonical path order.
 - Index identity: sites sharing an ID but differing in prime level or tags.
 - Rustdoc: runnable, asserted examples for every public item and `# Errors`

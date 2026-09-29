@@ -122,6 +122,13 @@ impl<V: Clone + Hash + Eq + Ord + Debug + Send + Sync> InterpolationProblem<V> {
     pub fn derive_site_order(node_sites: &BTreeMap<V, Vec<DynIndex>>) -> Vec<DynIndex>;
 }
 
+/// Topology and site checks of the contract, shared with callers such as the
+/// M2 patch driver (added in M2; see "Validation" below).
+pub fn validate_layout<V>(
+    topology: &NodeNameNetwork<V>,
+    node_sites: &BTreeMap<V, Vec<DynIndex>>,
+) -> Result<(), InterpolationError>;
+
 #[non_exhaustive]
 pub enum InterpolationTermination { Converged, BondCapReached, IterationLimit }
 
@@ -165,7 +172,11 @@ site index appears once and has a positive dimension; at least one active
 site exists; `initial_pivots` has one row per active site, at least one
 column, and coordinates within the site dimensions; `absolute_tolerance` is
 finite and nonnegative. Engines rely on these invariants and do not repeat
-the checks. Sizes an engine derives for itself (for TreeTCI, the product of a
+the checks. The topology and site checks (tree shape, node set, distinct full
+site identities, positive dimensions, at least one site) are performed by the
+public `validate_layout`, which `new` calls; M2 added it so that the patch
+driver validates its inputs with the same code before any evaluation. Sizes an
+engine derives for itself (for TreeTCI, the product of a
 node's site dimensions) are validated by that engine with checked arithmetic
 and reported as `InvalidProblem`.
 
