@@ -5,9 +5,36 @@ patches. The crate supports arbitrary named tree topologies, multiple site
 indices per node, homogeneous `f64`/`Complex64` partitions, strict algebra, and
 volume-proportional adaptive patching.
 
-Adaptive patching is bond-cap-driven and independent of adaptive interpolation:
-this crate does **not** provide TCI, sampled-zero inference, or a dependency on
-`tensor4all-treetci`.
+Adaptive patching is bond-cap-driven and independent of adaptive interpolation.
+
+## Adaptive patched interpolation
+
+`adaptive_interpolation::patched_interpolate` builds a partition directly from
+a batch evaluator on an arbitrary named tree. It runs an interpolation engine
+implementing `tensor4all_treetn::interpolation::TreeInterpolator` (for example
+`tensor4all_treetci::TreeTciInterpolator`) on the whole domain, accepts only
+outcomes that converged strictly below `max_bond_dim`, and otherwise fixes the
+next site of `patch_order` and retries on every child. The crate depends on the
+engine trait only, not on `tensor4all-treetci`.
+
+- Patches are processed sequentially in FIFO order; each has an evaluation
+  cache, so no point is evaluated twice. Patches with at most one active site
+  are evaluated exactly without the engine.
+- A patch whose candidate samples are all exactly zero is reported in
+  `PatchedInterpolationReport::zero_projectors` and omitted from the partition.
+  This is a finite-sampling policy: sparse functions need initial pivots in
+  their support.
+- Acceptance uses the engine's sampled error estimate against
+  `rtol * reference_scale`. It is **not** a verified error bound and makes no
+  L2 claim. Pass a known `reference_scale`; otherwise it is pinned from the
+  root patch's samples.
+- Randomness comes from a per-patch seed derived from
+  `PatchedInterpolationOptions::seed`; for a fixed seed, a deterministic
+  evaluator, and a deterministic engine the result is reproducible.
+
+The patch queue and pivot recycling derive from TCIAlgorithms.jl (MIT) through
+the deprecated `tensor4all-partitionedtt`; this crate carries
+`LICENSE-TCIALGORITHMS-MIT`.
 
 ## Truncation convention
 

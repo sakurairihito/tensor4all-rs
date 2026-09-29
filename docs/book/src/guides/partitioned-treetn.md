@@ -5,8 +5,10 @@ patches. It is the TreeTN-native successor to the deprecated
 `tensor4all-partitionedtt` crate and supports named chains, branched trees, and
 multiple site indices on one node.
 
-This crate provides partition algebra and TreeTN-general adaptive patching. It
-does not provide adaptive interpolation or TCI.
+This crate provides partition algebra, TreeTN-general adaptive patching, and
+adaptive patched interpolation of a function through any tree interpolation
+engine. It does not implement an engine itself; the TreeTCI engine lives in
+`tensor4all-treetci`.
 
 ## Construct an eager patch
 
@@ -94,6 +96,87 @@ assert!(result.values().all(|patch| patch.max_bond_dim() <= 1));
 `ExactParameterGain` forms and budget-truncates every candidate's children,
 then compares checked sums of logical local tensor element counts. Structured
 storage payload length and AD state are not used as the metric.
+
+## Adaptive patched interpolation
+
+`adaptive_interpolation::patched_interpolate` interpolates a function on an
+arbitrary named tree directly into a partition. It runs an engine implementing
+`tensor4all_treetn::interpolation::TreeInterpolator`, such as
+`tensor4all_treetci::TreeTciInterpolator`, on the whole domain. An outcome is
+accepted only when it converged strictly below `max_bond_dim`; otherwise the
+next unfixed site of `patch_order` is fixed and every child is interpolated in
+turn. For quantics grids, list the most significant bits first.
+
+The evaluator receives a column-major `[n_sites, n_points]` batch of
+zero-based full-domain points in the derived site order: nodes in ascending
+name order, each node's sites in the given order. Each patch caches its
+samples and hands them to its children, so no point is evaluated twice, and a
+patch with at most one unfixed site is evaluated exactly without the engine.
+
+```rust
+# use std::collections::BTreeMap;
+# use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex, IdxTensor};
+# use tensor4all_partitionedtreetn::adaptive_interpolation::{
+#     patched_interpolate, PatchedInterpolationOptions,
+# };
+# use tensor4all_treetci::TreeTciInterpolator;
+# use tensor4all_treetn::NodeNameNetwork;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// A junction "c" of degree three without a site, and three leaves.
+let (x, y, z) = (DynIndex::new_dyn(2), DynIndex::new_dyn(3), DynIndex::new_dyn(3));
+let mut topology = NodeNameNetwork::new();
+for node in ["c", "x", "y", "z"] {
+    topology.add_node(node.to_string())?;
+}
+for leaf in ["x", "y", "z"] {
+    topology.add_edge(&"c".to_string(), &leaf.to_string())?;
+}
+let node_sites = BTreeMap::from([
+    ("c".to_string(), vec![]),
+    ("x".to_string(), vec![x.clone()]),
+    ("y".to_string(), vec![y.clone()]),
+    ("z".to_string(), vec![z.clone()]),
+]);
+
+// Site order [x, y, z]. f vanishes for x = 0 and has rank three otherwise.
+let f = |p: &[usize]| (p[0] * (1 + p[1] + p[2]).pow(2)) as f64;
+let options = PatchedInterpolationOptions::new(3)
+    .with_rtol(1e-10)
+    .with_reference_scale(25.0)
+    .with_patch_order(vec![x.clone(), y.clone()]);
+let result = patched_interpolate(
+    &TreeTciInterpolator::default(),
+    topology,
+    node_sites,
+    ColMajorArray::new(vec![1, 2, 2], vec![3, 1])?,
+    |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
+        Ok(batch.data().chunks(3).map(f).collect())
+    },
+    &options,
+)?;
+
+// The x = 0 half is a zero patch; the rest is split at y.
+assert_eq!(result.report.zero_projectors.len(), 1);
+assert_eq!(result.partition.len(), 3);
+
+let values: Vec<f64> = (0..18).map(|k| f(&[k % 2, (k / 2) % 3, k / 6])).collect();
+let reference = IdxTensor::from_dense(vec![x, y, z], values)?;
+let dense = result.partition.to_treetn()?.contract_to_tensor()?;
+assert!(dense.sub(&reference)?.maxabs()? < 1e-8);
+# Ok(())
+# }
+```
+
+A patch whose candidate samples are all exactly zero is reported in
+`report.zero_projectors` and left out of the partition, which treats an absent
+patch as zero. This is a finite-sampling policy: pass initial pivots in the
+support of a sparse function. Acceptance uses the engine's sampled error
+estimate against `rtol * reference_scale`; it is not a verified error bound and
+makes no L2 claim. Pass a known `reference_scale`: without one, the scale is
+pinned from the samples of the whole domain, a lower bound on `max |f|` that
+tightens the tolerance for localized functions. Execution is sequential; for a
+fixed `seed`, a deterministic evaluator, and a deterministic engine, the
+partition and the report are reproducible.
 
 ## Reconstruction with a fixed global L2 tolerance
 

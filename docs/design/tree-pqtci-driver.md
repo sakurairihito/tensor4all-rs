@@ -2,11 +2,23 @@
 
 ## Status
 
-Proposal for review, revised after a first design review. Milestone M2 of
-[tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md).
-It adds public API to `tensor4all-partitionedtreetn` and must be approved
-before implementation. It builds on the M1 contract in
-[tree-interpolation-engine-seam.md](./tree-interpolation-engine-seam.md).
+Approved and implemented in M2 of
+[tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md). It
+builds on the M1 contract in
+[tree-interpolation-engine-seam.md](./tree-interpolation-engine-seam.md). The
+implementation consists of:
+
+- the public helper `tensor4all_treetn::interpolation::validate_layout`, which
+  `InterpolationProblem::new` now calls;
+- the module `tensor4all_partitionedtreetn::adaptive_interpolation` (the
+  driver, its packed-key cache, candidate sampling, and re-embedding) and the
+  crate-internal assembly `PartitionedTreeTN::from_disjoint_subdomains`;
+- the driver-local dense test engine and the TreeTCI end-to-end tests;
+- the provenance record, `LICENSE-TCIALGORITHMS-MIT`, and the public-surface
+  updates listed below.
+
+The decisions taken during implementation are recorded under
+[Implementation decisions](#implementation-decisions).
 
 ## Goal
 
@@ -349,8 +361,64 @@ lineage through `tensor4all-partitionedtt`. The M2 PR:
   (M5).
 - Retiring or changing `tensor4all-partitionedtt`.
 
-## Open question for review
+## Names
 
-1. Names: `adaptive_interpolation`, `patched_interpolate`, and the
-   `Patched*` types, chosen to avoid `AdaptiveInterpolationResult` in the
-   chain crate.
+The review kept the proposed names: `adaptive_interpolation`,
+`patched_interpolate`, and the `Patched*` types, chosen to avoid
+`AdaptiveInterpolationResult` in the chain crate.
+
+## Implementation decisions
+
+- **Scalar bounds.** `T: tensor4all_core::CommonScalar + TensorElement`.
+  Magnitudes, the exact-zero test, and the finiteness test all use
+  `CommonScalar::abs_val` (the hypotenuse for complex values); one-hot factors
+  and exact networks are built with `IdxTensor::from_dense::<T>`.
+- **Where values are checked.** The per-patch cache is the only path to the
+  evaluator, so the count and finiteness checks of step 5 sit there and also
+  cover the samples the engine requests, not only the candidates and exact
+  values. A failure is returned to the engine as an evaluator error, which the
+  M1 contract reports as `InterpolationError::Evaluator`. The cache also
+  rejects an engine batch with the wrong number of rows or an out-of-range
+  coordinate the same way, before the evaluator sees it. Nothing is cached for
+  a failed batch.
+- **Engine outcomes are checked, not trusted.** An accepted outcome must carry
+  the problem's nodes and edges and exactly the active sites of every node
+  (full identity and dimension); returned pivots are checked (one row per
+  active site, in-range coordinates) only when `recycle_pivots` is on. A
+  mismatch is `Interpolation { projector, source: InterpolationError::Engine }`.
+- **`patch_order` identity.** An entry that matches a site's identity (ID,
+  tags, prime level) but not its dimension is rejected as `InvalidInput`, as
+  the rest of the crate rejects equal-identity aliases with another dimension.
+- **Seeds and keys.** `mix(x)` is the first SplitMix64 output of the state
+  `x`. A patch absorbs its path into `mix(root_seed ^ PATH_DOMAIN)` pair by
+  pair (`s = mix(s ^ position)`, then `s = mix(s ^ coordinate)`), and its
+  candidate and engine sub-seeds are `mix(s ^ CANDIDATE_STREAM)` and
+  `mix(s ^ ENGINE_STREAM)` with the constants in
+  `src/adaptive_interpolation/sampling.rs`. Random candidates get
+  `20 * missing + 100` attempts before the column-major fallback. A cache key
+  gives each coordinate `bits(d - 1)` bits (none for `d = 1`) without
+  straddling a word. Unit tests pin these streams against an independent
+  implementation.
+- **No patch without an active site.** Only patches with at least two active
+  sites split, so every child keeps at least one; the no-active-site case of
+  step 8 is unreachable through the driver. The exact path enumerates the
+  points of a patch without distinguishing the two cases, and the network
+  builder for it is unit-tested directly.
+- **Counters.** `function_evaluations` counts the points passed to the
+  evaluator; `cache_hits` counts requested points served without it, including
+  repeats inside one batch.
+- **Assembly.** `from_disjoint_subdomains` still checks topology, site space,
+  and dtype against the first patch (linear in the patch count) and skips only
+  the pairwise overlap check. Violated internal invariants, which the queue
+  rules out, are reported as `Partition` errors rather than panics.
+- **Tolerance overflow.** `rtol * reference_scale` can overflow for finite
+  inputs; `InterpolationProblem::new` then rejects the root problem, reported
+  as `Interpolation { source: InvalidProblem }`, since a pinned scale is only
+  known after the root samples.
+- **Tests.** The domain wider than 128 bits is a chain of 129 binary sites
+  (three 43-bit variables) run with a test engine that builds the exact
+  rank-one network of a product function from fibers: TreeTCI took about
+  300 s for one run on that chain in a debug build. Determinism is checked on
+  the stored patch tensors, because materializing the same partition twice
+  with `to_treetn` and `contract_to_tensor` differs at rounding level (the
+  index order of the direct sum is not fixed).

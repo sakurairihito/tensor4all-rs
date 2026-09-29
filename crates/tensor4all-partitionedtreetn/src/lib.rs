@@ -8,10 +8,19 @@
 //! patching. Stored patch data is eagerly masked, and partition metadata is
 //! validated transactionally.
 //!
+//! [`adaptive_interpolation::patched_interpolate`] builds a partition directly
+//! from a function: it runs any engine implementing
+//! [`TreeInterpolator`](tensor4all_treetn::interpolation::TreeInterpolator)
+//! (for example `tensor4all_treetci::TreeTciInterpolator`) patch by patch and
+//! splits the patches that do not converge below the bond cap. The crate
+//! depends on the engine trait only, not on an engine crate.
+//!
 //! The representation follows the partitioned tensor-network approach used by
 //! [PartitionedMPSs.jl](https://github.com/tensor4all/PartitionedMPSs.jl) and
-//! the adaptive patching literature; this crate does not contain TCI-derived
-//! adaptive interpolation code.
+//! the adaptive patching literature. The patch queue of the adaptive
+//! interpolation driver derives from TCIAlgorithms.jl (MIT) through
+//! `tensor4all-partitionedtt`; see the notice in
+//! [`adaptive_interpolation`] and `LICENSE-TCIALGORITHMS-MIT`.
 
 pub mod adaptive_interpolation;
 mod error;

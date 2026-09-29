@@ -279,6 +279,8 @@ Amended by the [tree interpolation engine seam](tree-interpolation-engine-seam.m
   `docs/PROVENANCE_AND_CITATION_POLICY.md` and follows the license and
   derivation-notice obligations stated below for code derived from that crate
   (`LICENSE-TCIALGORITHMS-MIT`).
+- Implemented in M2 as `tensor4all_partitionedtreetn::adaptive_interpolation`
+  ([tree-pqtci-driver.md](tree-pqtci-driver.md)).
 
 ## Errors
 
@@ -362,6 +364,7 @@ impact attestation in the worklog/PR body.
 - Adaptive interpolation (the M2 patch driver of the
   [tree adaptive patching roadmap](tree-adaptive-patching-roadmap.md); see
   [Adaptive interpolation ownership](#adaptive-interpolation-ownership)).
+  Implemented in M2 ([tree-pqtci-driver.md](tree-pqtci-driver.md)).
 - Common-refinement addition for different overlapping projector layouts.
 - Contraction between different named topologies.
 - Generic tensor storage beyond `IdxTensor`.

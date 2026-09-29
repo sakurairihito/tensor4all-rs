@@ -144,7 +144,9 @@ Ports InterpolativeQTT.jl; returns `SimpleTensorTrain<f64>`.
 
 Use this crate for new partitioned work on named TreeTNs. It stores eagerly
 masked `TreeTN<IdxTensor, V>` patches, supports branched topologies and multiple
-site indices per node, and does not implement adaptive interpolation.
+site indices per node, and drives adaptive patched interpolation through any
+engine implementing `tensor4all_treetn::interpolation::TreeInterpolator`
+(it implements no engine and does not depend on `tensor4all-treetci`).
 
 - `Projector` — maps full `DynIndex` identities to zero-based coordinates.
 - `SubDomainTreeTN<V>` — eagerly masked TreeTN plus its projector.
@@ -156,6 +158,22 @@ site indices per node, and does not implement adaptive interpolation.
 - `PatchSplitStrategy::{Sequential, ExactParameterGain}` — exact gain uses
   checked logical local tensor element counts after child truncation.
 - `add_with_patching(patches, &center, &options)` — split over-cap patches.
+- `adaptive_interpolation::patched_interpolate(&engine, topology, node_sites,
+  initial_pivots, evaluate, &PatchedInterpolationOptions)` — sequential tree
+  pQTCI. `evaluate` receives a column-major `[n_sites, n_points]` batch of
+  0-based full-domain points in the derived site order (nodes ascending, each
+  node's sites in order). A patch is accepted only on
+  `InterpolationTermination::Converged` (strictly below `max_bond_dim`, at
+  least 2); otherwise the next site of the (partial) `patch_order` is fixed.
+  `PatchedInterpolationOptions::new(max_bond_dim)` plus `with_*` builders:
+  `rtol` (default `1e-8`; engine tolerance `rtol * reference_scale`, a sampled
+  criterion — no verified bound, no L2 claim), `reference_scale` (pass a known
+  `max |f|`; else pinned from the root samples), `n_initial_pivots` (5),
+  `recycle_pivots` (false), `seed` (0; per-patch sub-seeds, no `&mut R` API),
+  `max_patches`. All-zero candidate samples make a zero patch
+  (`report.zero_projectors`, absent from the partition): supply pivots in the
+  support of sparse functions. Patches with at most one free site are
+  evaluated exactly; every point is evaluated at most once.
 - `truncate_adaptive(&partition, &center, cutoff, max_bond_dim)` — assign
   volume-proportional absolute local cutoffs and drop patches at/below theirs.
 - `contract_adaptive(&left, &right, &center, &contract_options, &patching_options)` —

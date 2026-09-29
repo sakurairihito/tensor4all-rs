@@ -48,7 +48,7 @@ Record any new port, derivation, or algorithm origin in
 | `add_with_patching`, `truncate_adaptive` | yes (`rtol`) | yes (local discarded-weight `cutoff`) |
 | `contract_adaptive` (project-first recursion) | yes | yes |
 | Split strategies | `Sequential`, `ExactParameterGain` | same |
-| Adaptive patched interpolation | yes (`adaptiveinterpolate`) | **no**; excluded from the migration scope of [partitioned-treetn.md](./partitioned-treetn.md) |
+| Adaptive patched interpolation | yes (`adaptiveinterpolate`) | sequential, generic over the M1 engine trait (`adaptive_interpolation::patched_interpolate`, M2) |
 | Global L2 reconstruction and merge | no | yes ([orthogonal-target-reconstruction.md](./orthogonal-target-reconstruction.md)) |
 | Parallel patch execution | Hataori Rayon/MPI for interpolation ([adaptive-tci-parallel-execution.md](./adaptive-tci-parallel-execution.md)) | none |
 
