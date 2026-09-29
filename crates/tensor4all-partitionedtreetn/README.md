@@ -30,7 +30,10 @@ engine trait only, not on `tensor4all-treetci`.
   root patch's samples.
 - Randomness comes from a per-patch seed derived from
   `PatchedInterpolationOptions::seed`; for a fixed seed, a deterministic
-  evaluator, and a deterministic engine the result is reproducible.
+  evaluator, and a deterministic engine the stored patches and the report are
+  identical across runs. Their direct sum (`to_treetn`, then a dense
+  contraction) is equal only up to rounding, because `TreeTN::add` orders the
+  summed indices by hash-map iteration.
 
 The patch queue and pivot recycling derive from TCIAlgorithms.jl (MIT) through
 the deprecated `tensor4all-partitionedtt`; this crate carries

@@ -173,10 +173,14 @@ patch as zero. This is a finite-sampling policy: pass initial pivots in the
 support of a sparse function. Acceptance uses the engine's sampled error
 estimate against `rtol * reference_scale`; it is not a verified error bound and
 makes no L2 claim. Pass a known `reference_scale`: without one, the scale is
-pinned from the samples of the whole domain, a lower bound on `max |f|` that
-tightens the tolerance for localized functions. Execution is sequential; for a
-fixed `seed`, a deterministic evaluator, and a deterministic engine, the
-partition and the report are reproducible.
+pinned to the largest magnitude among the root patch's candidate samples (or
+its exact values when the root has at most one site), a sampled lower bound on
+`max |f|` that tightens the tolerance for localized functions. Execution is
+sequential; for a fixed `seed`, a deterministic evaluator, and a deterministic
+engine, the stored patches and the report are identical across runs.
+Materializing their direct sum with `to_treetn` and a dense contraction is
+equal only up to rounding, because `TreeTN::add` orders the summed indices by
+hash-map iteration.
 
 ## Reconstruction with a fixed global L2 tolerance
 
