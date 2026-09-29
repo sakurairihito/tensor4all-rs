@@ -39,16 +39,21 @@ Verified against the M1 branch state.
 - `tensor4all_core::CachedFunction` requires an infallible, `Send + Sync`
   point function and a `'static` batch function over `&[Vec<I>]`, and its keys
   stop at 1024 bits. It cannot wrap a fallible column-major evaluator, and its
-  entries can only be cleared all at once.
+  entries can only be cleared all at once. Core's key-width selection is
+  crate-private, and `tensor4all-partitionedtreetn` has no wide-integer
+  dependency.
+- The topology and site checks of the M1 contract (tree shape, node set equal
+  to the `node_sites` keys, distinct full site identities, positive
+  dimensions, at least one site) currently run only inside
+  `InterpolationProblem::new`.
 - `PartitionedTreeTN` treats an absent patch as zero and requires disjoint
   projectors, not coverage; `from_subdomains(vec![])` is valid and later
   operations on an empty partition return `Empty`. `from_subdomains` checks all
   patch pairs for overlap.
 - `PatchingOptions::patch_order` in the same crate accepts a partial order.
-- `tensor4all-partitionedtreetn` has no random-number dependency. The workspace
-  provides `rand` and `rand_chacha`; REPOSITORY_RULES.md requires named RNG
-  algorithms in seed-based production code and a caller-owned `&mut R` API for
-  randomized algorithms.
+- `tensor4all-partitionedtreetn` has no random-number dependency.
+  REPOSITORY_RULES.md requires a named RNG algorithm in seed-based production
+  code and a caller-owned `&mut R` API for randomized algorithms.
 - Design lineage and provenance: the chain driver
   `tensor4all-partitionedtt::adaptiveinterpolate` states that its queue, split
   flow, and pivot recycling derive from TCIAlgorithms.jl. The approved records
@@ -74,7 +79,9 @@ pub struct PatchedInterpolationOptions {
     pub seed: u64,
     pub max_patches: Option<usize>,
 }
-// Default plus `with_*` builders; fields documented as below.
+// Built with `PatchedInterpolationOptions::new(max_bond_dim)`, which sets the
+// defaults below, plus `with_*` builders; there is no `Default` because the
+// bond cap has no sensible default.
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -159,7 +166,12 @@ meaning of `rtol` and `reference_scale`.
 
 ## Algorithm
 
-1. **Validate** the inputs: `patch_order` entries are distinct site indices of
+1. **Validate** the inputs before any evaluation. The topology and sites are
+   checked by a public helper added to the M1 module,
+   `tensor4all_treetn::interpolation::validate_layout(&topology, &node_sites)`,
+   which `InterpolationProblem::new` also calls, so the driver and the
+   contract share one validator and no fast path can skip it. Then:
+   `patch_order` entries are distinct site indices of
    the problem (full identity); `rtol` is finite and nonnegative;
    `reference_scale`, if given, is finite and positive; `max_bond_dim >= 2`;
    `n_initial_pivots >= 1`; `max_patches` is not `Some(0)`; `initial_pivots`
@@ -169,11 +181,12 @@ meaning of `rtol` and `reference_scale`.
    in FIFO order, counting every processed patch against `max_patches`
    (`ResourceLimit` when exceeded).
 3. **Cache.** Each patch owns an evaluation cache keyed by its active
-   coordinates, encoded as a mixed-radix integer of the narrowest sufficient
-   width; a domain too large for the widest supported key is `InvalidInput`.
-   When a patch splits, its cache is partitioned among its children in one
-   pass; when a patch is accepted or found to be zero, its cache is dropped.
-   An evaluator error is returned immediately; nothing is cached for it.
+   coordinates packed into a variable-length key (a boxed slice of `u64`
+   words, each holding as many coordinates as fit), so any domain size is
+   supported without a width limit or a new dependency. When a patch splits,
+   its cache is partitioned among its children in one pass; when a patch is
+   accepted or found to be zero, its cache is dropped. An evaluator error is
+   returned immediately; nothing is cached for it.
 4. **Candidates.** Keep, in order and without duplicates, the user pivots and
    (if enabled) the recycled parent pivots that are compatible with the
    patch's projector; then add random points inside the patch up to
@@ -181,14 +194,17 @@ meaning of `rtol` and `reference_scale`.
    saturating arithmetic (it only needs to be compared with the target).
    Random candidates use bounded rejection attempts and then fall back to the
    first unused points in column-major order.
-5. **Sample checks.** Candidate samples are checked for finiteness in every
-   patch before anything else; a non-finite sample is reported as
+5. **Sample checks.** Every value the driver samples (candidates and the
+   exact values of step 8) is checked for finiteness before it is used; a
+   non-finite value is reported as
    `Interpolation { projector, source: InterpolationError::Evaluator }`.
 6. **Reference scale.** If not given, it is pinned from the root patch's
    candidate samples and reused for every patch. A root with all candidate
    samples exactly zero cannot pin a scale and returns `InvalidInput` with the
    remedy to pass `reference_scale` or pivots in the support.
-7. **Zero screening.** If every candidate sample of a patch is exactly zero,
+7. **Zero screening.** Patches handled exactly by step 8 are screened on all
+   their values instead of candidates. For other patches, if every candidate
+   sample is exactly zero,
    the patch is a zero patch: its projector is recorded in
    `zero_projectors` and it is omitted from the partition. Exact zero matches
    M1's `AllSamplesZero` rule (the chain lineage used a `1e-30` threshold).
@@ -199,7 +215,11 @@ meaning of `rtol` and `reference_scale`.
    with exactly one active site has `d` values. Both are evaluated directly and
    built as a network with dimension-one links: the values on the node that
    carries the active site (or on the smallest node name if none), and a
-   one-hot factor for every fixed site on its own node. No engine call.
+   one-hot factor for every fixed site on its own node. No engine call. The
+   exact values are evaluated before zero screening: if all are exactly zero
+   the patch is a zero patch, otherwise it is accepted. Its `PatchRecord` has
+   `termination = Converged`, `error_estimate = 0`, the largest evaluated
+   magnitude, and `max_bond_dim = 1`.
 9. **Interpolate.** Otherwise build an `InterpolationProblem` with the active
    sites, the candidates in active coordinates,
    `absolute_tolerance = rtol * reference_scale`, the bond cap, and the engine
@@ -215,7 +235,11 @@ meaning of `rtol` and `reference_scale`.
     re-attached to its original node by an outer product with a one-hot vector
     built from `T`, then is wrapped with the crate-internal `from_masked_data`
     (the data is already masked). This helper is shared by all engines.
-12. **Assemble** the accepted patches with a crate-internal constructor that
+12. **Order.** `report.accepted` and `report.zero_projectors` are sorted by
+    patch path (lexicographic over the (position, coordinate) pairs), a
+    canonical order independent of processing order, so M7 can guarantee
+    identical reports.
+13. **Assemble** the accepted patches with a crate-internal constructor that
     skips the pairwise overlap check, because the queue produces disjoint
     projectors by construction; a debug assertion keeps the check in tests.
     An all-zero run returns an empty partition.
@@ -225,12 +249,14 @@ The partition stays in the eager (masked) form required by the current
 
 ## Randomness and determinism
 
-The driver uses `ChaCha8Rng` (workspace `rand` and `rand_chacha`, added as
-dependencies of `tensor4all-partitionedtreetn`). Each patch derives two
-sub-seeds, one for candidate sampling and one for the engine, by a SplitMix64
-mix of the root seed and the patch path, encoded as pairs of (position in the
-derived site order, coordinate); the path never uses `DynIndex` IDs, so the
-encoding survives the adaptive split sites of M5.
+The driver's generator is SplitMix64, a named algorithm implemented in the
+driver, so no dependency is added (roadmap Decision 1). Each patch derives two
+sub-seeds, one for candidate sampling and one for the engine, by mixing the
+root seed with the patch path, encoded as pairs of (position in the derived
+site order, coordinate); the path never uses `DynIndex` IDs, so the encoding
+survives the adaptive split sites of M5. Tests that need random data use
+`ChaCha8Rng`, through a dev-only dependency on the workspace `rand_chacha`;
+the library itself gains no dependency.
 
 Exception to the caller-owned `&mut R` rule: a single caller stream would make
 each patch's randomness depend on the processing order, so parallel execution
@@ -253,6 +279,9 @@ lineage through `tensor4all-partitionedtt`. The M2 PR:
 
 ## Public-surface updates in the M2 PR
 
+- `tensor4all_treetn::interpolation::validate_layout` (new public helper, with
+  rustdoc and an asserted example); `InterpolationProblem::new` delegates its
+  topology and site checks to it without changing behavior.
 - `crates/tensor4all-partitionedtreetn/README.md` and the crate docs in
   `src/lib.rs`, which say the crate provides no TCI or sampled-zero inference.
 - `docs/book/src/guides/partitioned-treetn.md` (same statement; add the entry
@@ -284,8 +313,14 @@ lineage through `tensor4all-partitionedtt`. The M2 PR:
   compared by projector key.
 - Evaluation counts show no duplicate evaluation of a point.
 - Errors: `NoSplitIndexLeft` (partial order), `ResourceLimit`, an unpinnable
-  scale, a driver-side evaluator failure and a non-finite sample, a domain too
-  large for the cache key, and each `InvalidInput` branch.
+  scale, a driver-side evaluator failure and a non-finite sample (including in
+  the exact small-patch path), and each `InvalidInput` branch, including every
+  `validate_layout` rejection reached through a root with at most one site.
+- A cache over a domain wider than 128 bits (for example three variables of
+  43 bits) works.
+- A one-site patch whose local dimension exceeds `n_initial_pivots` and is
+  nonzero at a single coordinate is accepted, not screened as zero.
+- Reports are in canonical path order.
 - Index identity: sites sharing an ID but differing in prime level or tags.
 - Rustdoc: runnable, asserted examples for every public item and `# Errors`
   naming the variants.
