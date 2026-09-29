@@ -302,7 +302,12 @@ scientific credit for “Adaptive Patching for Tensor Train Computations.” Bec
 `adaptive_interpolation.rs` is not copied, the new crate does not claim a code
 derivation from TCIAlgorithms.jl and does not copy
 `LICENSE-TCIALGORITHMS-MIT`. The deprecated TT crate retains its existing
-TCIAlgorithms derivation notice and license.
+TCIAlgorithms derivation notice and license. This holds for the migration
+only: the M2 adaptive interpolation driver (see
+[Adaptive interpolation ownership](#adaptive-interpolation-ownership)) derives
+its patch queue from TCIAlgorithms.jl through `tensor4all-partitionedtt`, and
+the M2 PR adds the derivation notice, the provenance record, and
+`LICENSE-TCIALGORITHMS-MIT` to this crate.
 
 ## Documentation surface
 

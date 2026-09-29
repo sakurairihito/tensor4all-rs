@@ -2,11 +2,21 @@
 
 ## Status
 
-Proposal for review, revised after a first design review. Milestone M1 of
-[tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md).
-It adds public API to `tensor4all-treetn` and `tensor4all-treetci` and must be
-approved before implementation. The M1 implementation PR also amends
-[partitioned-treetn.md](./partitioned-treetn.md) (last section).
+Approved and implemented in M1 of
+[tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md) on
+branch `feat/tree-adaptive-patching`:
+
+- `314e8123` TreeTCI termination report (step 1) and the `tensor4all-quanticstci`
+  update;
+- `e25e2fe0` the contract module `tensor4all_treetn::interpolation`;
+- `96949860` the TreeTCI engine `TreeTciInterpolator` (steps 2-6) and its
+  tests, including the test-only mock engine;
+- `69ae1b0f` the amendment of [partitioned-treetn.md](./partitioned-treetn.md)
+  (last section);
+- `c0cde430` review fixes (the cap precedence, non-finite initial samples).
+
+The decisions taken during implementation are recorded under
+[Implementation decisions](#implementation-decisions).
 
 ## Goal
 
@@ -177,9 +187,11 @@ and reported as `InvalidProblem`.
 - **Samples.** `max_sample_magnitude` covers the samples used by the
   interpolation sweeps, not samples taken only for global pivot search or
   materialization.
-- **Zero patches.** If every initial pivot evaluates to zero the engine
-  returns `AllSamplesZero`. The sampled-zero policy itself (screening
-  candidates before calling the engine) belongs to the driver (M2).
+- **Zero patches.** If every initial pivot evaluates to exactly zero the
+  engine returns `AllSamplesZero`. A non-finite initial sample (NaN or
+  infinite) is an invalid evaluator value and is reported as `Evaluator`, never
+  as `AllSamplesZero`. The sampled-zero policy itself (screening candidates
+  before calling the engine) belongs to the driver (M2).
 - **Pivots.** Returned pivots are valid points but may include points where
   the function is zero; they seed children and carry no other meaning.
 - **Network form.** The outcome network has the problem's node names and
@@ -273,7 +285,43 @@ derivation-notice obligations that
 [partitioned-treetn.md](./partitioned-treetn.md) states for code derived from
 that crate (`LICENSE-TCIALGORITHMS-MIT`).
 
-## Open question for review
+## Names
 
-1. Names: `TreeInterpolator`, `InterpolationProblem`, `InterpolationOutcome`,
-   `InterpolationTermination`, `InterpolationError`.
+The review kept the proposed names: `TreeInterpolator`,
+`InterpolationProblem`, `InterpolationOutcome`, `InterpolationTermination`,
+and `InterpolationError` in `tensor4all_treetn::interpolation`. The TreeTCI
+side adds `TreeTciInterpolator`, `TreeTciOptimizeReport`, and
+`TreeTciTermination`.
+
+## Implementation decisions
+
+- **Report from both optimizers.** `optimize_default`, the thin wrapper of
+  `optimize_with_proposer` with `DefaultProposer`, returns the same
+  `TreeTciOptimizeReport { ranks, errors, termination }`.
+  `TreeTciTermination` is `#[non_exhaustive]`.
+- **Cap precedence in TreeTCI.** The saturation stop is checked before the
+  convergence criterion, ranks never exceed the cap after a sweep, and
+  convergence requires the last rank to be the window minimum. A
+  `TreeTciTermination::Converged` run with a cap therefore ends strictly below
+  it, and an error criterion met at the cap surfaces as `MaxBondDimension`,
+  mapped to `BondCapReached`. The engine keeps the "rank at the cap is
+  `BondCapReached`" guard for `Converged` as defence in depth; it is covered by
+  a unit test of the mapping.
+- **Engine configuration.** `TreeTciInterpolator::new` takes
+  `TreeTciOptions`. On every run the problem overrides `tolerance` (the
+  absolute tolerance), `max_bond_dim` (the cap), `normalize_error` (always
+  `false`), and `seed` (the problem seed); `max_iter` and the global pivot
+  search settings come from the engine. `new` validates the options and
+  requires `max_iter >= TreeTciInterpolator::MIN_MAX_ITER` (public constant,
+  3). `Default` uses `TreeTciOptions::default()`.
+- **Proposer.** The engine always uses `DefaultProposer`, which is
+  deterministic. A seeded proposer could not have its own seed overridden
+  generically, which the randomness rule requires.
+- **Evaluator error source.** When the marker is the direct source of the
+  TreeTCI error, the caller's original error becomes the `Evaluator` source;
+  otherwise the whole chain is kept.
+- **Test-only mock engine.** It evaluates the dense domain and factorizes it
+  with `factorize_tensor_to_treetn`, which rejects a node without site
+  indices, so the mock runs on a chain, a star of degree three, and a single
+  node. The TreeTCI engine is tested on all topologies, including internal and
+  leaf nodes without sites.
