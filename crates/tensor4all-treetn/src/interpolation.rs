@@ -131,8 +131,8 @@ where
     ///   a node. A node's sites are listed in the order the site order uses.
     /// * `initial_pivots` - Column-major `[n_active_sites, n_pivots]` array in
     ///   site order ([`Self::derive_site_order`]), with at least one column.
-    ///   Engines start from these points; if all of them evaluate to zero the
-    ///   engine returns [`InterpolationError::AllSamplesZero`].
+    ///   Engines start from these points; if all of them evaluate to exactly
+    ///   zero the engine returns [`InterpolationError::AllSamplesZero`].
     /// * `absolute_tolerance` - Bound compared with the engine's raw
     ///   (unnormalized) error estimate. The caller derives it from its
     ///   relative tolerance and a reference scale; engines do not normalize.
@@ -600,14 +600,15 @@ pub enum InterpolationError {
         /// Description of the violated condition.
         message: String,
     },
-    /// The evaluator returned an error or a wrong number of values.
+    /// The evaluator returned an error, a wrong number of values, or an
+    /// invalid (non-finite) value where the engine requires a finite one.
     #[error("evaluator failed: {source}")]
     Evaluator {
-        /// The evaluator's error, or a description of the length mismatch.
+        /// The evaluator's error, or a description of the invalid result.
         #[source]
         source: anyhow::Error,
     },
-    /// Every initial pivot evaluated to zero.
+    /// Every initial pivot evaluated to exactly zero.
     #[error("every initial pivot evaluates to zero")]
     AllSamplesZero,
     /// The engine failed for a reason unrelated to the evaluator.
@@ -639,8 +640,10 @@ pub enum InterpolationError {
 ///   [`InterpolationTermination::BondCapReached`].
 /// - [`InterpolationProblem::seed`] overrides any seed in the engine's own
 ///   configuration.
-/// - If every initial pivot evaluates to zero, the engine returns
-///   [`InterpolationError::AllSamplesZero`].
+/// - If every initial pivot evaluates to exactly zero, the engine returns
+///   [`InterpolationError::AllSamplesZero`]; a non-finite initial sample is an
+///   invalid evaluator value and is reported as
+///   [`InterpolationError::Evaluator`].
 /// - The outcome network carries the problem's node names, topology, and
 ///   exactly the active site indices.
 ///
@@ -752,10 +755,11 @@ pub trait TreeInterpolator<T> {
     /// - [`InterpolationError::InvalidProblem`] when the engine cannot
     ///   represent the problem (for example a size derived by the engine
     ///   overflows).
-    /// - [`InterpolationError::Evaluator`] when `evaluate` returns an error or
-    ///   a number of values other than the number of points.
+    /// - [`InterpolationError::Evaluator`] when `evaluate` returns an error, a
+    ///   number of values other than the number of points, or a non-finite
+    ///   value at an initial pivot.
     /// - [`InterpolationError::AllSamplesZero`] when every initial pivot
-    ///   evaluates to zero.
+    ///   evaluates to exactly zero.
     /// - [`InterpolationError::Engine`] for any other engine failure.
     ///
     /// # Examples

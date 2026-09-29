@@ -215,11 +215,16 @@ impl Default for TreeTciOptions {
 /// assert_eq!(report.ranks, vec![1, 1, 1]);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TreeTciTermination {
     /// Over the last three sweeps every bond error was below
     /// [`TreeTciOptions::tolerance`], no global pivots were added, and the
-    /// last rank equals the minimum rank of the window. The final rank may
-    /// equal [`TreeTciOptions::max_bond_dim`].
+    /// last rank equals the minimum rank of the window. When
+    /// [`TreeTciOptions::max_bond_dim`] is set, the final rank is strictly
+    /// below it: ranks never exceed the cap after a sweep, a final rank equal
+    /// to the cap would make the whole window sit at the cap (the last rank is
+    /// the window minimum), and that case is taken by the saturation stop,
+    /// which is checked first.
     Converged,
     /// [`TreeTciOptions::max_bond_dim`] is set and the maximal bond dimension
     /// reached it in each of the last three sweeps. This stop is checked

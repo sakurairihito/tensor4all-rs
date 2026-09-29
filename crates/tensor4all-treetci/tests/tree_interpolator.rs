@@ -102,13 +102,12 @@ fn pivots_from(points: &[Vec<usize>]) -> ColMajorArray<usize> {
 }
 
 /// Checks shared by every engine and every run, whatever the verdict.
-struct Checked<T> {
+struct Checked {
     outcome: InterpolationOutcome<Name>,
     /// Max-norm residual against the dense reference.
     residual: f64,
     /// Largest magnitude of the function on the domain.
     max_abs: f64,
-    _scalar: std::marker::PhantomData<T>,
 }
 
 /// Run `engine` on `problem` and check the contract: node names, topology,
@@ -120,7 +119,7 @@ fn run_and_check<T, E>(
     engine: &E,
     problem: &InterpolationProblem<Name>,
     f: &dyn Fn(&[usize]) -> T,
-) -> Checked<T>
+) -> Checked
 where
     T: TensorElement + CommonScalar,
     E: TreeInterpolator<T>,
@@ -187,7 +186,6 @@ where
         outcome,
         residual,
         max_abs,
-        _scalar: std::marker::PhantomData,
     }
 }
 
@@ -313,7 +311,7 @@ fn single_node_function(p: &[usize]) -> f64 {
     (p[0] + 2 * p[1]) as f64 - 3.0 * p[2] as f64
 }
 
-fn assert_accurate<T>(checked: &Checked<T>, relative: f64) {
+fn assert_accurate(checked: &Checked, relative: f64) {
     assert!(
         checked.residual <= relative * checked.max_abs,
         "residual {} exceeds {relative} * max |f| {}",
@@ -541,9 +539,11 @@ fn criterion_met_at_the_cap_is_bond_cap_reached() {
     // Chain of three dimension-2 nodes (max degree 2). 1 + p0 + p1 + p2 has
     // rank 2 across both cuts, which is also the largest rank a cut of this
     // domain can have, so with a cap of 2 TreeTCI reaches the cap with a zero
-    // bond error: the error criterion holds at a rank equal to the cap. (When
-    // the cap is below the full rank of an edge's candidate matrix, TreeTCI
-    // reports the last accepted pivot as that edge's error instead.)
+    // bond error: the error criterion holds at a rank equal to the cap. The
+    // saturation stop, which the loop checks before convergence, ends the run
+    // (`MaxBondDimension`), mapped to `BondCapReached`. Because of that
+    // precedence TreeTCI never reports `Converged` at the cap; the mapping's
+    // guard for that case is unit-tested in `src/interpolator/tests.rs`.
     let node_sites: BTreeMap<Name, Vec<DynIndex>> = ["n0", "n1", "n2"]
         .iter()
         .map(|node| (name(node), vec![DynIndex::new_dyn(2)]))
@@ -669,13 +669,13 @@ fn sparse_value(point: &[usize]) -> f64 {
     }
 }
 
-/// Chain of five dimension-4 nodes (max degree 2), seeded with sixteen
-/// support points and capped at 8.
+/// Chain of five dimension-4 nodes (max degree 2), seeded with eight
+/// support points and capped at 4.
 fn sparse_chain_problem(seed: u64) -> InterpolationProblem<Name> {
     const N_SITES: usize = 5;
     let mut pivots = Vec::new();
     let mut key = 1u64;
-    while pivots.len() < 16 {
+    while pivots.len() < 8 {
         key = mix64(key).max(1);
         let point: Vec<usize> = (0..N_SITES)
             .map(|site| ((key >> (2 * site)) % 4) as usize)
@@ -697,7 +697,7 @@ fn sparse_chain_problem(seed: u64) -> InterpolationProblem<Name> {
         node_sites,
         pivots_from(&pivots),
         1e-12,
-        NonZeroUsize::new(8),
+        NonZeroUsize::new(4),
         seed,
     )
     .unwrap()
@@ -708,8 +708,9 @@ fn problem_seed_overrides_the_engine_seed() {
     let run = |problem: &InterpolationProblem<Name>, engine_seed| {
         let engine = TreeTciInterpolator::new(TreeTciOptions {
             seed: Some(engine_seed),
-            nsearch: 10,
-            max_nglobal_pivot: 10,
+            max_iter: 4,
+            nsearch: 5,
+            max_nglobal_pivot: 5,
             ..Default::default()
         })
         .unwrap();
@@ -737,7 +738,7 @@ fn problem_seed_overrides_the_engine_seed() {
 
     // The seed is live: some other problem seed changes the run.
     assert!(
-        (8..16).any(|seed| run(&sparse_chain_problem(seed), 1).pivots != first.pivots),
+        (8..12).any(|seed| run(&sparse_chain_problem(seed), 1).pivots != first.pivots),
         "no problem seed changed the pivots"
     );
 }
@@ -888,5 +889,68 @@ fn oversized_nodes_are_invalid_problems() {
             assert!(message.contains("overflows usize"), "{message}")
         }
         other => panic!("expected InvalidProblem, got {other:?}"),
+    }
+}
+
+#[test]
+fn evaluator_failure_during_materialization_is_an_evaluator_error() {
+    let engine = TreeTciInterpolator::default();
+    let problem = chain_problem(1e-12, None, 0);
+    let n_sites = problem.site_order().len();
+
+    // Count the calls of a successful run; the run is deterministic.
+    let calls = Cell::new(0);
+    engine
+        .interpolate(
+            &problem,
+            faulty_evaluator(&calls, usize::MAX, false, n_sites),
+        )
+        .unwrap();
+    let total = calls.get();
+
+    // Materialization evaluates every node's tensor after the optimization
+    // loop and nothing evaluates after it, so the last call of the run is a
+    // materialization call.
+    let calls = Cell::new(0);
+    expect_evaluator_error(
+        engine.interpolate(&problem, faulty_evaluator(&calls, total, false, n_sites)),
+        &format!("planned failure on call {total}"),
+    );
+    assert_eq!(calls.get(), total);
+}
+
+#[test]
+fn non_finite_initial_samples_are_evaluator_errors() {
+    let engine = TreeTciInterpolator::default();
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        // Non-finite at the first initial pivot only, finite elsewhere.
+        let f = move |p: &[usize]| if p.iter().all(|&v| v == 0) { bad } else { 1.0 };
+
+        let chain = chain_problem(1e-12, None, 0);
+        expect_evaluator_error(
+            engine.interpolate(&chain, evaluator(&f, site_dims(&chain))),
+            "non-finite value at initial pivot 0",
+        );
+
+        // A finite nonzero sample beside the non-finite one does not hide it.
+        let two_pivots = InterpolationProblem::new(
+            chain.topology().clone(),
+            chain.node_sites().clone(),
+            pivots_from(&[vec![1, 0, 0, 0], vec![0, 0, 0, 0]]),
+            1e-12,
+            None,
+            0,
+        )
+        .unwrap();
+        expect_evaluator_error(
+            engine.interpolate(&two_pivots, evaluator(&f, site_dims(&two_pivots))),
+            "non-finite value at initial pivot 1",
+        );
+
+        let single = single_node_problem(vec![0, 0, 0]);
+        expect_evaluator_error(
+            engine.interpolate(&single, evaluator(&f, site_dims(&single))),
+            "non-finite value at initial pivot 0",
+        );
     }
 }

@@ -196,9 +196,10 @@ where
     ///   site dimensions (or the full index set of a single-node problem)
     ///   overflows `usize`.
     /// - [`InterpolationError::Evaluator`] when `evaluate` returns an error or
-    ///   a number of values other than the number of points, at any stage.
+    ///   a number of values other than the number of points, at any stage, or
+    ///   a non-finite value at an initial pivot.
     /// - [`InterpolationError::AllSamplesZero`] when every initial pivot
-    ///   evaluates to zero.
+    ///   evaluates to exactly zero.
     /// - [`InterpolationError::Engine`] when TreeTCI fails for any other
     ///   reason (graph construction, pivot bookkeeping, a singular solve, or
     ///   materialization).
@@ -243,16 +244,11 @@ where
     {
         let layout = VertexLayout::new(problem)?;
 
-        // Zero-patch rule, applied before any topology-specific path. The
-        // fold in `max_magnitude` starts at zero and ignores NaN, so the
-        // result is never NaN.
+        // Zero-patch rule, applied before any topology-specific path.
         let initial = problem.initial_pivots();
         let initial_values =
             call_evaluator(&evaluate, initial.data(), layout.n_sites()).map_err(classify_anyhow)?;
-        let max_initial = max_magnitude(&initial_values);
-        if max_initial <= 0.0 {
-            return Err(InterpolationError::AllSamplesZero);
-        }
+        let max_initial = initial_sample_scale(&initial_values)?;
 
         if layout.vertex_count() == 1 {
             return interpolate_single_node(&layout, &evaluate);
@@ -316,6 +312,11 @@ fn map_termination(
     cap: Option<NonZeroUsize>,
 ) -> InterpolationTermination {
     match reason {
+        // INVARIANT: `optimize_with_proposer` checks the saturation stop before
+        // the convergence criterion, so a `Converged` run with a cap ends
+        // strictly below it (see `TreeTciTermination::Converged`). This guard
+        // is defence in depth: it keeps the contract's precedence even if the
+        // loop order changes.
         TreeTciTermination::Converged if cap.is_some_and(|cap| final_rank >= cap.get()) => {
             InterpolationTermination::BondCapReached
         }
@@ -404,6 +405,30 @@ fn engine(error: TreeTciError) -> InterpolationError {
     InterpolationError::Engine {
         source: anyhow::Error::new(error),
     }
+}
+
+/// Apply the zero-patch rule to the initial samples and return their largest
+/// magnitude. A non-finite sample is an invalid evaluator value
+/// (`Evaluator`); `AllSamplesZero` requires every sample to be exactly zero.
+fn initial_sample_scale<T: CommonScalar>(values: &[T]) -> Result<f64, InterpolationError> {
+    let magnitudes: Vec<f64> = values
+        .iter()
+        .map(|value| CommonScalar::abs_val(*value))
+        .collect();
+    if let Some(pivot) = magnitudes
+        .iter()
+        .position(|magnitude| !magnitude.is_finite())
+    {
+        return Err(InterpolationError::Evaluator {
+            source: anyhow::anyhow!(
+                "evaluator returned a non-finite value at initial pivot {pivot}"
+            ),
+        });
+    }
+    if magnitudes.iter().all(|&magnitude| magnitude == 0.0) {
+        return Err(InterpolationError::AllSamplesZero);
+    }
+    Ok(magnitudes.into_iter().fold(0.0_f64, f64::max))
 }
 
 fn max_magnitude<T: CommonScalar>(values: &[T]) -> f64 {
