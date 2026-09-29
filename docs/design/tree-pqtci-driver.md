@@ -370,9 +370,11 @@ The review kept the proposed names: `adaptive_interpolation`,
 ## Implementation decisions
 
 - **Scalar bounds.** `T: tensor4all_core::CommonScalar + TensorElement`.
-  Magnitudes, the exact-zero test, and the finiteness test all use
-  `CommonScalar::abs_val` (the hypotenuse for complex values); one-hot factors
-  and exact networks are built with `IdxTensor::from_dense::<T>`.
+  Magnitudes and the exact-zero test use `CommonScalar::abs_val` (the
+  hypotenuse for complex values); the finiteness test checks every component
+  (`value * 0 == 0`), so a finite complex value whose magnitude overflows
+  is accepted. One-hot factors and exact networks are built with
+  `IdxTensor::from_dense::<T>`.
 - **Where values are checked.** The per-patch cache is the only path to the
   evaluator, so the count and finiteness checks of step 5 sit there and also
   cover the samples the engine requests, not only the candidates and exact
@@ -384,7 +386,10 @@ The review kept the proposed names: `adaptive_interpolation`,
 - **Engine outcomes are checked, not trusted.** An accepted outcome must carry
   the problem's nodes and edges and exactly the active sites of every node
   (full identity and dimension); returned pivots are checked (one row per
-  active site, in-range coordinates) only when `recycle_pivots` is on. A
+  active site, in-range coordinates) only when `recycle_pivots` is on. An
+  outcome reported as `Converged` whose re-embedded patch has a bond dimension
+  at or above `max_bond_dim` is rejected, because the M1 contract defines
+  `Converged` as strictly below the cap; it is not treated as a split. A
   mismatch is `Interpolation { projector, source: InterpolationError::Engine }`.
 - **`patch_order` identity.** An entry that matches a site's identity (ID,
   tags, prime level) but not its dimension is rejected as `InvalidInput`, as

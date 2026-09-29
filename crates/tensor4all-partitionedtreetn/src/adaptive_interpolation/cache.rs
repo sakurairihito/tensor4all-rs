@@ -82,6 +82,14 @@ impl KeyLayout {
 }
 
 /// Evaluation cache of one patch, keyed by its active coordinates.
+///
+/// `tensor4all_core::CachedFunction` does not fit here: it wraps an
+/// infallible point function (the driver's evaluator is fallible and batched),
+/// its keys stop at 1024 bits, and its entries can only be cleared at once,
+/// whereas this cache must be split among the children of a split patch.
+/// Each lookup still allocates an owned key (see the "Owned Vector Cache
+/// Keys" rule in `PERFORMANCE_TIPS.md`); removing that is left to the
+/// parallel milestone (M7).
 #[derive(Clone, Debug)]
 pub(super) struct PatchCache<T> {
     layout: KeyLayout,
@@ -244,7 +252,7 @@ where
                 "the evaluator returned {} values for {n_missing} points",
                 fresh.len()
             );
-            if let Some(index) = fresh.iter().position(|value| !value.abs_val().is_finite()) {
+            if let Some(index) = fresh.iter().position(|&value| !is_finite(value)) {
                 anyhow::bail!(
                     "the evaluator returned a non-finite value at the point {:?}",
                     &missing_points[index * n_sites..(index + 1) * n_sites]
@@ -265,4 +273,13 @@ where
             })
             .collect())
     }
+}
+
+/// Whether every component (real and imaginary part) of `value` is finite.
+///
+/// Multiplying by zero gives exactly zero for finite components and NaN when
+/// a component is infinite or NaN. Unlike `abs_val().is_finite()`, this
+/// accepts a finite complex value whose magnitude overflows.
+pub(super) fn is_finite<T: CommonScalar>(value: T) -> bool {
+    (value * T::from_f64(0.0)).abs_val() == 0.0
 }

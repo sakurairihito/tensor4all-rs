@@ -56,8 +56,11 @@
 //! randomized algorithms of this workspace, the driver offers no API taking a
 //! caller-owned `&mut R`: one shared stream would make the randomness of a
 //! patch depend on the processing order. For a fixed seed, a deterministic
-//! evaluator, and a deterministic engine, the partition and the report are
-//! identical across runs.
+//! evaluator, and a deterministic engine, the stored patches and the report
+//! are identical across runs. Materializing their direct sum
+//! ([`PartitionedTreeTN::to_treetn`], then a dense contraction) is equal only
+//! up to rounding, because `TreeTN::add` orders the summed indices by hash-map
+//! iteration.
 //!
 //! # Examples
 //!
@@ -654,7 +657,8 @@ impl From<PartitionedTreeTNError> for PatchedInterpolationError {
 ///   returns a wrong number of values, or returns a non-finite value
 ///   ([`InterpolationError::Evaluator`]); when the engine fails (including
 ///   [`InterpolationError::AllSamplesZero`] after screening); or when an
-///   engine outcome does not match the problem ([`InterpolationError::Engine`]).
+///   engine outcome does not match the problem or reports `Converged` at a
+///   bond dimension not strictly below the cap ([`InterpolationError::Engine`]).
 /// - [`PatchedInterpolationError::NoSplitIndexLeft`] when a patch does not
 ///   converge and every site of `patch_order` is fixed.
 /// - [`PatchedInterpolationError::ResourceLimit`] when more than
@@ -1019,6 +1023,18 @@ where
             embed::check_outcome_layout(&outcome.network, layout, &fixed)
                 .map_err(|message| engine_error(projector, message))?;
             let subdomain = self.subdomain(&outcome.network, &fixed, projector)?;
+            // The contract defines `Converged` as strictly below the cap.
+            if subdomain.max_bond_dim() >= self.options.max_bond_dim {
+                return Err(engine_error(
+                    projector,
+                    format!(
+                        "the engine reported Converged with bond dimension {}, not strictly below \
+                         the cap {}",
+                        subdomain.max_bond_dim(),
+                        self.options.max_bond_dim
+                    ),
+                ));
+            }
             let record = PatchRecord {
                 projector: projector.clone(),
                 termination: outcome.termination,
