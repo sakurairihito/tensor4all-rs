@@ -23,8 +23,8 @@
 | [partitionedtt-projector-invariants.md](./partitionedtt-projector-invariants.md) | Issue #634 design for coherent projector identity, validation, and transactional PartitionedTT mutation |
 | [partitioned-treetn.md](./partitioned-treetn.md) | Issue #648 migration design for TreeTN-native eager partitioning and adaptive patching |
 | [tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md) | Milestone roadmap for adaptive patched interpolation, contraction, and parallel execution on arbitrary trees |
-| [treetn-contraction-outcome.md](./treetn-contraction-outcome.md) | Proposal: TreeTN contraction outcome report and rank-threshold early abort (tree patching M1, P1) |
-| [tree-patching-m1-prerequisites.md](./tree-patching-m1-prerequisites.md) | Tree patching M1: contraction outcome report and early abort, Hadamard verification, fixed-site and compact patch representation, forced overhead, sparse storage evaluation |
+| [treetn-contraction-outcome.md](./treetn-contraction-outcome.md) | Proposal: TreeTN contraction outcome report and rank-threshold early abort (tree patching M6) |
+| [tree-patching-findings.md](./tree-patching-findings.md) | Verified facts about current code used by the tree patching milestones: contraction reporting, element-wise product, fixed sites, patch representation, avoidable overhead, sparse storage decision |
 | [orthogonal-target-reconstruction.md](./orthogonal-target-reconstruction.md) | Fixed global L2 target, gain-driven reconstruction, superpositions, subset-QFT integration, and the level-coupled merge-refine schedule |
 | [gse-chain-mps-algorithm.md](./gse-chain-mps-algorithm.md) | Chain MPS global subspace expansion analysis for TreeTN GSE-TDVP planning |
 | [itensormps-compatible-zipup.md](./itensormps-compatible-zipup.md) | ITensorMPS-compatible chain zip-up contraction schedule and policy-aware decomposition follow-up |

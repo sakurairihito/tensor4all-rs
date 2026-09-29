@@ -2,10 +2,13 @@
 
 ## Status
 
-Proposal for review. Item P1 of
-[tree-patching-m1-prerequisites.md](./tree-patching-m1-prerequisites.md).
-It adds public API to `tensor4all-treetn` and must be approved before
-implementation. Revised after a first design review.
+Proposal, revised after two design reviews. Part of milestone M6 (adaptive
+patched contraction) of
+[tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md);
+background in section 1 of
+[tree-patching-findings.md](./tree-patching-findings.md). It adds public API
+to `tensor4all-treetn` and must be approved before implementation, which is
+scheduled with M6, not before the interpolation milestones.
 
 ## Problem
 
@@ -37,7 +40,7 @@ canonicalization, and reindexing of both operands is always paid.
 
 - Exact detection of whether a rank cap discarded nonzero weight. That needs
   core `factorize` to expose the discarded tail and is deferred to a core
-  issue (P1 item 4 of the M1 plan).
+  issue.
 - Early abort on the chain zip-up path, for Src, for Naive, and for Fit in the
   first version (see Method coverage). Fit also waits for the open draft
   PR #656, which restructures `fit.rs`.
