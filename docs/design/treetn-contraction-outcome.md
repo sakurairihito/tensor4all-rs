@@ -49,12 +49,12 @@ canonicalization, and reindexing of both operands is always paid.
 ## Public surface
 
 ```rust
-/// Bond dimension of one output edge, oriented toward the contraction center.
+/// Bond dimension of one output edge, oriented toward the report root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeRank<V> {
-    /// Endpoint farther from `center`.
+    /// Endpoint farther from the root.
     pub child: V,
-    /// Endpoint closer to `center`.
+    /// Endpoint closer to the root.
     pub parent: V,
     pub rank: usize,
 }
@@ -62,8 +62,8 @@ pub struct EdgeRank<V> {
 /// Final bond dimensions of the output network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractionReport<V> {
-    /// One entry per output edge, in `edges_to_canonicalize_by_names(center)`
-    /// order of the output network (leaves toward the center).
+    /// One entry per output edge, in `edges_to_canonicalize_by_names(root)`
+    /// order of the output network (leaves toward `root`); see "Report root".
     pub edge_ranks: Vec<EdgeRank<V>>,
 }
 
@@ -85,13 +85,26 @@ pub fn contract_with_outcome<T, V>(
 ) -> Result<ContractionOutcome<T, V>, TreeTNOperationError>;
 ```
 
+- **Report root.** The root is `center` when the output network contains it.
+  Otherwise it is the single node of the output network's canonical region.
+  This case occurs on the chain zip-up path when the node `center` keeps no
+  output site indices and is pruned; the path then seeds the canonical region
+  at another node. If the canonical region is not a single node, the root is
+  the smallest output node name. The rule is deterministic and applies to
+  every method.
 - **Saturation.** The outcome is `Saturated` exactly when some edge of the
   output network that `contract(tn_a, tn_b, center, options)` would return has
-  a bond dimension `>= abort_at_rank`. `edge` is the first such edge in the
-  report order, with its final rank. Equality counts, matching
+  a bond dimension `>= abort_at_rank`. Equality counts, matching
   `partitionedtreetn`: a capped result cannot distinguish an exact rank equal
   to the cap from a truncated one. With `None` the outcome is always
   `Completed`.
+- **Which edge is named.** With post-hoc detection, `edge` is the first edge
+  at or above the threshold in report order, with its final rank. With early
+  abort (tree zip-up path only, where `center` is always kept), `edge` is the
+  first such edge in the processing order,
+  `edges_to_canonicalize_by_names(center)` of the input network `tn_a`. The
+  definition does not rely on the two orders coinciding; a test checks that
+  they agree today.
 - **Independence from truncation.** `abort_at_rank` is separate from
   `ContractionOptions::max_bond_dim`. The truncation cap limits what the output
   may keep; the threshold is the caller's probe budget. `contract_adaptive`
@@ -114,8 +127,10 @@ Edge order and orientation are always taken from the returned network, so the
 report never disagrees with the network. Networks from different methods may
 differ in shape:
 
-- Zip-up prunes scalar subtrees and dimension-one dummy links.
-- Fit keeps the dimension-one links of its topology-preserving initializer.
+- Zip-up drops the nodes of subtrees without surviving site indices; a
+  rank-one factorization stays in the output as a dimension-one link.
+- Fit keeps such nodes, joined by the dimension-one links of its
+  topology-preserving initializer.
 - Naive collapses a scalar result to one node, so its report is empty.
 
 ## Method coverage
@@ -145,32 +160,47 @@ This depends on #788 (PR #789) being merged.
 - For each group with `PatchSplitStrategy::Sequential`, the split candidate
   is computed from the group's output indices and projector before any
   contraction. If a candidate exists, pairs are contracted with
-  `abort_at_rank = patching cap`; the first `Saturated` outcome stops the
-  group and it splits at that candidate. If no candidate exists, pairs are
-  contracted without a threshold, because the fallback returns the full group
-  sum.
+  `abort_at_rank = patching cap`. A contribution counts as saturated when its
+  outcome is `Saturated` or, for a `Completed` network, when
+  `SubDomainTreeTN::max_bond_dim() >= cap`. The second clause keeps today's
+  predicate for outputs without edges, whose maximum bond dimension is
+  reported as one (so they saturate a cap of one). The first saturated
+  contribution stops the group, and it splits at that candidate. If no
+  candidate exists, pairs are contracted without a threshold, because the
+  fallback returns the full group sum.
 - With `ExactParameterGain` the split decision needs the full group sum, so
   contributions are contracted without a threshold, as today.
 - Because saturation is defined on final bond dimensions, the partition
   layout and values are unchanged; only contractions whose results would have
   been discarded are skipped or cut short.
+- Chain-shaped inputs that keep output sites always take the chain zip-up
+  path, which detects saturation after completion, so they gain only the
+  skipped remaining pairs of a group, not a shortened contraction. Tests of
+  the early-abort saving therefore use branched trees.
 
 ## Tests and documentation
 
 - `contract_with_outcome(..., None)` equals `contract` on chain and branched
   trees (dense comparison), and its report equals the returned network's link
   dimensions in the documented order.
+- A chain case in which `center` is pruned from the output: the report root
+  is the canonical-region node and the report still covers every output
+  edge.
 - On the tree path, a threshold reached at an early edge returns `Saturated`
   naming that edge, with fewer factorizations than a full run (asserted by a
   test-only counter).
+- On a branched tree where two branches both reach the threshold, the early
+  abort's `edge` equals the first saturating entry of the `Completed` report
+  for the same inputs without a threshold.
 - For every method, `Saturated` is returned exactly when `contract`'s result
   has an edge at or above the threshold (equality included), including the
   chain path where the answer comes after completion.
 - Report shapes: Fit dummy links and the Naive scalar case.
-- `partitionedtreetn`: a Sequential group stops contracting after the first
-  saturated contribution (counter), with unchanged partition layout and dense
-  values; the `ExactParameterGain` path and the no-candidate fallback are
-  unchanged.
+- `partitionedtreetn`: on a branched tree, a Sequential group stops
+  contracting after the first saturated contribution (counter), with
+  unchanged partition layout and dense values; edgeless contributions with a
+  cap of one keep today's behavior; the `ExactParameterGain` path and the
+  no-candidate fallback are unchanged.
 - Rustdoc: runnable, asserted examples for `EdgeRank`, `ContractionReport`,
   `ContractionOutcome`, and `contract_with_outcome`, with `# Errors` naming
   the failure conditions.
