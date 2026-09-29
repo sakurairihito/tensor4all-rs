@@ -13,6 +13,7 @@
 //! the adaptive patching literature; this crate does not contain TCI-derived
 //! adaptive interpolation code.
 
+pub mod adaptive_interpolation;
 mod error;
 mod partitioned_tree_tn;
 mod patching;
