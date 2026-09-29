@@ -8,7 +8,8 @@
 //! next sweep samples regions the local pivot updates missed.
 //!
 //! The search is enabled by default (`TreeTciOptions::enable_global_pivots`)
-//! and runs after every optimization sweep.
+//! and runs after every optimization sweep, except after the final sweep of a
+//! run that stops at `max_iter` or through the bond-dimension saturation stop.
 
 use crate::error::Result as TreeTciResult;
 use crate::{materialize::to_treetn, GlobalIndexBatch, MultiIndex, TreeTCI2};
