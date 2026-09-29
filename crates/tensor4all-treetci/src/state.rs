@@ -102,11 +102,18 @@ impl<T> TreeTCI2<T> {
     }
 
     /// Add global pivots and project them to every edge bipartition.
+    ///
+    /// Each side of an edge is deduplicated independently, so pivots added
+    /// this way are only paired consistently across each edge (both sides
+    /// holding the same number of pivots) after an optimization sweep. Sweep
+    /// the state with [`optimize_default`](crate::optimize_default) or
+    /// [`optimize_with_proposer`](crate::optimize_with_proposer) before
+    /// passing it to [`to_treetn`](crate::to_treetn).
+    ///
     /// # Errors
     ///
     /// Returns an error when the operation fails (a shape or index mismatch, or
-    /// /// a backend failure).
-    ///
+    /// a backend failure).
     pub fn add_global_pivots(&mut self, pivots: &[MultiIndex]) -> TreeTciResult<()> {
         let n_sites = self.local_dims.len();
         if !(pivots.iter().all(|pivot| pivot.len() == n_sites)) {
