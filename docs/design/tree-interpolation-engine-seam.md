@@ -3,17 +3,17 @@
 ## Status
 
 Approved and implemented in M1 of
-[tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md) on
-branch `feat/tree-adaptive-patching`:
+[tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md). The
+implementation consists of:
 
-- `314e8123` TreeTCI termination report (step 1) and the `tensor4all-quanticstci`
-  update;
-- `e25e2fe0` the contract module `tensor4all_treetn::interpolation`;
-- `96949860` the TreeTCI engine `TreeTciInterpolator` (steps 2-6) and its
-  tests, including the test-only mock engine;
-- `69ae1b0f` the amendment of [partitioned-treetn.md](./partitioned-treetn.md)
-  (last section);
-- `c0cde430` review fixes (the cap precedence, non-finite initial samples).
+- the TreeTCI termination report (step 1) and the matching
+  `tensor4all-quanticstci` update;
+- the contract module `tensor4all_treetn::interpolation`;
+- the TreeTCI engine `TreeTciInterpolator` (steps 2-6) and its tests,
+  including the test-only mock engine;
+- the amendment of [partitioned-treetn.md](./partitioned-treetn.md) (last
+  section);
+- review fixes (the cap precedence, non-finite initial samples).
 
 The decisions taken during implementation are recorded under
 [Implementation decisions](#implementation-decisions).
@@ -317,9 +317,12 @@ side adds `TreeTciInterpolator`, `TreeTciOptimizeReport`, and
 - **Proposer.** The engine always uses `DefaultProposer`, which is
   deterministic. A seeded proposer could not have its own seed overridden
   generically, which the randomness rule requires.
-- **Evaluator error source.** When the marker is the direct source of the
-  TreeTCI error, the caller's original error becomes the `Evaluator` source;
-  otherwise the whole chain is kept.
+- **Evaluator error source.** An error whose chain contains the marker
+  anywhere is classified as `Evaluator`. When the marker is the error itself
+  or sits only under `anyhow` context layers added inside the engine,
+  `downcast` recovers it: the caller's original error becomes the source and
+  those engine-internal context layers are dropped. When the marker sits
+  under another typed error, the whole chain is kept as the source.
 - **Test-only mock engine.** It evaluates the dense domain and factorizes it
   with `factorize_tensor_to_treetn`, which rejects a node without site
   indices, so the mock runs on a chain, a star of degree three, and a single
