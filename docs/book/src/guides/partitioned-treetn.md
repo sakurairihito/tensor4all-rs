@@ -177,10 +177,11 @@ pinned to the largest magnitude among the root patch's candidate samples (or
 its exact values when the root has at most one site), a sampled lower bound on
 `max |f|` that tightens the tolerance for localized functions. Execution is
 sequential; for a fixed `seed`, a deterministic evaluator, and a deterministic
-engine, the stored patches and the report are identical across runs.
-Materializing their direct sum with `to_treetn` and a dense contraction is
-equal only up to rounding, because `TreeTN::add` orders the summed indices by
-hash-map iteration.
+engine, the stored patches (values and axis order) and the report are
+identical across runs. On branched trees, materializing their direct sum with
+`to_treetn` and a dense contraction is equal across runs only up to rounding,
+because the construction order of a `TreeTN` is not reproducible there yet;
+this is tracked upstream.
 
 ## Reconstruction with a fixed global L2 tolerance
 

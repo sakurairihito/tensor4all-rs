@@ -56,11 +56,12 @@
 //! randomized algorithms of this workspace, the driver offers no API taking a
 //! caller-owned `&mut R`: one shared stream would make the randomness of a
 //! patch depend on the processing order. For a fixed seed, a deterministic
-//! evaluator, and a deterministic engine, the stored patches and the report
-//! are identical across runs. Materializing their direct sum
-//! ([`PartitionedTreeTN::to_treetn`], then a dense contraction) is equal only
-//! up to rounding, because `TreeTN::add` orders the summed indices by hash-map
-//! iteration.
+//! evaluator, and a deterministic engine, the stored patches (values and axis
+//! order of every tensor) and the report are identical across runs. On
+//! branched trees, materializing their direct sum
+//! ([`PartitionedTreeTN::to_treetn`], then a dense contraction) is equal across
+//! runs only up to rounding, because the construction order of a `TreeTN` is
+//! not reproducible there yet; this is tracked upstream.
 //!
 //! # Examples
 //!
@@ -570,9 +571,10 @@ pub enum PatchedInterpolationError {
     },
     /// Sampling or interpolating one patch failed: the evaluator failed or
     /// returned a wrong number of values, a non-finite value, or a value
-    /// whose magnitude overflows ([`InterpolationError::Evaluator`]), or the
-    /// engine failed or returned
-    /// an outcome that does not match the problem.
+    /// whose magnitude overflows ([`InterpolationError::Evaluator`]); or the
+    /// engine failed, returned an outcome that does not match the problem, or
+    /// reported `Converged` with a rank that reaches the bond cap
+    /// ([`InterpolationError::Engine`]).
     #[error("interpolation of the patch {projector:?} failed: {source}")]
     Interpolation {
         /// Projector of the failing patch.

@@ -428,7 +428,15 @@ The review kept the proposed names: `adaptive_interpolation`,
 - **Tests.** The domain wider than 128 bits is a chain of 129 binary sites
   (three 43-bit variables) run with a test engine that builds the exact
   rank-one network of a product function from fibers: TreeTCI took about
-  300 s for one run on that chain in a debug build. Determinism is checked on
-  the stored patch tensors, because materializing the same partition twice
-  with `to_treetn` and `contract_to_tensor` differs at rounding level (the
-  index order of the direct sum is not fixed).
+  300 s for one run on that chain in a debug build.
+- **Determinism, verified.** Two runs with the same seed store bitwise
+  identical patches: per projector and per node, the same legs in the same
+  positional order (sites by position, bonds by neighbor and dimension) and
+  the same raw column-major data, with an identical report. The tests assert
+  this on the degree-three trees with the dense test engine and with TreeTCI,
+  and digests of the same comparison agreed across three separate test
+  processes. On branched trees, materializing the direct sum of the patches
+  (`to_treetn`, then `contract_to_tensor`) is equal across runs only up to
+  rounding, because the construction order of a `TreeTN` is not reproducible
+  there yet (tracked upstream); the determinism claim therefore covers the
+  stored patches and the report, not their materialized sum.
