@@ -165,6 +165,10 @@ Scope:
 Exit: the contract is documented in rustdoc and design records; tests check
 reported bounds against dense references on small problems.
 
+Design: [tree-patching-error-contract.md](./tree-patching-error-contract.md)
+(proposal; the interpolation side in full, the patched-algebra mode scoped for
+a separate record).
+
 ### M4. Patch representation decision (M)
 
 Outcome: a measured decision between the current eager (masked) patches and a
