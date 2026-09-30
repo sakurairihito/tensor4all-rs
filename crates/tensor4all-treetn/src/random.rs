@@ -14,7 +14,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use tensor4all_core::index::{DynId, Index, TagSet};
 use tensor4all_core::tensor::RandomScalar;
-use tensor4all_core::IdxTensor;
+use tensor4all_core::{sort_indices_deterministic, IdxTensor};
 
 /// Specification for link (bond) dimensions.
 ///
@@ -67,6 +67,20 @@ pub type DefaultIndex = Index<DynId, TagSet>;
 /// Generates random tensors at each node with:
 /// - Site indices from the `site_network`
 /// - Link indices created according to `link_space`
+///
+/// Nodes are visited in the site network's node order, and each node tensor's
+/// legs are its site indices sorted by
+/// [`sort_indices_deterministic`](tensor4all_core::sort_indices_deterministic)
+/// followed by its link indices in neighbor order. The same `rng` state and a
+/// site network built from the same index objects therefore produce the same
+/// network (link indices are fresh on every call, so compare by position).
+///
+/// Caveat: `sort_indices_deterministic` orders by dimension and prime level
+/// first and then by the index ID, which is random for freshly created
+/// indices. Two site legs of one node with equal dimension and prime level can
+/// therefore be ordered differently when the site network is built from newly
+/// created indices (for example in another process), and the same seed then
+/// fills that node's tensor in a different leg order.
 ///
 /// # Type Parameters
 /// * `T` - Scalar type (e.g. `f64` or `Complex64`)
@@ -148,9 +162,13 @@ where
             .cloned()
             .unwrap_or_default();
 
-        // Collect link indices from edges connected to this node
+        // Site legs first. A site space is an unordered set, so sort it by full
+        // index identity: the leg order, and therefore which RNG draws land on
+        // which tensor entry, must not depend on hash-set iteration order.
         let mut all_indices: Vec<DefaultIndex> = site_inds.into_iter().collect();
+        sort_indices_deterministic(&mut all_indices);
 
+        // Then link indices, in the network's neighbor order.
         for neighbor in site_network.neighbors(&node_name) {
             let key = if node_name < neighbor {
                 (node_name.clone(), neighbor.clone())

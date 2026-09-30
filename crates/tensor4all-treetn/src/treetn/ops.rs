@@ -520,6 +520,12 @@ where
     ///
     /// This is an alias for `contract_to_tensor()`.
     ///
+    /// The result's indices are ordered by sorted node name, then by each node
+    /// tensor's own leg order ([`node_site_indices`](Self::node_site_indices)).
+    /// This differs from `external_indices()`, which follows
+    /// [`node_names`](Self::node_names) (insertion) order; see
+    /// [`contract_to_tensor`](Self::contract_to_tensor) for an example.
+    ///
     /// # Warning
     /// This operation can be very expensive for large networks,
     /// as the result size grows exponentially with the number of sites.
@@ -555,8 +561,8 @@ where
     ///
     /// // Contract to a single dense tensor over site indices s0 and s1
     /// let dense = tn.to_dense().unwrap();
-    /// // Result is rank-2 (two site indices s0 and s1)
-    /// assert_eq!(dense.num_external_indices(), 2);
+    /// // Result is rank-2, ordered by node name: s0 (node "A"), then s1 (node "B")
+    /// assert_eq!(dense.external_indices(), vec![s0, s1]);
     /// ```
     pub fn to_dense(&self) -> std::result::Result<T, TreeTNOperationError> {
         self.contract_to_tensor()
@@ -764,8 +770,10 @@ where
     /// Returns all site indices and their owning vertex names.
     ///
     /// Returns `(indices, vertex_names)` where `indices[i]` belongs to
-    /// vertex `vertex_names[i]`. Order is unspecified but consistent
-    /// between the two vectors.
+    /// vertex `vertex_names[i]`. Vertices appear in
+    /// [`node_names`](Self::node_names) order and each vertex's site indices
+    /// follow its tensor's leg order ([`node_site_indices`](Self::node_site_indices)),
+    /// the same order as [`TensorIndex::external_indices`](tensor4all_core::TensorIndex::external_indices).
     ///
     /// # Errors
     /// Returns an error if a node's site space cannot be found (a missing-index
@@ -810,12 +818,12 @@ where
         let mut indices = Vec::new();
         let mut node_names = Vec::new();
         for node_name in self.node_names() {
-            let site_space = self
-                .site_space(&node_name)
+            let site_indices = self
+                .node_site_indices(&node_name)
                 .ok_or_else(|| anyhow::anyhow!("Site space not found for node {:?}", node_name))
                 .context("all_site_indices: site space must exist")?;
-            for index in site_space {
-                indices.push(index.clone());
+            for index in site_indices {
+                indices.push(index);
                 node_names.push(node_name.clone());
             }
         }
