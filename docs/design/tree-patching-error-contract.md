@@ -13,9 +13,10 @@ contraction) is scoped here and gets its own design record before
 implementation ([Patched algebra](#patched-algebra-m3b)).
 
 Implementation has two prerequisites, both stated below: frozen M2 golden
-digests committed before the refactor ([Tests](#tests)), and an
-evaluation-order audit of the TreeTN evaluator that the measurement uses
-([Determinism](#determinism)).
+digests committed before the refactor ([Tests](#tests)), and a fix that
+makes the TreeTN evaluator used by the measurement reproducible on trees that
+take its generic path ([Determinism](#determinism)); which fix is an open
+question for the user.
 
 The decisions that depend on the user are collected under
 [Open questions](#open-questions-for-the-user). No measurement was run for
@@ -43,7 +44,9 @@ Concretely:
 
 ## Findings that shape the design
 
-Verified on `feat/tree-adaptive-patching` at `caf164f0`. API names were
+Verified on `feat/tree-adaptive-patching` at `caf164f0` and rechecked at
+`8db7b087`, after the #791 fix (#793) was merged; the cited line numbers hold
+at both commits. API names were
 checked against the `cargo run -p xtask --release -- api-dump` inventory
 (`target/api-dump/*.md`) and the listed source.
 
@@ -95,27 +98,41 @@ checked against the `cargo run -p xtask --release -- api-dump` inventory
   `CANDIDATE_STREAM` and `ENGINE_STREAM` (`adaptive_interpolation/sampling.rs`,
   lines 17-27 and `patch_seeds` at line 79). The driver offers only the seed
   API and documents the exception to the caller-owned `&mut R` rule.
-- **Randomness outside the driver: index IDs.** `DynIndex` IDs come from
+- **Index IDs (checked, not the cause).** `DynIndex` IDs come from
   `generate_id()`, a per-thread, unseeded `rand::rng()`
   (`tensor4all-core/src/defaults/index.rs:413-427`), and
   `sort_indices_deterministic` breaks ties of equal dimension and prime level
-  by `id()` (`tensor4all-core/src/index_like.rs:333-344`). Earlier
-  run-to-run differences in SRC contraction came from exactly this
-  (comments at `tensor4all-treetn/src/treetn/contraction/src_probe.rs:576-578,
-  786` and `src_tree.rs:622-625`). Every engine outcome carries fresh bond
-  IDs.
+  by `id()` (`tensor4all-core/src/index_like.rs:333-344`); earlier run-to-run
+  differences in SRC contraction came from that (comments at
+  `tensor4all-treetn/src/treetn/contraction/src_probe.rs:576-578, 786` and
+  `src_tree.rs:622-625`). The evaluator path does not use it: a complete
+  search of `cached_evaluator.rs` finds no use of `id()` or
+  `sort_indices_deterministic`, and the core contraction it calls labels legs
+  positionally. The fresh-ID indices the generic path mints per message
+  (lines 4388, 4759, 5592) therefore do not affect the operation order. Index
+  IDs stay in the determinism test as an excluded risk.
+- **Contraction-path ties (the cause).** For an N-ary contraction the
+  default planner of tenferro-einsum uses omeco's greedy planner, and omeco
+  0.2.6 `tree_greedy` (`src/greedy.rs:170-307`) iterates
+  `IncidenceList::vertices()`, which is `HashMap::keys()`
+  (`src/incidence_list.rs:82-84`). Ties between equally cheap pairs are
+  therefore broken by hash order, which differs across threads and
+  processes. The chosen plan is cached per thread
+  (`CONCRETE_EINSUM_PLAN_CACHE`,
+  `tensor4all-tensorbackend/src/tenferro_bridge.rs:144, 276`), so repetitions
+  on one thread reuse one plan and agree bitwise.
 - **Norms of networks.** `SubDomainTreeTN::norm_squared` clones and
-  canonicalizes the patch. `PartitionedTreeTN` stores patches in a
-  `HashMap` (`partitioned_tree_tn.rs:45`) and `norm_squared` sums in its
-  iteration order (lines 333-337). Neither is bitwise reproducible across
-  runs (#791 and the hash order), which matters for any value that feeds a
-  decision.
+  canonicalizes the patch, and `TreeTN::log_norm` computes the logarithm of
+  the norm by canonicalization to avoid overflow. `PartitionedTreeTN` stores
+  patches in a `HashMap` (`partitioned_tree_tn.rs:45`) and `norm_squared`
+  sums in its iteration order (lines 333-337). The bitwise reproducibility of
+  the canonicalization path has not been audited; the hash-order sum is not
+  reproducible.
 - **Point evaluation of a network.** `TreeTNEvaluator::evaluate_batched`
   passes nodes without requested sites through unchanged
   (`treetn/evaluator.rs`, lines 294-345), but evaluates every point through a
-  temporary network built with `TreeTN::from_tensors` and
-  `contract_to_tensor`, the path of
-  [#791](https://github.com/tensor4all/tensor4all-rs/issues/791).
+  temporary network built with `TreeTN::from_tensors` and a full
+  `contract_to_tensor`, one N-ary contraction per point.
   `TreeTNCachedEvaluator::evaluate_batched_typed::<T>`
   (`treetn/cached_evaluator.rs:2052`):
   - iterates nodes in sorted name order (lines 1452-1453) and treats a node
@@ -125,17 +142,20 @@ checked against the `cargo run -p xtask --release -- api-dump` inventory
     (`can_use_raw_messages`, lines 2513-2557). A tree with a multi-site node
     or a site-free node, such as the M2 `quantics_tree` test tree, takes the
     generic `IdxTensor` path for every message;
-  - on the generic path mints a fresh random-ID index per message
-    computation (lines 4388, 4759, 5592) and contracts through core
-    `IdxTensor` contraction;
+  - on the generic path contracts N-ary operand lists through
+    `contract_with_options` at a node with two or more children (line 4828)
+    and at a center with two or more neighbors (line 5651), which reaches the
+    planner ties above. A separate investigation measured relative
+    differences up to `1.6e-13` in evaluated values across fresh threads and
+    processes on such trees, including the M2 `quantics_tree`; on trees that
+    take the raw kernels (one site per node, `f64`/`c64`) the values were
+    bitwise identical across rebuilds, threads, processes, and thread counts
+    under the controls prescribed in [Determinism](#determinism). These
+    numbers come from that investigation; this record did not rerun it;
   - in the chain kernel chooses BLAS or a scalar loop from the composition of
     the batch (lines 2752-2775), and keeps message caches across calls, so a
-    value can depend at rounding level on the batch contents, the call
-    history, and the hint.
-
-  A complete search of `cached_evaluator.rs` finds no direct use of `id()`
-  or `sort_indices_deterministic`; whether the core contraction it calls
-  orders legs independently of IDs has not been verified.
+    value depends at rounding level, deterministically, on the batch
+    contents, the call history, the center, and the hint.
 - **Reconstruction precedent.** Reconstruction supports only the unweighted
   discrete L2 norm and uses the allowance `max(atol, rtol * reference_scale)`
   with `ReconstructionTolerance { rtol, atol }` (default `rtol = 1e-6`), where
@@ -194,22 +214,33 @@ Zero patches are part of the error: omitting a patch is an approximation by
 zero, and it is charged like any other.
 
 A relative statement needs `||f||`, which is not computable. It is bounded
-from the computable side instead: `||f~||` is exact up to rounding from the
-patch networks, and by the triangle inequality `||f|| >= ||f~|| - E`, so
+from the computable side instead: `||f~||` is computable up to rounding from
+the patch networks, and by the triangle inequality `||f|| >= ||f~|| - E`, so
 
 ```text
 E / ||f|| <= E / (||f~|| - E)        whenever ||f~|| > E.
 ```
 
-This a-posteriori relative bound holds whenever `E` is bounded, independently
-of any reference norm, and the report states it (see
+The driver forms this ratio conservatively, with the computed `E` inflated
+and the computed `||f~||` deflated by `GLOBAL_ROUNDING_MARGIN` (see
+[Per-patch allowance](#per-patch-allowance)). Its status follows that of `E`:
+
+- **certified run**: a bound on `E / ||f||`, up to that margin, independent of
+  any reference norm;
+- **audited run**: an estimate, with the uncertainty of the audited `E`;
+- **acceptance-only run**: no relative statement, because there is no
+  estimate of `E`;
+- **`||f~|| <= E`** (in particular an empty or near-empty partition): no
+  relative statement at all; the rustdoc says so.
+
+The report encodes these cases in one enum (see
 [Records and report](#records-and-report)).
 
 ### What can be computed without the dense function
 
 | Quantity | How | Guarantee | Cost |
 |---|---|---|---|
-| `||f~_P||_P`, `||f~||_X` | `SubDomainTreeTN::norm_squared`, summed by the driver in canonical path order | exact up to rounding | one canonicalization per patch, no evaluations of `f` |
+| `||f~_P||_P`, `||f~||_X` | `TreeTN::log_norm` of each accepted patch, combined by the driver in canonical path order | exact up to rounding; bitwise reproducibility unaudited | one canonicalization per patch, no evaluations of `f` |
 | `f~(x)` at chosen points | TreeTN batch evaluators | exact up to rounding | one network evaluation per point |
 | `||f - f~_P||_P` for a small patch | evaluate `f` and `f~_P` at every point of `P` | exact up to rounding (a certificate) | `|P|` evaluations of `f` (fewer with cache hits), `|P|` network evaluations |
 | `||f - f~_P||_P` for a large patch | Monte Carlo on `n` fresh uniform points of `P` | a statistical estimate, see below; no bound | `n` evaluations of `f` (fewer with cache hits), `n` network evaluations |
@@ -299,13 +330,15 @@ which the report names per patch:
   one, the report carries no estimate for the patch.
 
 The run's global error is **certified** when every contribution is exact or
-exhaustive. `certified` is a statement about the absolute error, `E <= delta`
-up to a named rounding margin, where `delta` is the allowance actually used.
-When the reference norm was estimated, `delta` is itself random (see
-[Reference norm](#reference-norm)), and only the a-posteriori relative bound
-`E / (||f~|| - E)` is free of it. Otherwise the report says whether the global
-number is an audited estimate, with its standard error and the certified
-fraction of the domain, or only a sum of acceptance statistics.
+exhaustive. Certification is a statement about the absolute error,
+`E <= delta` up to a named rounding margin, where `delta` is the allowance
+actually used. When the reference norm was estimated, `delta` is itself random
+(see [Reference norm](#reference-norm)), and only the a-posteriori relative
+bound `E / (||f~|| - E)` is free of it. Otherwise the global number is either
+an **audited** estimate, with its standard error and the certified fraction
+of the domain, or, without a complete audit, an **acceptance-only** sum of
+acceptance statistics, which is neither a bound nor an estimate of `E`. The
+report distinguishes the three cases by type.
 
 Whether this definition is what the user means by "verified" is
 [open question 1](#open-questions-for-the-user).
@@ -375,30 +408,22 @@ patch's allowance; verification checks what the engine did not. Whether a
 smaller engine tolerance (a factor below one) lowers the total cost by avoiding
 failed verifications is a measurement for M9 on M2 patches, not a knob in M3.
 
-### Rounding floor
+### Tolerances below roundoff
 
-`tau` is tied to `rms(f)`, not `max |f|`. For a function localized on a
-fraction `rho` of the domain, `rms(f)` is about `sqrt(rho) max |f|`: with the
-default `rtol = 1e-8` and `rho = 2^-40`, `tau` is about `1e-14 max |f|`, which
-is the rounding level of evaluating `f` and of the network contraction near
-the peak. Verification of a peak patch can then never pass, and the patch
-would split down to exact patches until `max_patches` is hit. A Monte Carlo
-reference that underestimates `S` makes this worse.
+The driver does not predict an attainable residual from a fixed multiple of
+machine epsilon and a patch value scale. A scale such as `max |f|` does not
+identify whether a measured residual comes from roundoff, conditioning,
+contraction order, or approximation error, so it cannot provide a reliable
+universal rejection threshold.
 
-The driver detects it instead of splitting blindly. With `eps` the machine
-epsilon of the scalar type, `A_P` the largest magnitude among the patch's
-measured values of `f` and the engine's `max_sample_magnitude`, and a named
-constant `ROUNDING_FLOOR_FACTOR` fixed at implementation (checked in M9):
-
-- at the root, after pinning `tau`: if `0 < tau < ROUNDING_FLOOR_FACTOR * eps *
-  A_root`, return `ToleranceBelowRounding` before interpolating;
-- when a verification fails: if `tau < ROUNDING_FLOOR_FACTOR * eps * A_P`,
-  return `ToleranceBelowRounding` for that patch instead of retrying or
-  splitting.
-
-The remedy is to raise `rtol`, set `atol`, or give a reference norm
-(`L2Reference::Given`) if the estimate was too small. The check is skipped
-for `tau = 0`, which requests exact patches explicitly.
+The requested `tau` remains the engine tolerance and the acceptance threshold
+for measured residuals. If verification exceeds `tau`, the driver follows the
+same retry and split path at every scale. It may reach exact patches, or stop
+with the existing verification or resource-limit error if its split order or
+configured resources are exhausted. A very small tolerance can therefore cost
+more work or reach a resource limit; it is not rejected before interpolation
+or verification based on a predicted rounding floor. `tau = 0` follows this
+same path and can reach exact patches.
 
 ### Reference norm
 
@@ -612,31 +637,51 @@ pub enum L2ReferenceSource {
 #[non_exhaustive]
 pub enum MaxReferenceSource { Given, ExactRoot, MaxOfRootCandidates }
 
+/// The global L2 error of a run, by what it can claim. RMS values are
+/// E / sqrt(|X|). Bitwise reproducible under the Determinism prerequisite,
+/// except the relative fields, which depend on approximation_rms.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum GlobalL2Error {
+    /// Every contribution is Exact or Exhaustive: E <= delta up to
+    /// GLOBAL_ROUNDING_MARGIN.
+    #[non_exhaustive]
+    Certified {
+        rms_error: f64,
+        /// Conservative bound on E / ||f||; None when ||f~|| <= E.
+        relative_error_bound: Option<f64>,
+    },
+    /// Every Sampled contribution has an audit: an estimate, not a bound.
+    #[non_exhaustive]
+    Audited {
+        rms_error_estimate: f64,
+        /// Relative standard error of rms_error_estimate^2.
+        mean_square_rel_std_error: f64,
+        /// Estimate of E / ||f||; None when ||f~|| <= the estimated E.
+        relative_error_estimate: Option<f64>,
+    },
+    /// Some Sampled contribution has no audit: the combined acceptance
+    /// statistics, which are neither a bound nor an estimate of E. No
+    /// relative statement exists.
+    #[non_exhaustive]
+    AcceptanceOnly { acceptance_statistic_rms: f64 },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct L2ErrorReport {
     /// |X| as f64.
     pub domain_points: f64,
-    /// Global E / sqrt(|X|): from Exact and Exhaustive measurements and, for
-    /// Sampled contributions, the audit if every one was audited, otherwise
-    /// the acceptance measurements.
-    pub rms_error: f64,
-    /// Relative standard error of rms_error^2 from the audit samples; None
-    /// unless audited.
-    pub mean_square_rel_std_error: Option<f64>,
-    /// Every contribution is Exact or Exhaustive.
-    pub certified: bool,
-    /// Every Sampled contribution has an audit measurement.
-    pub audited: bool,
+    pub global: GlobalL2Error,
     /// Fraction of |X| whose contribution is Exact or Exhaustive.
     pub certified_fraction: f64,
-    /// ||f~|| / sqrt(|X|), exact up to rounding, summed in path order.
+    /// ||f~|| / sqrt(|X|) from TreeTN::log_norm per accepted patch, combined
+    /// in path order. Not covered by the bitwise determinism claim: the
+    /// canonicalization it relies on is not audited for reproducibility.
     pub approximation_rms: f64,
-    /// rms_error / (approximation_rms - rms_error) when positive: the
-    /// a-posteriori bound on E / ||f|| (certified runs) or its estimate.
-    pub relative_error: Option<f64>,
 }
-// error_norm(), approximation_norm(), delta() -> Option<f64>.
+// approximation_norm(), delta(), and error_norm() on GlobalL2Error return
+// Option<f64> (None on overflow in L2 units).
 
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -672,9 +717,18 @@ pub struct PatchedInterpolationReport {   // #[non_exhaustive], as in M2
 }
 ```
 
-Every acceptance measurement satisfies `rms <= tau`, so the sum of acceptance
-statistics never exceeds `tau` in RMS. The audited global estimate can exceed
-`tau`; it is reported as measured, because that is its purpose.
+Every acceptance measurement satisfies `rms <= tau`, so a certified
+`rms_error` and the `acceptance_statistic_rms` never exceed `tau` (up to
+`GLOBAL_ROUNDING_MARGIN`). The audited estimate can exceed `tau`; it is
+reported as measured, because that is its purpose.
+
+`approximation_rms` is computed without forming `||f~_P||^2` in L2 units: for
+each accepted patch the driver takes `TreeTN::log_norm` of the patch data (a
+clone, since the method canonicalizes), forms
+`rms_P = exp(log_norm - ln(|P|) / 2)`, and combines
+`approximation_rms^2 = sum over P of (|P| / |X|) rms_P^2` in canonical path
+order. No term can overflow for finite patch values, and a patch of norm zero
+contributes zero.
 
 ### Errors
 
@@ -690,9 +744,6 @@ statistics never exceeds `tau` in RMS. The audited global estimate can exceed
   "list more sites in `patch_order`, raise `rtol` or `atol`, or check the
   reference norm". `NoSplitIndexLeft` keeps its M2 meaning (the patch did not
   converge).
-- `ToleranceBelowRounding { projector, tau, floor }`: see
-  [Rounding floor](#rounding-floor). Remedy: "raise `rtol`, set `atol`, or
-  give a reference norm with `L2Reference::Given`".
 
 and new `InvalidInput` branches, all before any evaluation: `rtol` or `atol`
 negative or not finite; a given reference not finite and positive;
@@ -727,10 +778,12 @@ No field or variant keeps its name with a different meaning.
 - **L2** (default): acceptance requires the M2 conditions (`Converged`,
   strictly below the cap, layout checks) and an acceptance measurement with
   `rms <= tau`. Zero patches require the same of the zero approximation. A
-  certified run has `E <= delta` up to `GLOBAL_ROUNDING_MARGIN`, and
-  `E / ||f|| <= relative_error`. Otherwise the audited global value is an
-  estimate with the reported standard error, and without an audit there is no
-  estimate.
+  certified run has `E <= delta` up to `GLOBAL_ROUNDING_MARGIN` and, when
+  `||f~|| > E`, `E / ||f|| <= relative_error_bound`, which is formed
+  conservatively with that margin. An audited run gives an estimate of `E`
+  and of `E / ||f||` with the reported standard error. An acceptance-only run
+  gives neither; its reported number is only the combined acceptance
+  statistic. When `||f~|| <= E` no relative statement exists.
 - **SampledMax**: exactly the M2 driver, with the engine tolerance
   `max(atol, rtol * max_reference)`; `atol = 0` reproduces M2. No measurement,
   and the rustdoc keeps the M2 statement that this is not a verified bound.
@@ -748,7 +801,7 @@ Changes to the M2 steps
 1. **Validate** before any evaluation: the norm first (placeholders), then
    the tolerance, the reference, the verification options, and `|X|`.
 2. **Pin** the reference at the root (given, not needed, exact root, or the
-   opt-in estimate), then `tau`; apply the root rounding-floor check.
+   opt-in estimate), then `tau`.
 3. **Exact small patches** (at most one active site): unchanged. Their
    acceptance measurement is `Exact` with `rms = 0`: the network is built from
    the evaluated values and the one-hot factors multiply by exactly one, so no
@@ -785,30 +838,44 @@ Changes to the M2 steps
    measurement. For a sampled acceptance with `audit` on, draw the audit
    sample from the audit stream, measure it the same way, and record it; audit
    points never become pivots.
-9. **Retry.** Otherwise apply the rounding-floor check, then, while
-   `a < retries`, rerun the engine as run `a + 1`. Its initial pivots are the
-   patch's candidates, then the measured points with `|r| > tau` in
-   descending order of `|r|`, then the outcome's pivots (if any), without
-   duplicates, with the points added to the candidates capped at
-   `max_bond_dim - 1` so that the added set alone cannot reach the cap. A
-   rerun that does not converge splits the patch (step 6).
+9. **Retry.** Otherwise, while `a < retries`, rerun the engine as run
+   `a + 1`. Its initial pivots are the patch's **base candidates** (those of
+   run 0: the M2 candidates plus any zero-screen points of step 4), followed
+   by an **added list** built from the failed run `a` only:
+   1. the measured points with `|r| > tau`, in descending order of `|r|`
+      (ties in measurement order);
+   2. then the pivots returned by the failed outcome, in their returned
+      order.
+
+   Points already among the base candidates or earlier in the list are
+   dropped, and the added list is truncated to `max_bond_dim - 1` points.
+   The outcome's pivots therefore count toward the cap and only fill what the
+   worst points leave. Added lists do not accumulate across reruns: each
+   rerun uses the base candidates and the list from the run just before it.
+   The base candidates are not counted; they are bounded as in M2 (plus at
+   most `max_bond_dim - 1` zero-screen points). A rerun that does not
+   converge splits the patch (step 6).
 10. **Split** when the retries are exhausted, as for a non-converged patch
-    (M2 step 10), with one addition: the measured points with `|r| > tau`
-    (largest first, at most `max_bond_dim - 1`) are passed to the children as
-    candidates, like recycled pivots but independent of `recycle_pivots`,
-    because they locate what the approximation missed and are already cached.
+    (M2 step 10), with one addition: the measured points of the last failed
+    measurement with `|r| > tau` (largest first, at most `max_bond_dim - 1`)
+    are passed to the children as candidates, because they locate what the
+    approximation missed and are already cached. They are independent of
+    `recycle_pivots`; recycled outcome pivots follow the M2 rule and are not
+    counted toward this cap.
     A patch that cannot split returns `VerificationFailed`.
-11. **Report.** Records stay in canonical path order. The global report sums
-    the contributions and the approximation norms (from
-    `SubDomainTreeTN::norm_squared` per accepted patch) in that order, so it
-    does not depend on processing order or on the hash order of the partition.
-    The approximation norm feeds the report only, never a decision.
+11. **Report.** Records stay in canonical path order. The global error and
+    the approximation norm (from `TreeTN::log_norm` per accepted patch, see
+    [Records and report](#records-and-report)) are combined in that order, so
+    they do not depend on processing order or on the hash order of the
+    partition. The approximation norm feeds the report only, never a
+    decision.
 
 Failure handling in one line: a failed verification first reruns the engine
 with the worst points as pivots (a missed feature that fits under the cap),
-then splits (a feature that needs more rank); a residual at the rounding level
-is `ToleranceBelowRounding`, and an exhausted `patch_order` or `max_patches`
-is `VerificationFailed` or `ResourceLimit`.
+then splits (a feature that needs more rank). The same path applies when the
+requested tolerance is below an apparent rounding scale; an exhausted
+`patch_order` or `max_patches` is reported as `VerificationFailed` or
+`ResourceLimit`.
 
 Whether the retry pivots help is a measurement: `add_global_pivots` puts every
 added point into the pivot sets of every edge, so they raise the starting rank
@@ -859,15 +926,28 @@ The M2 guarantee (identical report and bitwise identical stored node tensors
 for a fixed seed, a deterministic evaluator, and a deterministic engine)
 extends to L2 runs only if every measured network value is bitwise
 reproducible, because an acceptance decision near `tau` could otherwise flip
-between runs. Two sources of run-to-run variation stand in the way:
+between runs. The claim covers every report field except `approximation_rms`
+and the relative fields of `GlobalL2Error`, which depend on it; those are
+reproducible only up to rounding (see
+[Records and report](#records-and-report)).
 
-1. **#791**: networks built with `TreeTN::from_tensors` and materialized with
-   `contract_to_tensor` are not reproducible at rounding level. This excludes
-   `TreeTNEvaluator` for the measurement.
-2. **Random index IDs**: IDs come from an unseeded per-thread generator and
-   break ties in `sort_indices_deterministic`; every engine outcome has fresh
-   bond IDs, and the generic path of `TreeTNCachedEvaluator` mints fresh IDs
-   per message. Fixing #791 does not remove ID-dependent ordering.
+**Root cause.** On trees where `TreeTNCachedEvaluator` takes its generic
+`IdxTensor` path (a site-free node, a node with several sites, or `f32`/`c32`
+data), its N-ary contractions at a node with two or more children and at a
+center with two or more neighbors go through tenferro-einsum's default
+planner, and omeco's greedy planner breaks ties between equally cheap pairs
+in `HashMap` order. The chosen plan, and with it the rounding of the result,
+can differ between threads and between processes. The plan is cached per
+thread, so repetitions on one thread agree bitwise and cannot reveal the
+problem. The M3 test tree (`quantics_tree`) takes this path.
+`TreeTNEvaluator` contracts a whole network per point through
+`contract_to_tensor` and is not used for the measurement.
+
+**Checked and excluded.** Random index IDs are not the cause: the evaluator
+path does not sort by ID, core labels legs positionally, and the fresh-ID
+indices minted per message do not change the operation order. They remain in
+the test below as an excluded risk. The #791 fix (#793) makes site-leg and
+edge order deterministic; it does not change the planner's tie-breaking.
 
 The gate is a code-level argument backed by a test: **the floating-point
 operation order of a measurement is a function of the sorted node names, the
@@ -877,34 +957,42 @@ The driver's part of the argument is fixed by this design:
 - one fresh `TreeTNCachedEvaluator` per measurement, so no message cache
   carries values from another measurement;
 - a fixed center (`CachedEvaluatorOptions::center` set to the smallest node
-  name, so no greedy search runs) and `EvaluationHint::default()` for every
-  batch;
+  name, so no greedy center search runs) and `EvaluationHint::default()` for
+  every batch;
 - points in a deterministic order (the stream order, or column-major for
   exhaustive), evaluated in chunks of the fixed size `MEASUREMENT_CHUNK`, so
   batch composition and call history are functions of the patch path and the
-  seed. The BLAS or scalar choice of the chain kernel then depends only on the
-  batch contents, which are fixed.
+  seed. The BLAS or scalar choice of the chain kernel and the message-cache
+  history then depend only on that fixed call sequence.
 
-The evaluator's part cannot be completed from the code read for this record:
-`cached_evaluator.rs` does not use `id()` or `sort_indices_deterministic`
-directly, but the generic `IdxTensor` path, which the test trees take, mints
-random-ID indices per message and contracts through core `IdxTensor`
-contraction, whose leg order has not been audited for ID independence.
-**Prerequisite**: an audit of the generic message path of
-`TreeTNCachedEvaluator` and the core contraction it calls, in
-`tensor4all-treetn` and `tensor4all-core`, that establishes ID-independent
-operation order, or makes it so (for example by ordering legs positionally, as
-the SRC fixes did). The M3 implementation starts after that audit; the driver
-does not work around it.
+Under these controls the raw-kernel trees were found bitwise reproducible
+across rebuilds, threads, processes, and thread counts. The evaluator's part
+is not satisfied on generic-path trees. **Prerequisite**: a fix of the
+contraction-path ties, before the M3 implementation starts. Two candidates,
+neither decided ([open question 8](#open-questions-for-the-user)):
 
-The test (a unit test of the measurement): build a patch on a branched tree
-with a multi-site node and a site-free junction, then, in each of several
-repetitions, rebuild it from its raw node data with fresh IDs for every bond
-index and a fresh `TreeTN::from_tensors`, create a fresh evaluator, and
-measure the same points with the same chunking and hint; all repetitions must
-give bitwise identical residuals. "The same patch" is never the same object.
-Fresh IDs and fresh hash maps in each repetition cover the per-process sources
-of variation within one process.
+- (a) in `tensor4all-treetn`, fold the N-ary contractions of the generic
+  message and center paths pairwise in positional order (children in sorted
+  name order), so no planner runs there;
+- (b) upstream, deterministic tie-breaking in omeco or in the tenferro-einsum
+  planner, which also covers every other N-ary contraction in the workspace.
+
+The driver does not work around it. The required scope of reproducibility,
+across processes or within one process (which still includes different
+threads once M7 runs patches in parallel), is
+[open question 9](#open-questions-for-the-user).
+
+The test (a unit test of the measurement): build patches on two trees, a
+branched tree with a multi-site node and a site-free junction (generic path)
+and a branched tree with one site per node (raw kernels). Run each
+repetition on a **fresh thread** (so the thread-local plan cache starts
+empty), and, if open question 9 asks for cross-process reproducibility, also
+in separate test processes. In every repetition, rebuild the patch from its
+raw node data with fresh IDs for every bond index and a fresh
+`TreeTN::from_tensors`, create a fresh evaluator, and measure the same points
+with the same chunking, center, and hint; all repetitions must give bitwise
+identical residuals. "The same patch" is never the same object. Repetitions on
+the same thread are not a valid test of this property.
 
 ## Placement
 
@@ -913,8 +1001,9 @@ Following roadmap Decision 1 (option E):
 - **`tensor4all-treetn`: no change to the M1 contract.** The trait, problem,
   outcome, and termination stay as they are; engines still receive one
   absolute tolerance. The measurement uses the existing public batch
-  evaluator. The determinism audit above may change evaluator internals, not
-  its API. Rejected: a `TreeInterpolator` method that estimates the error (the
+  evaluator. Fix (a) of [Determinism](#determinism) would change evaluator
+  internals, not its API; fix (b) would change an upstream dependency.
+  Rejected: a `TreeInterpolator` method that estimates the error (the
   measurement must be independent of the engine's sampling, and every engine
   would have to implement it, against Decision 2); a public residual
   estimator in `treetn` (its only consumer would be the driver; it can be
@@ -946,9 +1035,10 @@ with no whole-network bound.
   a typed unsupported error before any work. The reference is the operation's
   exact input norm, computed from the networks, with no caller override, as
   in reconstruction. `PartitionedTreeTN::norm_squared` is not bitwise
-  reproducible (hash-order summation at `partitioned_tree_tn.rs:333-337` and
-  canonicalization under #791), so a pinned reference must be summed in a
-  canonical order and computed by a reproducible path.
+  reproducible (hash-order summation at `partitioned_tree_tn.rs:333-337`), and
+  the reproducibility of the canonicalization it calls is unaudited, so a
+  pinned reference must be summed in a canonical order and computed by a path
+  whose reproducibility is established first.
 - Every truncation is measured, not assumed: the residual is the norm of the
   explicit difference network against the untruncated source
   (`TreeTN::axpby` followed by `norm`, as in `reconstruction/engine.rs`).
@@ -985,12 +1075,14 @@ or more, checked in the test.
    total; `max_exhaustive_points = 1024`, so every patch, the root included,
    is measured exhaustively. A localized function, TreeTCI, a given reference
    norm, and a sufficient cap so that some patches are accepted from the
-   engine with rank at least two. The report must be `certified`.
-   Materialize the partition once (`to_treetn()?.contract_to_tensor()?`),
-   subtract the dense reference, and assert
-   `diff.norm() <= delta * (1 + GLOBAL_ROUNDING_MARGIN)`, the agreement of
-   `diff.norm()` with `error_norm()` within that margin, and
-   `diff.norm() / reference.norm() <= relative_error`.
+   engine with rank at least two. The global error must be
+   `GlobalL2Error::Certified`. Materialize the partition once
+   (`to_treetn()?.contract_to_tensor()?`), subtract the dense reference, and
+   assert `diff.norm() <= delta * (1 + GLOBAL_ROUNDING_MARGIN)`, the agreement
+   of `diff.norm()` with the certified `error_norm()` within that margin, that
+   `relative_error_bound` is `Some`, and
+   `diff.norm() / reference.norm() <= relative_error_bound`; the bound already
+   contains the margin, so no further slack is added.
 2. **L2 against a dense reference, sampled.** The same problem with
    `samples = 16`, `max_exhaustive_points = 0`, and a fixed seed, so a patch
    is exhaustive only with at most 16 points. Assert that some accepted patch
@@ -999,23 +1091,36 @@ or more, checked in the test.
    audited relative standard error is positive, that the audited estimate lies
    within a recorded number of standard errors of the true error; when it is
    zero, only the first bound is asserted. Both constants are fixed-seed
-   regression constants, not probabilistic claims.
+   regression constants, not probabilistic claims. With `audit = false` the
+   same run reports `GlobalL2Error::AcceptanceOnly` with no relative
+   statement. A run whose `||f~||` does not exceed its `E` (for example only
+   zero patches with a nonzero measured error within `atol`) reports its
+   relative field as `None`.
 3. **A missed feature is caught.** A dense test engine configured to drop a
    narrow feature returns `Converged`; exhaustive verification rejects it, the
-   rerun receives the worst points (at most `max_bond_dim - 1`), and the patch
-   is accepted or split; `verification_failures` and `engine_retries` match.
-   With `retries = 0` the patch splits immediately.
+   rerun receives the worst points, and the patch is accepted or split;
+   `verification_failures` and `engine_retries` match. With `retries = 0` the
+   patch splits immediately. A test engine that records its initial pivots
+   and returns many pivots checks the added list of step 9 exactly: worst
+   points first, then outcome pivots, duplicates of the base candidates
+   dropped, at most `max_bond_dim - 1` added points, and no accumulation over
+   two reruns.
 4. **Sampled retry on a fresh stream.** A sampled verification that fails
    leads to a rerun whose measurement uses verification stream 1, not 0.
 5. **Retries exhausted.** The patch splits and the children receive the worst
-   points as candidates, with `recycle_pivots` off.
+   points of the last failed measurement as candidates (at most
+   `max_bond_dim - 1`), with `recycle_pivots` off, and in addition to the
+   recycled pivots with `recycle_pivots` on.
 6. **Failure at the end of the order.** `VerificationFailed` when no split
    site is left after a verification failure (and `NoSplitIndexLeft`
    unchanged for a non-converged patch); `ResourceLimit` when `max_patches`
    is reached after a verification failure.
-7. **Rounding floor.** A tolerance below the floor at the root, and a patch
-   whose failure sits at the rounding level, return `ToleranceBelowRounding`;
-   `rtol = atol = 0` splits to exact patches without that error.
+7. **Tolerance below roundoff.** A positive tolerance below a conventional
+   machine-epsilon-times-scale estimate is not rejected at the root or after a
+   failed measurement; retries and splitting proceed from the measured
+   residual. With enough split resources, the case reaches exact patches; a
+   constrained run reports its normal verification or resource-limit error.
+   The zero-tolerance case follows the same path.
 8. **Zero patches.** A region where every candidate is zero but the function
    is nonzero on half of the region fails the zero screen (fixed seed) and
    goes to the engine with the nonzero points as candidates, without
@@ -1039,10 +1144,14 @@ or more, checked in the test.
 13. **SampledMax.** The frozen M2 digests are reproduced; `atol > 0` raises
     the engine tolerance to `atol` when it exceeds `rtol * max_reference`; a
     domain too large for `f64` is accepted under `SampledMax` as in M2.
-14. **Determinism.** Two L2 runs with the same seed are bitwise identical
-    (patches and reports) on the branched tree, with the dense engine and with
-    TreeTCI; plus the fresh-ID measurement test of
-    [Determinism](#determinism).
+14. **Determinism.** Two L2 runs with the same seed, each on a fresh thread
+    (and in separate processes if open question 9 requires it), give bitwise
+    identical patches and reports, except `approximation_rms` and the
+    relative fields, which agree within `GLOBAL_ROUNDING_MARGIN`; on the
+    branched tree with the dense engine and with TreeTCI, after the
+    prerequisite fix. Plus the fresh-thread, fresh-ID measurement test of
+    [Determinism](#determinism) on a generic-path tree and a raw-kernel
+    tree.
 15. **Cache.** Measurement points reuse cached values, a point is never
     evaluated twice, measured values reach the children, and audit points
     never appear among pivots.
@@ -1071,8 +1180,10 @@ The M3 PR updates the rustdoc of the driver module and every changed type,
 `docs/book/src/guides/tree-tn.md`, and
 [tree-pqtci-driver.md](./tree-pqtci-driver.md) ("Error criterion"). Rustdoc
 states the definition of verified, that a sampled measurement is an estimate
-only when audited and never a bound, that `certified` is absolute with
-respect to the allowance used, and the units of each reference.
+only when audited and never a bound, that a certified error is absolute with
+respect to the allowance used, that no relative statement exists for an
+acceptance-only run or when `||f~|| <= E`, which report fields the bitwise
+determinism claim covers, and the units of each reference.
 
 ## Measurements needed later
 
@@ -1083,7 +1194,6 @@ None blocks the M3 implementation; the defaults below are provisional.
 | Defaults of `samples`, `max_exhaustive_points`, `retries`, `audit` | measurement evaluations as a share of all evaluations, failure and retry rates | M9, on M2 patches of a real workload (TreeTCI, `rtol` near `1e-4`), chain and branched tree |
 | Retry pivots and their cap | retry success, starting and final rank, evaluations per retry | M9, same workloads |
 | Engine tolerance below `tau` | total evaluations and patch count against the factor | M9, same workloads, at matched measured accuracy |
-| `ROUNDING_FLOOR_FACTOR` | residuals of exact representations at the rounding level | M3 implementation (unit scale), confirmed in M9 |
 | Volume versus norm-proportional allocation | patches and evaluations on localized functions at matched measured error | M9, only if open question 2 selects both |
 
 ## Non-goals
@@ -1106,7 +1216,9 @@ None blocks the M3 implementation; the defaults below are provisional.
 1. **Definition of "verified".** Exact and exhaustive measurements are
    certificates of the absolute error against the allowance used; sampled
    ones are decision statistics, and unbiased estimates only through an
-   independent audit; `certified` does not cover an estimated reference. Is
+   independent audit; a certified error does not cover an estimated
+   reference, and a run without a complete audit is labelled acceptance-only
+   and makes no error or relative claim. Is
    this acceptable, or should the public API avoid the word "verified" for
    sampled measurements (for example "measured")?
 2. **Budget allocation.** Proposed: volume-proportional with one pinned
@@ -1114,7 +1226,8 @@ None blocks the M3 implementation; the defaults below are provisional.
    the local `cutoff` allocation, and the M1 record). It needs a reference
    norm, which is either given or an estimate that can loosen the tolerance
    (see question 3), and it over-refines localized functions by about
-   `sqrt(rho)` and can push their peak patches below the rounding floor.
+   `sqrt(rho)`, potentially requiring more exact patches or reaching a
+   configured resource limit.
    Alternative: proportional to each patch's own norm,
    `ms_P(r) <= rtol^2 ms_P(f~_P) + atol^2 / |X|`, giving
    `E^2 <= rtol^2 ||f~||^2 + atol^2`. It needs no reference norm and no
@@ -1122,8 +1235,10 @@ None blocks the M3 implementation; the defaults below are provisional.
    guarantee is relative to `||f~||` (relative to `||f||` up to
    `1 / (1 - rtol)`), it requires `rtol < 1`, with `atol = 0` it demands
    relative accuracy in low-amplitude regions, and it puts `||f~_P||` into
-   the acceptance decision, which then needs a bitwise reproducible patch norm
-   (the canonicalizing `norm_squared` falls under #791). The a-posteriori
+   the acceptance decision, which then needs a bitwise reproducible patch
+   norm; the canonicalizing `log_norm`/`norm_squared` path is not audited for
+   that, so the alternative would add a norm-reproducibility prerequisite
+   like the evaluator one (question 8). The a-posteriori
    relative bound is available under either. Keep the proposal, switch, or
    offer both?
 3. **Default reference norm.** Proposed now: none (`L2Reference::Required`),
@@ -1142,7 +1257,8 @@ None blocks the M3 implementation; the defaults below are provisional.
    of the acceptance sample, and draw an independent audit sample for every
    sampled contribution by default (`audit = true`), at the cost of `samples`
    more evaluations per sampled accepted or zero patch; without the audit the
-   report has no error estimate for sampled patches. An upper confidence bound
+   run is reported as `AcceptanceOnly`, with no error estimate and no
+   relative statement. An upper confidence bound
    `m + z * SE` rejects more borderline patches but does not help against a
    concentrated residual (it is zero in the counterexample). Should the audit
    be on by default, and should a confidence-bound acceptance be offered?
@@ -1153,3 +1269,18 @@ None blocks the M3 implementation; the defaults below are provisional.
 7. **Placeholders.** Proposed: `MaxAbs` and `WeightedL2`. Are these the norms
    you want reserved, or others (for example a Sobolev or a pointwise
    relative norm)?
+8. **Evaluator determinism fix.** A prerequisite before implementation (see
+   [Determinism](#determinism)); which one? (a) In `tensor4all-treetn`, fold
+   the N-ary contractions of `TreeTNCachedEvaluator`'s generic path pairwise
+   in positional order: local to one crate and quick to land, but it fixes
+   only this evaluator and gives up the planner's cost optimization there.
+   (b) Deterministic tie-breaking in omeco or the tenferro-einsum planner:
+   fixes every N-ary contraction in the workspace, but needs an upstream
+   change and a dependency update. Both, (a) first and (b) later, is also
+   possible.
+9. **Scope of the determinism guarantee.** Should identical seeds give
+   bitwise identical results across processes (and machines with the same
+   build), or only within one process? Within one process still means across
+   threads once M7 runs patches in parallel, so the thread-local plan cache
+   alone does not suffice for either scope. The choice sets whether the
+   determinism tests also run in separate processes.
