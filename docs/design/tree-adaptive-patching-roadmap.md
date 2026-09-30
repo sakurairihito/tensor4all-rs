@@ -149,8 +149,10 @@ nodes; the driver is deterministic for fixed seeds.
 
 ### M3. Error contract (M)
 
-Outcome: one accuracy requirement with a reported, measured bound for
+Outcome: one accuracy requirement with a reported, measured error for
 interpolation and patched algebra; verified L2 is the default (Decision 3).
+The measured error is a bound where it is exact or exhaustive (and for patched
+algebra) and a statistical estimate where it is sampled.
 
 Scope:
 
@@ -160,10 +162,12 @@ Scope:
   pinned once for all patches instead of per-patch maximum samples;
 - an optional global-budget mode for patched contraction and addition,
   verified with the difference-network norms already used by reconstruction;
-- reports expose measured bounds, not only requested tolerances.
+- reports expose measured errors (bounds where exhaustive, estimates where
+  sampled), not only requested tolerances.
 
 Exit: the contract is documented in rustdoc and design records; tests check
-reported bounds against dense references on small problems.
+reported errors (bounds and estimates) against dense references on small
+problems.
 
 Design: [tree-patching-error-contract.md](./tree-patching-error-contract.md)
 (proposal; the interpolation side in full, the patched-algebra mode scoped for
