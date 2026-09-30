@@ -2,12 +2,15 @@
 
 ## Status
 
-Proposal for milestone M3 of
+Approved for implementation, for milestone M3 of
 [tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md),
-revised after one independent review. It changes the public API and the
+after four rounds of independent review. It changes the public API and the
 acceptance semantics of the M2 driver
-([tree-pqtci-driver.md](./tree-pqtci-driver.md)) and must be approved before
-implementation. It covers the interpolation side of M3 in full. The
+([tree-pqtci-driver.md](./tree-pqtci-driver.md)). The user chose to check the
+open questions while implementing: each one starts from the proposal written
+here, and implementation reports the evidence that bears on it. The
+implementation record states which proposals were kept and which were
+changed, and why. It covers the interpolation side of M3 in full. The
 patched-algebra side (the optional global-budget mode for addition and
 contraction) is scoped here and gets its own design record before
 implementation ([Patched algebra](#patched-algebra-m3b)).
@@ -16,7 +19,11 @@ Implementation has two prerequisites, both stated below: frozen M2 golden
 outputs committed before the refactor ([Tests](#tests)), and a fix that
 makes the TreeTN evaluator used by the measurement reproducible on trees that
 take its generic path ([Determinism](#determinism)); which fix is an open
-question for the user.
+question for the user. The golden outputs are committed first. The
+evaluator fix does not block the rest of the implementation: the
+cross-thread determinism test runs early, and if the fix is still open, its
+result on generic-path trees is reported to the user before M3 is declared
+done.
 
 The decisions that depend on the user are collected under
 [Open questions](#open-questions-for-the-user). No measurement was run for
@@ -1200,8 +1207,16 @@ separated from their thresholds**: scenarios on the dense test engine decide
 on ranks of exactly representable data; for each TreeTCI scenario the
 recording test also records the ratio of every patch's engine error estimate
 to its tolerance, and the scenario is admitted only if every ratio lies
-outside `[1 / GOLDEN_DECISION_SEPARATION, GOLDEN_DECISION_SEPARATION]`. LU
-pivot choices inside TreeTCI cannot be screened this way; a TreeTCI scenario
+outside `[1 / GOLDEN_DECISION_SEPARATION, GOLDEN_DECISION_SEPARATION]`. The
+M2 report does not contain these ratios: it has `error_estimate` only for
+accepted patches and does not record the tolerance. The recording test
+therefore wraps `TreeTciInterpolator` in a test-local engine that implements
+`TreeInterpolator<T>`, delegates every call, and records
+`problem.absolute_tolerance()`, the termination and the `error_estimate` of
+each call; the driver is generic over the engine, so this needs no library
+change. Only the final error-to-tolerance ratio of each call is screened.
+TreeTCI's per-sweep error history, its rank-truncation decisions and its LU
+pivot choices cannot be screened this way; a TreeTCI scenario
 whose discrete output differs on another platform is evidence for question 9
 and is not silently re-recorded. This is preferred over running the golden
 check in a single pinned CI environment, because the check should hold
@@ -1231,8 +1246,10 @@ or more, checked in the test.
    `relative_error_bound` is `Some`, and
    `diff.norm() / reference.norm() <= relative_error_bound + R /
    reference.norm()` (the bound already contains the margin and the
-   measurement's own term). In addition, as an explicit **calibration check
-   of the rounding model** and not a contract assertion,
+   measurement's own term). A separately named test,
+   `rounding_model_calibration`, on the same problem, holds the explicit
+   **calibration check of the rounding model**, which is not a contract
+   assertion, so that a CI failure identifies itself:
    `|diff.norm() - error_norm()| <= GLOBAL_ROUNDING_MARGIN * diff.norm() +
    2 R`: it has no `delta` slack, so it holds only if
    `MEASUREMENT_ROUNDING_FACTOR` bounds the rounding of both evaluation paths
@@ -1301,7 +1318,8 @@ or more, checked in the test.
     `GLOBAL_ROUNDING_MARGIN`. The overflow case is built on the exact
     small-patch path (a patch with one active site whose values are about
     `1e155` on enough points that `||f~_P||` exceeds `1.34e154`), or with
-    the dense test engine, so it exercises only the report's overflow
+    the dense test engine, with `L2Reference::Given` so that forming the
+    reference does not overflow first, so it exercises only the report's overflow
     handling: the run completes and reports `approximation_rms`, the rounding
     term, the flag, and the relative fields as `None`. TreeTCI's own
     behaviour at such magnitudes is out of scope for this test. A certified
