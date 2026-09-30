@@ -157,6 +157,16 @@ where
     /// The result has only site (physical) indices; all bond indices are summed out.
     /// See also [`to_dense`](Self::to_dense), which is an alias for this method.
     ///
+    /// # Output index order
+    /// Nodes are ordered by **sorted node name**, and each node's site legs
+    /// follow that node tensor's own leg order
+    /// ([`node_site_indices`](Self::node_site_indices)). This differs from
+    /// [`TensorIndex::external_indices`](tensor4all_core::TensorIndex::external_indices),
+    /// which lists nodes in [`node_names`](Self::node_names) (insertion) order:
+    /// for a chain supplied as `C, A, B` where `A` stores `[a2, bond, a1, bond]`,
+    /// `external_indices()` is `[c, a2, a1, b]` but the dense result is ordered
+    /// `[a2, a1, b, c]`.
+    ///
     /// # Returns
     /// A single tensor representing the full contraction of the network.
     ///
@@ -189,6 +199,31 @@ where
     ///
     /// // Result has only site indices
     /// assert_eq!(dense.num_external_indices(), 2);
+    ///
+    /// // Output order: nodes by sorted name, legs in each tensor's order.
+    /// let (a1, a2, b, c) = (
+    ///     DynIndex::new_dyn(2),
+    ///     DynIndex::new_dyn(2),
+    ///     DynIndex::new_dyn(2),
+    ///     DynIndex::new_dyn(2),
+    /// );
+    /// let (bond_ca, bond_ab) = (DynIndex::new_dyn(1), DynIndex::new_dyn(1));
+    /// let tc = IdxTensor::from_dense(vec![c.clone(), bond_ca.clone()], vec![1.0_f64; 2]).unwrap();
+    /// let ta = IdxTensor::from_dense(
+    ///     vec![a2.clone(), bond_ca, a1.clone(), bond_ab.clone()],
+    ///     vec![1.0_f64; 4],
+    /// )
+    /// .unwrap();
+    /// let tb = IdxTensor::from_dense(vec![bond_ab, b.clone()], vec![1.0_f64; 2]).unwrap();
+    /// let chain = TreeTN::<_, &str>::from_tensors(vec![tc, ta, tb], vec!["C", "A", "B"]).unwrap();
+    /// assert_eq!(
+    ///     chain.external_indices(),
+    ///     vec![c.clone(), a2.clone(), a1.clone(), b.clone()]
+    /// );
+    /// assert_eq!(
+    ///     chain.contract_to_tensor().unwrap().external_indices(),
+    ///     vec![a2, a1, b, c]
+    /// );
     /// ```
     pub fn contract_to_tensor(&self) -> std::result::Result<T, TreeTNOperationError>
     where
@@ -263,14 +298,15 @@ where
             .ok_or_else(|| anyhow::anyhow!("Contraction produced no result"))?;
 
         // Permute result indices to match canonical site index order:
-        // node names sorted, then site indices per node in consistent order
+        // node names sorted, then each node's site legs in the node tensor's own
+        // leg order (`node_site_indices`). The site space itself is an unordered
+        // set and must not be iterated here.
         let mut expected_indices: Vec<T::Index> = Vec::new();
         let mut node_names: Vec<V> = self.node_names();
         node_names.sort();
         for node_name in &node_names {
-            if let Some(site_space) = self.site_space(node_name) {
-                // Use site indices in insertion order (deterministic from site_space)
-                expected_indices.extend(site_space.iter().cloned());
+            if let Some(site_indices) = self.node_site_indices(node_name) {
+                expected_indices.extend(site_indices);
             }
         }
 
@@ -1143,9 +1179,23 @@ where
         // 10. Build result TreeTN
         let mut result = TreeTN::new();
 
-        // Add all result tensors
-        for (node_name, tensor) in result_tensors {
-            result.add_tensor(node_name, tensor)?;
+        // Add all result tensors in `tn_a`'s node order (every key of
+        // `result_tensors` is a node of `tn_a`). `result_tensors` is a HashMap;
+        // iterating it would make the result's node order (and with it
+        // `external_indices`, `all_site_indices` and later `add` layouts) depend
+        // on the hasher state.
+        for node_name in tn_a.node_names() {
+            if let Some(tensor) = result_tensors.remove(&node_name) {
+                result.add_tensor(node_name, tensor)?;
+            }
+        }
+        if !result_tensors.is_empty() {
+            let mut stray: Vec<&V> = result_tensors.keys().collect();
+            stray.sort();
+            return Err(anyhow::anyhow!(
+                "contract_zipup_with: internal error: result tensors for nodes {:?} are not nodes of the first operand",
+                stray
+            ));
         }
 
         // Connect nodes based on original topology

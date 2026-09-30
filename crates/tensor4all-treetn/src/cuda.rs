@@ -258,6 +258,11 @@ where
     /// The source network is never modified and the returned tensor remains on
     /// the supplied CUDA context until [`IdxTensor::download`] is called.
     ///
+    /// The result uses the same index order as
+    /// [`TreeTN::contract_to_tensor`]: nodes by sorted node name, then each
+    /// node tensor's own site-leg order. This differs from `external_indices()`,
+    /// which follows [`TreeTN::node_names`] (insertion) order.
+    ///
     /// # Errors
     ///
     /// Returns [`CudaTreeTNError`] for an empty or invalid tree, host/foreign
@@ -363,8 +368,8 @@ where
         let mut expected_node_names = self.node_names();
         expected_node_names.sort();
         for node_name in expected_node_names {
-            if let Some(site_space) = self.site_space(&node_name) {
-                expected_indices.extend(site_space.iter().cloned());
+            if let Some(site_indices) = self.node_site_indices(&node_name) {
+                expected_indices.extend(site_indices);
             }
         }
         let current_indices = result.external_indices();
