@@ -6,31 +6,23 @@
 
 mod adaptive_common;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::Debug;
-use std::hash::Hash;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use adaptive_common::*;
 use num_complex::Complex64;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use tensor4all_core::{
-    contract_pair, outer_product, ColMajorArray, ColMajorArrayRef, CommonScalar, DynIndex,
-    FactorizeOptions, IdxTensor, Index, IndexLike, TagSet, TensorElement,
-};
+use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex, Index, IndexLike, TagSet};
 use tensor4all_partitionedtreetn::adaptive_interpolation::{
     patched_interpolate, PatchedInterpolationError, PatchedInterpolationOptions,
     PatchedInterpolationResult,
 };
 use tensor4all_partitionedtreetn::Projector;
 use tensor4all_treetn::interpolation::{
-    validate_layout, InterpolationError, InterpolationOutcome, InterpolationProblem,
-    InterpolationTermination, TreeInterpolator,
+    validate_layout, InterpolationError, InterpolationTermination,
 };
-use tensor4all_treetn::{factorize_tensor_to_treetn_with, TreeTN, TreeTopology};
 
 #[test]
 fn branched_topology_is_a_genuine_tree_with_a_degree_three_node() {
@@ -42,232 +34,6 @@ fn branched_topology_is_a_genuine_tree_with_a_degree_three_node() {
     assert_eq!(degree("j"), 3);
     assert_eq!(problem.topology.edge_count(), 5);
     assert!(validate_layout(&problem.topology, &problem.node_sites).is_ok());
-}
-
-// ---------------------------------------------------------------------------
-// The dense test engine
-// ---------------------------------------------------------------------------
-
-/// Misbehavior injected into the dense test engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fault {
-    None,
-    /// Return a network whose first active site has another identity.
-    WrongLayout,
-    /// Return pivots with a wrong number of rows.
-    BadPivots,
-    /// Report `AllSamplesZero` although the driver screened the patch.
-    AllZero,
-    /// Stop with `IterationLimit` instead of converging.
-    IterationLimit,
-    /// Report `Converged` whatever the rank, even at the cap.
-    ConvergedAtCap,
-    /// Sample only the initial pivots and stop at the cap; the (empty)
-    /// network is never used because the driver splits.
-    CapAfterPivots,
-    /// Send a batch with the wrong number of rows.
-    BadBatch,
-    /// Send a batch with an out-of-range coordinate.
-    OutOfRange,
-}
-
-/// One problem seen by the dense test engine.
-#[derive(Clone, Debug)]
-struct Seen {
-    site_order: Vec<DynIndex>,
-    initial_pivots: Vec<Vec<usize>>,
-    returned_pivots: Vec<Vec<usize>>,
-    seed: u64,
-}
-
-/// Evaluates the whole active domain, factorizes it exactly (SVD with the
-/// default relative threshold), and reports `BondCapReached` when the exact
-/// rank reaches the cap. Nodes without active sites are supported through a
-/// temporary dimension-one site that is contracted away afterwards.
-struct DenseEngine {
-    fault: Fault,
-    seen: Mutex<Vec<Seen>>,
-}
-
-impl DenseEngine {
-    fn new() -> Self {
-        Self::with_fault(Fault::None)
-    }
-
-    fn with_fault(fault: Fault) -> Self {
-        Self {
-            fault,
-            seen: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn seen(&self) -> Vec<Seen> {
-        self.seen.lock().unwrap().clone()
-    }
-}
-
-fn columns_of(array: &ColMajorArray<usize>) -> Vec<Vec<usize>> {
-    (0..array.ncols().unwrap_or(0))
-        .map(|column| array.column(column).unwrap().to_vec())
-        .collect()
-}
-
-impl<T> TreeInterpolator<T> for DenseEngine
-where
-    T: CommonScalar + TensorElement,
-{
-    fn interpolate<V, F>(
-        &self,
-        problem: &InterpolationProblem<V>,
-        evaluate: F,
-    ) -> Result<InterpolationOutcome<V>, InterpolationError>
-    where
-        V: Clone + Hash + Eq + Ord + Debug + Send + Sync,
-        F: Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<T>>,
-    {
-        let engine = |source: anyhow::Error| InterpolationError::Engine { source };
-        let evaluator = |source: anyhow::Error| InterpolationError::Evaluator { source };
-        let site_order = problem.site_order().to_vec();
-        let dims: Vec<usize> = site_order.iter().map(IndexLike::dim).collect();
-        let n_active = dims.len();
-
-        match self.fault {
-            Fault::AllZero => return Err(InterpolationError::AllSamplesZero),
-            Fault::BadBatch => {
-                let data = vec![0; n_active + 1];
-                let shape = [n_active + 1, 1];
-                evaluate(ColMajorArrayRef::new(&data, &shape).unwrap()).map_err(evaluator)?;
-            }
-            Fault::OutOfRange => {
-                let data = dims.clone();
-                let shape = [n_active, 1];
-                evaluate(ColMajorArrayRef::new(&data, &shape).unwrap()).map_err(evaluator)?;
-            }
-            _ => {}
-        }
-
-        let initial = evaluate(problem.initial_pivots().as_ref()).map_err(evaluator)?;
-        if initial.iter().all(|value| value.abs_val() == 0.0) {
-            return Err(InterpolationError::AllSamplesZero);
-        }
-        if self.fault == Fault::CapAfterPivots {
-            return Ok(InterpolationOutcome {
-                network: TreeTN::new(),
-                termination: InterpolationTermination::BondCapReached,
-                error_estimate: 1.0,
-                max_sample_magnitude: 1.0,
-                pivots: None,
-            });
-        }
-        let domain: Vec<usize> = full_domain(&dims).concat();
-        let shape = [n_active, domain.len() / n_active];
-        let values =
-            evaluate(ColMajorArrayRef::new(&domain, &shape).unwrap()).map_err(evaluator)?;
-        let (argmax, max_sample_magnitude) =
-            values.iter().map(|value| value.abs_val()).enumerate().fold(
-                (0, 0.0_f64),
-                |best, (i, m)| if m > best.1 { (i, m) } else { best },
-            );
-
-        let mut indices = site_order.clone();
-        if self.fault == Fault::WrongLayout {
-            indices[0] = indices[0].sim();
-        }
-        let mut dense =
-            IdxTensor::from_dense(indices.clone(), values).map_err(|e| engine(e.into()))?;
-        let one = vec![T::from_f64(1.0)];
-        let mut nodes = HashMap::new();
-        let mut dummies = HashMap::new();
-        let mut position = 0;
-        for (node, sites) in problem.node_sites() {
-            let node_indices = indices[position..position + sites.len()].to_vec();
-            position += sites.len();
-            if node_indices.is_empty() {
-                let dummy = DynIndex::new_dyn(1);
-                let ones = IdxTensor::from_dense(vec![dummy.clone()], one.clone()).unwrap();
-                dense = outer_product(&dense, &ones).map_err(|e| engine(e.into()))?;
-                nodes.insert(node.clone(), vec![dummy]);
-                dummies.insert(node.clone(), ones);
-            } else {
-                nodes.insert(node.clone(), node_indices);
-            }
-        }
-        let topology = problem.topology();
-        let graph = topology.graph();
-        let edges = graph
-            .edge_indices()
-            .map(|edge| {
-                let (a, b) = graph.edge_endpoints(edge).unwrap();
-                (
-                    topology.node_name(a).unwrap().clone(),
-                    topology.node_name(b).unwrap().clone(),
-                )
-            })
-            .collect();
-        let root = problem.node_sites().keys().next().unwrap();
-        let factorized = factorize_tensor_to_treetn_with(
-            &dense,
-            &TreeTopology::new(nodes, edges),
-            FactorizeOptions::svd(),
-            root,
-        )
-        .map_err(|e| engine(e.into()))?;
-        let names: Vec<V> = problem.node_sites().keys().cloned().collect();
-        let tensors = names
-            .iter()
-            .map(|name| {
-                let tensor = factorized
-                    .tensor(factorized.node_index(name).unwrap())
-                    .unwrap();
-                match dummies.get(name) {
-                    Some(ones) => contract_pair(tensor, ones).unwrap(),
-                    None => tensor.clone(),
-                }
-            })
-            .collect();
-        let network = TreeTN::from_tensors(tensors, names).map_err(|e| engine(e.into()))?;
-
-        let rank = network.link_dims().into_iter().max().unwrap_or(1);
-        let termination = if self.fault == Fault::IterationLimit {
-            InterpolationTermination::IterationLimit
-        } else if self.fault == Fault::ConvergedAtCap {
-            InterpolationTermination::Converged
-        } else if problem.max_bond_dim().is_some_and(|cap| rank >= cap.get()) {
-            InterpolationTermination::BondCapReached
-        } else {
-            InterpolationTermination::Converged
-        };
-
-        let mut returned = columns_of(problem.initial_pivots());
-        returned.push(full_domain(&dims)[argmax].clone());
-        let rows = if self.fault == Fault::BadPivots {
-            n_active + 1
-        } else {
-            n_active
-        };
-        let flat: Vec<usize> = returned
-            .iter()
-            .flat_map(|p| {
-                p.iter()
-                    .copied()
-                    .chain(std::iter::repeat_n(0, rows - n_active))
-            })
-            .collect();
-        let pivots = ColMajorArray::new(flat, vec![rows, returned.len()]).unwrap();
-        self.seen.lock().unwrap().push(Seen {
-            site_order,
-            initial_pivots: columns_of(problem.initial_pivots()),
-            returned_pivots: returned,
-            seed: problem.seed(),
-        });
-        Ok(InterpolationOutcome {
-            network,
-            termination,
-            error_estimate: 0.0,
-            max_sample_magnitude,
-            pivots: Some(pivots),
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------

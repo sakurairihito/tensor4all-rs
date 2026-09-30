@@ -1,6 +1,11 @@
 //! Shared helpers of the adaptive interpolation integration tests.
 #![allow(dead_code)]
 
+mod dense_engine;
+
+#[allow(unused_imports)]
+pub(crate) use dense_engine::*;
+
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicUsize, Ordering};
