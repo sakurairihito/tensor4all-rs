@@ -24,26 +24,6 @@ use tensor4all_treetn::TreeTN;
 // TreeTCI end to end
 // ---------------------------------------------------------------------------
 
-/// Quantics coordinate in [0, 1) of `bits` (most significant first).
-fn quantics(bits: &[usize]) -> f64 {
-    bits.iter()
-        .enumerate()
-        .map(|(k, &bit)| bit as f64 * 0.5_f64.powi(k as i32 + 1))
-        .sum()
-}
-
-fn gaussian(x: f64, center: f64, width: f64) -> f64 {
-    (-((x - center) / width).powi(2)).exp()
-}
-
-/// Largest magnitude of `f` over the whole (small) domain.
-fn max_abs(problem: &Problem, f: &dyn Fn(&[usize]) -> f64) -> f64 {
-    full_domain(&problem.dims())
-        .iter()
-        .map(|p| f(p).abs())
-        .fold(0.0, f64::max)
-}
-
 #[test]
 fn treetci_patches_a_localized_function_on_a_quantics_chain() {
     // 128 points; two narrow peaks give the whole domain a rank above the cap.
@@ -71,40 +51,6 @@ fn treetci_patches_a_localized_function_on_a_quantics_chain() {
         .iter()
         .any(|record| record.max_bond_dim >= 2));
     assert_accurate(&result, &problem, &f, rtol);
-}
-
-/// Two quantics variables on branches of a site-free junction `r` of degree
-/// three; the third branch `z` is a binary flag.
-fn quantics_tree() -> Problem {
-    Problem::new(
-        &[
-            ("r", &[]),
-            ("x0", &[2]),
-            ("x1", &[2]),
-            ("x2", &[2]),
-            ("y0", &[2]),
-            ("y1", &[2]),
-            ("y2", &[2]),
-            ("z", &[2]),
-        ],
-        &[
-            ("r", "x0"),
-            ("x0", "x1"),
-            ("x1", "x2"),
-            ("r", "y0"),
-            ("y0", "y1"),
-            ("y1", "y2"),
-            ("r", "z"),
-        ],
-    )
-}
-
-/// A peak at (0.3, 0.6) whose height depends on the flag; site order
-/// x0, x1, x2, y0, y1, y2, z.
-fn tree_peak(p: &[usize]) -> f64 {
-    let (x, y) = (quantics(&p[0..3]), quantics(&p[3..6]));
-    (1.0 + 0.5 * p[6] as f64) * gaussian(x, 0.3, 0.12) * gaussian(y, 0.6, 0.12)
-        + 0.2 * (x * y + p[6] as f64 * x)
 }
 
 fn quantics_tree_options(problem: &Problem, recycle: bool) -> PatchedInterpolationOptions {
