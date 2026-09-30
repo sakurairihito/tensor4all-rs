@@ -142,7 +142,7 @@ fn treetci_patches_a_function_on_a_branched_tree_deterministically() {
         assert_accurate(&result, &problem, &tree_peak, options.rtol);
         runs.push(result);
     }
-    assert_same_run(&runs[1], &runs[2]);
+    assert_same_run(&problem, &runs[1], &runs[2]);
 }
 
 /// A test engine for product functions: it samples the fibers through the

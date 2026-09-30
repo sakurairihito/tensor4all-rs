@@ -779,7 +779,7 @@ fn runs_are_deterministic_and_seeds_depend_on_the_patch() {
     assert_eq!(pivots(&first_engine), pivots(&second_engine));
     let distinct: HashSet<u64> = seeds(&first_engine).into_iter().collect();
     assert_eq!(distinct.len(), first_engine.seen().len());
-    assert_same_run(&first, &second);
+    assert_same_run(&problem, &first, &second);
 }
 
 #[test]

@@ -412,9 +412,92 @@ pub(crate) fn expect_interpolation<T: Debug>(
     }
 }
 
+/// One leg of a stored node tensor, described without run-specific index IDs:
+/// a site by its position in the site order, a bond by the node it links to.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Leg {
+    Site(usize),
+    Bond { to: Name, dim: usize },
+}
+
+/// The stored node tensor of one patch: its legs in positional order and its
+/// raw column-major `f64` data as bit patterns.
+pub(crate) type NodeFingerprint = (Name, Vec<Leg>, Vec<u64>);
+
+/// One stored patch: its projector as sorted (site position, coordinate)
+/// pairs and its node fingerprints in node-name order.
+pub(crate) type PatchFingerprint = (Vec<(usize, usize)>, Vec<NodeFingerprint>);
+
+/// A bitwise, positional description of every stored patch, in report order:
+/// the projector as sorted (site position, coordinate) pairs and, for every
+/// node in name order, its legs and raw data. Two runs with equal
+/// fingerprints store the same tensors with the same axis order.
+pub(crate) fn fingerprint(
+    result: &PatchedInterpolationResult<Name>,
+    problem: &Problem,
+) -> Vec<PatchFingerprint> {
+    result
+        .report
+        .accepted
+        .iter()
+        .map(|record| {
+            let mut entries: Vec<(usize, usize)> = record
+                .projector
+                .iter()
+                .map(|(site, &value)| (problem.position(site), value))
+                .collect();
+            entries.sort_unstable();
+            let data = result.partition.get(&record.projector).unwrap().data();
+            let mut names = data.node_names();
+            names.sort();
+            let tensor_of = |name: &Name| data.tensor(data.node_index(name).unwrap()).unwrap();
+            let nodes = names
+                .iter()
+                .map(|name| {
+                    let tensor = tensor_of(name);
+                    assert!(tensor.is_f64(), "node {name} is not f64");
+                    let legs = tensor
+                        .indices()
+                        .iter()
+                        .map(
+                            |index| match problem.sites.iter().position(|s| s == index) {
+                                Some(position) => Leg::Site(position),
+                                None => {
+                                    let to = names
+                                        .iter()
+                                        .find(|other| {
+                                            *other != name
+                                                && tensor_of(other).indices().contains(index)
+                                        })
+                                        .unwrap()
+                                        .clone();
+                                    Leg::Bond {
+                                        to,
+                                        dim: index.dim(),
+                                    }
+                                }
+                            },
+                        )
+                        .collect();
+                    let bits = tensor
+                        .to_vec::<f64>()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect();
+                    (name.clone(), legs, bits)
+                })
+                .collect();
+            (entries, nodes)
+        })
+        .collect()
+}
+
 /// Two runs are identical: the same records in the same order, the same
-/// counts, and bit-identical patch tensors.
+/// counts, and bitwise-identical stored patches (same legs in the same
+/// positional order, same raw column-major data).
 pub(crate) fn assert_same_run(
+    problem: &Problem,
     first: &PatchedInterpolationResult<Name>,
     second: &PatchedInterpolationResult<Name>,
 ) {
@@ -428,22 +511,13 @@ pub(crate) fn assert_same_run(
     for (x, y) in a.accepted.iter().zip(&b.accepted) {
         assert_eq!(x.projector, y.projector);
         assert_eq!(x.termination, y.termination);
-        assert_eq!(x.error_estimate, y.error_estimate);
-        assert_eq!(x.max_sample_magnitude, y.max_sample_magnitude);
+        assert_eq!(x.error_estimate.to_bits(), y.error_estimate.to_bits());
+        assert_eq!(
+            x.max_sample_magnitude.to_bits(),
+            y.max_sample_magnitude.to_bits()
+        );
         assert_eq!(x.max_bond_dim, y.max_bond_dim);
     }
-    for (projector, left) in first.partition.iter() {
-        let right = second.partition.get(projector).unwrap();
-        let (left, right) = (left.data(), right.data());
-        for name in left.node_names() {
-            let x = left.tensor(left.node_index(&name).unwrap()).unwrap();
-            let y = right.tensor(right.node_index(&name).unwrap()).unwrap();
-            assert_eq!(x.dims(), y.dims(), "node {name}");
-            assert_eq!(
-                x.to_vec::<f64>().unwrap(),
-                y.to_vec::<f64>().unwrap(),
-                "node {name}"
-            );
-        }
-    }
+    assert_eq!(first.partition.len(), second.partition.len());
+    assert_eq!(fingerprint(first, problem), fingerprint(second, problem));
 }
