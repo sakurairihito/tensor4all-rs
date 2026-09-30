@@ -62,6 +62,9 @@ enum Fault {
     IterationLimit,
     /// Report `Converged` whatever the rank, even at the cap.
     ConvergedAtCap,
+    /// Sample only the initial pivots and stop at the cap; the (empty)
+    /// network is never used because the driver splits.
+    CapAfterPivots,
     /// Send a batch with the wrong number of rows.
     BadBatch,
     /// Send a batch with an out-of-range coordinate.
@@ -146,6 +149,15 @@ where
         let initial = evaluate(problem.initial_pivots().as_ref()).map_err(evaluator)?;
         if initial.iter().all(|value| value.abs_val() == 0.0) {
             return Err(InterpolationError::AllSamplesZero);
+        }
+        if self.fault == Fault::CapAfterPivots {
+            return Ok(InterpolationOutcome {
+                network: TreeTN::new(),
+                termination: InterpolationTermination::BondCapReached,
+                error_estimate: 1.0,
+                max_sample_magnitude: 1.0,
+                pivots: None,
+            });
         }
         let domain: Vec<usize> = full_domain(&dims).concat();
         let shape = [n_active, domain.len() / n_active];
@@ -1154,4 +1166,73 @@ fn converged_outcomes_at_the_cap_are_engine_errors() {
     let result = run(&engine, &problem, &product_only, &[], &options).unwrap();
     assert_eq!(result.report.accepted.len(), 1);
     assert_eq!(result.report.accepted[0].max_bond_dim, 1);
+}
+
+/// `f` is 1 everywhere except at `bad`, where both parts are near the largest
+/// finite float: finite components whose magnitude overflows.
+fn overflow_at(bad: Vec<usize>) -> impl Fn(&[usize]) -> Complex64 + Sync {
+    move |p: &[usize]| {
+        if p == bad.as_slice() {
+            Complex64::new(1.5e308, 1.5e308)
+        } else {
+            Complex64::new(1.0, 0.0)
+        }
+    }
+}
+
+fn expect_magnitude_overflow(
+    result: Result<PatchedInterpolationResult<Name>, PatchedInterpolationError>,
+) -> Projector {
+    let (projector, source) = expect_interpolation(result);
+    match source {
+        InterpolationError::Evaluator { source } => {
+            let message = format!("{source:#}");
+            assert!(message.contains("magnitude overflows"), "{message}");
+            assert!(!message.contains("non-finite"), "{message}");
+        }
+        other => panic!("expected Evaluator, got {other:?}"),
+    }
+    projector
+}
+
+#[test]
+fn overflowing_magnitudes_are_rejected_before_they_pin_a_scale() {
+    // An exact root without reference_scale would pin an infinite scale.
+    let problem = single_node(&[3]);
+    let projector = expect_magnitude_overflow(run(
+        &DenseEngine::new(),
+        &problem,
+        &overflow_at(vec![1]),
+        &[],
+        &PatchedInterpolationOptions::new(2),
+    ));
+    assert!(projector.is_empty());
+
+    // A root that needs the engine: the user pivot is sampled first.
+    let problem = branched();
+    let bad = vec![2, 1, 0, 1, 0, 1];
+    let projector = expect_magnitude_overflow(run(
+        &DenseEngine::new(),
+        &problem,
+        &overflow_at(bad.clone()),
+        &[bad],
+        &PatchedInterpolationOptions::new(2),
+    ));
+    assert!(projector.is_empty());
+
+    // A child patch: the root samples only its pivot and splits at s; the
+    // exact child s = 2 meets the value.
+    let problem = Problem::new(&[("s", &[3]), ("t", &[8])], &[("s", "t")]);
+    let s = problem.site("s", 0);
+    let options = PatchedInterpolationOptions::new(2)
+        .with_n_initial_pivots(1)
+        .with_patch_order(vec![s.clone()]);
+    let projector = expect_magnitude_overflow(run(
+        &DenseEngine::with_fault(Fault::CapAfterPivots),
+        &problem,
+        &overflow_at(vec![2, 5]),
+        &[vec![0, 0]],
+        &options,
+    ));
+    assert_eq!(projector, Projector::from_pairs([(s, 2)]).unwrap());
 }

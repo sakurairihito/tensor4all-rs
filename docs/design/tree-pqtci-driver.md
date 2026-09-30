@@ -371,9 +371,14 @@ The review kept the proposed names: `adaptive_interpolation`,
 
 - **Scalar bounds.** `T: tensor4all_core::CommonScalar + TensorElement`.
   Magnitudes and the exact-zero test use `CommonScalar::abs_val` (the
-  hypotenuse for complex values); the finiteness test checks every component
-  (`value * 0 == 0`), so a finite complex value whose magnitude overflows
-  is accepted. One-hot factors and exact networks are built with
+  hypotenuse for complex values). A sampled value is rejected with one of two
+  messages: "non-finite value" when a component is infinite or NaN (checked
+  per component as `value * 0 == 0`), and "magnitude overflows" when every
+  component is finite but `abs_val` is not (a complex value near the largest
+  float in both parts). Both are `Interpolation { source: Evaluator }`, so
+  every magnitude the driver uses (the pinned reference scale, zero
+  screening, the maximum sample) and every value the engine receives has a
+  finite magnitude. One-hot factors and exact networks are built with
   `IdxTensor::from_dense::<T>`.
 - **Where values are checked.** The per-patch cache is the only path to the
   evaluator, so the count and finiteness checks of step 5 sit there and also

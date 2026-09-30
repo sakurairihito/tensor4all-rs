@@ -569,8 +569,9 @@ pub enum PatchedInterpolationError {
         message: String,
     },
     /// Sampling or interpolating one patch failed: the evaluator failed or
-    /// returned a wrong number of values or a non-finite value
-    /// ([`InterpolationError::Evaluator`]), or the engine failed or returned
+    /// returned a wrong number of values, a non-finite value, or a value
+    /// whose magnitude overflows ([`InterpolationError::Evaluator`]), or the
+    /// engine failed or returned
     /// an outcome that does not match the problem.
     #[error("interpolation of the patch {projector:?} failed: {source}")]
     Interpolation {
@@ -634,7 +635,7 @@ impl From<PartitionedTreeTNError> for PatchedInterpolationError {
 ///   make the sampled scale and the zero screening reliable.
 /// * `evaluate` - Batch evaluator. It receives a column-major
 ///   `[n_sites, n_points]` array of full-domain points in site order and
-///   returns one finite value per point.
+///   returns one finite value per point, with a finite magnitude.
 /// * `options` - See [`PatchedInterpolationOptions`].
 ///
 /// # Returns
@@ -654,7 +655,9 @@ impl From<PartitionedTreeTNError> for PatchedInterpolationError {
 ///   no `reference_scale` is given and every candidate sample of a root that
 ///   needs the engine is exactly zero.
 /// - [`PatchedInterpolationError::Interpolation`] when the evaluator fails,
-///   returns a wrong number of values, or returns a non-finite value
+///   returns a wrong number of values, or returns a value with a non-finite
+///   component or with finite components whose magnitude overflows (a
+///   complex value near the largest float in both parts)
 ///   ([`InterpolationError::Evaluator`]); when the engine fails (including
 ///   [`InterpolationError::AllSamplesZero`] after screening); or when an
 ///   engine outcome does not match the problem or reports `Converged` at a

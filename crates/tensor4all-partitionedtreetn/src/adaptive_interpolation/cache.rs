@@ -252,11 +252,21 @@ where
                 "the evaluator returned {} values for {n_missing} points",
                 fresh.len()
             );
-            if let Some(index) = fresh.iter().position(|&value| !is_finite(value)) {
-                anyhow::bail!(
-                    "the evaluator returned a non-finite value at the point {:?}",
-                    &missing_points[index * n_sites..(index + 1) * n_sites]
-                );
+            if let Some((index, defect)) = fresh
+                .iter()
+                .enumerate()
+                .find_map(|(index, &value)| value_defect(value).map(|defect| (index, defect)))
+            {
+                let point = &missing_points[index * n_sites..(index + 1) * n_sites];
+                match defect {
+                    ValueDefect::NonFinite => anyhow::bail!(
+                        "the evaluator returned a non-finite value at the point {point:?}"
+                    ),
+                    ValueDefect::MagnitudeOverflow => anyhow::bail!(
+                        "the evaluator returned a value whose magnitude overflows at the point \
+                         {point:?}"
+                    ),
+                }
             }
             Counters::add(&self.counters.evaluations, n_missing);
             let mut cache = self.cache.borrow_mut();
@@ -272,6 +282,29 @@ where
                 Slot::Missing(index) => fresh[index],
             })
             .collect())
+    }
+}
+
+/// Why a sampled value cannot be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ValueDefect {
+    /// A component (real or imaginary part) is infinite or NaN.
+    NonFinite,
+    /// Every component is finite but the magnitude `abs_val` overflows, as for
+    /// a complex value near the largest finite float in both parts.
+    MagnitudeOverflow,
+}
+
+/// The defect of a sampled value, or `None` when its components and its
+/// magnitude are finite. Every magnitude the driver uses (the pinned
+/// reference scale, zero screening, the maximum sample) is then finite.
+pub(super) fn value_defect<T: CommonScalar>(value: T) -> Option<ValueDefect> {
+    if !is_finite(value) {
+        Some(ValueDefect::NonFinite)
+    } else if !value.abs_val().is_finite() {
+        Some(ValueDefect::MagnitudeOverflow)
+    } else {
+        None
     }
 }
 
