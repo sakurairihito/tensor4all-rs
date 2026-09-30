@@ -177,11 +177,13 @@ pinned to the largest magnitude among the root patch's candidate samples (or
 its exact values when the root has at most one site), a sampled lower bound on
 `max |f|` that tightens the tolerance for localized functions. Execution is
 sequential; for a fixed `seed`, a deterministic evaluator, and a deterministic
-engine, the stored patches (values and axis order) and the report are
-identical across runs. On branched trees, materializing their direct sum with
-`to_treetn` and a dense contraction is equal across runs only up to rounding,
-because the construction order of a `TreeTN` is not reproducible there yet;
-this is tracked upstream.
+engine, the report and every stored node tensor (values and positional axis
+order) are identical across runs. What is derived from the stored `TreeTN`s
+may still differ across runs, for a single patch as for the whole partition,
+on any topology ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)):
+materializing (`to_dense`, `contract_to_tensor`, `to_treetn`) in axis order and
+at rounding level, and the iteration order of `external_indices`, `site_space`,
+and `neighbors`.
 
 ## Reconstruction with a fixed global L2 tolerance
 

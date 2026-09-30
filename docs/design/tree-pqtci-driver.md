@@ -433,10 +433,14 @@ The review kept the proposed names: `adaptive_interpolation`,
   identical patches: per projector and per node, the same legs in the same
   positional order (sites by position, bonds by neighbor and dimension) and
   the same raw column-major data, with an identical report. The tests assert
-  this on the degree-three trees with the dense test engine and with TreeTCI,
-  and digests of the same comparison agreed across three separate test
-  processes. On branched trees, materializing the direct sum of the patches
-  (`to_treetn`, then `contract_to_tensor`) is equal across runs only up to
-  rounding, because the construction order of a `TreeTN` is not reproducible
-  there yet (tracked upstream); the determinism claim therefore covers the
-  stored patches and the report, not their materialized sum.
+  this on the degree-three trees with the dense test engine and with TreeTCI.
+  A one-off manual check, with no committed test, also found identical
+  digests of the same comparison in three separate test processes. The claim
+  covers the report and the stored node tensors only. The stored patches are
+  `TreeTN`s built through `TreeTN::from_tensors`, so they inherit
+  [#791](https://github.com/tensor4all/tensor4all-rs/issues/791): what is derived from them may
+  differ across runs, for a single patch as for the partition and on any
+  topology (a node with two or more sites suffices on a chain), namely
+  materializing (`to_dense`, `contract_to_tensor`, `to_treetn`) in axis order
+  and at rounding level, and the iteration order of `external_indices`,
+  `site_space`, and `neighbors`.

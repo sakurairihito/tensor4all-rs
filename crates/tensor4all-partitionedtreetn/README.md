@@ -30,11 +30,14 @@ engine trait only, not on `tensor4all-treetci`.
   root patch's samples.
 - Randomness comes from a per-patch seed derived from
   `PatchedInterpolationOptions::seed`; for a fixed seed, a deterministic
-  evaluator, and a deterministic engine the stored patches (values and axis
-  order) and the report are identical across runs. On branched trees their
-  direct sum (`to_treetn`, then a dense contraction) is equal across runs only
-  up to rounding, because the construction order of a `TreeTN` is not
-  reproducible there yet; this is tracked upstream.
+  evaluator, and a deterministic engine the report and every stored node
+  tensor (values and positional axis order) are identical across runs. What
+  is derived from the stored `TreeTN`s may still differ across runs, for a
+  single patch as for the whole partition, on any topology
+  ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)): materializing
+  (`to_dense`, `contract_to_tensor`, `to_treetn`) in axis order and at rounding
+  level, and the iteration order of `external_indices`, `site_space`, and
+  `neighbors`.
 
 The patch queue and pivot recycling derive from TCIAlgorithms.jl (MIT) through
 the deprecated `tensor4all-partitionedtt`; this crate carries

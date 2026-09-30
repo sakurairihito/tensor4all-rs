@@ -56,12 +56,14 @@
 //! randomized algorithms of this workspace, the driver offers no API taking a
 //! caller-owned `&mut R`: one shared stream would make the randomness of a
 //! patch depend on the processing order. For a fixed seed, a deterministic
-//! evaluator, and a deterministic engine, the stored patches (values and axis
-//! order of every tensor) and the report are identical across runs. On
-//! branched trees, materializing their direct sum
-//! ([`PartitionedTreeTN::to_treetn`], then a dense contraction) is equal across
-//! runs only up to rounding, because the construction order of a `TreeTN` is
-//! not reproducible there yet; this is tracked upstream.
+//! evaluator, and a deterministic engine, the report and every stored node
+//! tensor (values and positional axis order) are identical across runs. The
+//! stored patches are `TreeTN`s, so what is derived from them may still differ
+//! across runs, for a single patch as for the whole partition, on any topology
+//! ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)): materializing
+//! (`to_dense`, `contract_to_tensor`, [`PartitionedTreeTN::to_treetn`]) in axis
+//! order and at rounding level, and the iteration order of `external_indices`,
+//! `site_space`, and `neighbors`.
 //!
 //! # Examples
 //!
