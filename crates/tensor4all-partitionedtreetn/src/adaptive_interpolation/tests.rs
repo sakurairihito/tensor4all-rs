@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, HashSet};
 use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex, IdxTensor, IndexLike};
 use tensor4all_treetn::{NodeNameNetwork, TreeTN};
 
-use super::cache::{is_finite, Counters, KeyLayout, PatchCache, PatchSampler};
+use super::cache::{
+    is_finite, value_defect, Counters, KeyLayout, PatchCache, PatchSampler, ValueDefect,
+};
 use super::embed::{check_outcome_layout, embed_fixed_sites, exact_active_network};
 use super::layout::SiteLayout;
 use super::sampling::{
@@ -455,19 +457,76 @@ fn exact_and_embedded_networks_keep_the_scalar_type() {
     assert_embedding_keeps_dtype(num_complex::Complex64::new(1.0, 2.0), IdxTensor::is_c64);
 }
 
-#[test]
-fn finiteness_is_checked_per_component() {
-    use num_complex::Complex64;
-    assert!(is_finite(1.0_f64));
-    assert!(!is_finite(f64::NAN));
-    assert!(!is_finite(f64::NEG_INFINITY));
-    // Finite parts whose magnitude overflows are finite.
-    let large = Complex64::new(1.5e308, 1.5e308);
-    assert!(!tensor4all_core::CommonScalar::abs_val(large).is_finite());
-    assert!(is_finite(large));
-    assert!(!is_finite(Complex64::new(1.0, f64::INFINITY)));
-    assert!(!is_finite(Complex64::new(f64::NAN, 0.0)));
+/// Finiteness and magnitude checks for one real type and its complex type:
+/// infinities of both signs and NaN in each component are non-finite;
+/// subnormals, `-0.0`, and the largest finite values are finite; a complex
+/// value with finite parts whose magnitude overflows is its own defect.
+macro_rules! value_defect_cases {
+    ($name:ident, $real:ty, $complex:ty) => {
+        #[test]
+        fn $name() {
+            let subnormal = <$real>::MIN_POSITIVE / 4.0;
+            assert!(subnormal.is_subnormal());
+            let finite = [
+                0.0,
+                -0.0,
+                1.0,
+                -2.5,
+                subnormal,
+                -subnormal,
+                <$real>::MAX,
+                <$real>::MIN,
+            ];
+            let bad = [<$real>::INFINITY, <$real>::NEG_INFINITY, <$real>::NAN];
+            for x in finite {
+                assert_eq!(value_defect(x), None, "{x:?}");
+                assert_eq!(value_defect(<$complex>::new(x, 0.0)), None, "{x:?}");
+                assert_eq!(value_defect(<$complex>::new(-0.0, x)), None, "{x:?}");
+            }
+            assert_eq!(value_defect(<$complex>::new(subnormal, -subnormal)), None);
+            for x in bad {
+                assert_eq!(value_defect(x), Some(ValueDefect::NonFinite), "{x:?}");
+                for value in [
+                    <$complex>::new(x, 1.0),
+                    <$complex>::new(1.0, x),
+                    <$complex>::new(x, x),
+                ] {
+                    assert!(!is_finite(value), "{value:?}");
+                    assert_eq!(
+                        value_defect(value),
+                        Some(ValueDefect::NonFinite),
+                        "{value:?}"
+                    );
+                }
+            }
+            // Finite parts, overflowing magnitude.
+            for value in [
+                <$complex>::new(<$real>::MAX, <$real>::MAX),
+                <$complex>::new(<$real>::MIN, <$real>::MAX / 1.5),
+            ] {
+                assert!(is_finite(value), "{value:?}");
+                assert_eq!(
+                    value_defect(value),
+                    Some(ValueDefect::MagnitudeOverflow),
+                    "{value:?}"
+                );
+            }
+            // A real value never overflows its magnitude.
+            assert_eq!(value_defect(<$real>::MIN), None);
+        }
+    };
 }
+
+value_defect_cases!(
+    value_defects_of_f32_and_complex32,
+    f32,
+    num_complex::Complex32
+);
+value_defect_cases!(
+    value_defects_of_f64_and_complex64,
+    f64,
+    num_complex::Complex64
+);
 
 #[test]
 fn outcome_layout_check_rejects_every_mismatch() {
