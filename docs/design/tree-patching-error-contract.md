@@ -245,9 +245,12 @@ of `E`:
   an unbiased estimate of `E / ||f||`;
 - **acceptance-only run**: no relative statement, because there is no
   estimate of `E`;
-- **`||f~|| <= E`** (in particular an empty or near-empty partition), or
-  `||f~||` not computable (see [Records and report](#records-and-report)): no
-  relative statement at all; the rustdoc says so.
+- **the denominator is not positive**, that is
+  `(1 - GLOBAL_ROUNDING_MARGIN) * ||f~|| <= E_up` for a certified run or
+  `||f~|| <= E` with the audited estimate of `E` for an audited run (in
+  particular an empty or near-empty partition), or `||f~||` not computable
+  (see [Records and report](#records-and-report)): no relative statement at
+  all; the rustdoc says so.
 
 The report encodes these cases in one enum (see
 [Records and report](#records-and-report)).
@@ -349,9 +352,9 @@ The run's global error is **certified** when every contribution is exact or
 exhaustive. Certification is a statement about the absolute error,
 `E <= delta * (1 + GLOBAL_ROUNDING_MARGIN) + MEASUREMENT_ROUNDING_FACTOR * eps
 * ||f~||` (see [Measurement rounding](#measurement-rounding)), where `delta` is
-the allowance actually used. The report flags when the rounding term is not
-small against `delta`. When the reference norm was estimated, `delta` is
-itself random
+the allowance actually used. The report sets the flag `rounding_limited`
+when the rounding term is at least the allowance (`delta` in L2 units, `tau`
+in RMS units). When the reference norm was estimated, `delta` is itself random
 (see [Reference norm](#reference-norm)), and only the a-posteriori relative
 bound `E / (||f~|| - E)` is free of it. Otherwise the global number is either
 an **audited** estimate, with its standard error and the certified fraction
@@ -701,8 +704,9 @@ pub enum MaxReferenceSource { Given, ExactRoot, MaxOfRootCandidates }
 
 /// The global L2 error of a run, by what it can claim. RMS values are
 /// E / sqrt(|X|). Bitwise reproducible under the Determinism prerequisite,
-/// except the fields that depend on approximation_rms (the rounding term,
-/// the flag, and the relative fields).
+/// except the fields that depend on approximation_rms:
+/// rounding_allowance_rms, rounding_limited, relative_error_bound, and
+/// relative_bound_estimate (approximation_rms itself is exempt too).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum GlobalL2Error {
@@ -719,7 +723,8 @@ pub enum GlobalL2Error {
         /// rounding_allowance_rms >= tau: the allowance is not resolved by
         /// the measurement. None when approximation_rms is None.
         rounding_limited: Option<bool>,
-        /// Conservative bound on E / ||f|| built from E_up; None when
+        /// Conservative bound E_up / ((1 - GLOBAL_ROUNDING_MARGIN) ||f~||
+        /// - E_up) on E / ||f||; None when (1 - GLOBAL_ROUNDING_MARGIN) *
         /// ||f~|| <= E_up or approximation_rms is None.
         relative_error_bound: Option<f64>,
     },
@@ -731,7 +736,8 @@ pub enum GlobalL2Error {
         mean_square_rel_std_error: f64,
         /// Plug-in estimate of the bound E / (||f~|| - E), with the audited
         /// estimate of E inserted; not an unbiased estimate of E / ||f||.
-        /// None when ||f~|| <= the estimated E or approximation_rms is None.
+        /// None when ||f~|| <= the estimated E (no margins: an estimate) or
+        /// approximation_rms is None.
         relative_bound_estimate: Option<f64>,
     },
     /// Some Sampled contribution has no audit: the combined acceptance
@@ -864,12 +870,15 @@ No field or variant keeps its name with a different meaning.
   `E <= delta * (1 + GLOBAL_ROUNDING_MARGIN) + MEASUREMENT_ROUNDING_FACTOR *
   eps * ||f~||`, up to the rounding model of
   [Measurement rounding](#measurement-rounding), with `rounding_limited`
-  telling whether the second term reaches `delta`; when `||f~|| > E_up`,
-  also `E / ||f|| <= relative_error_bound`. An audited run gives an estimate
+  telling whether the second term is at least `delta` (in RMS units, at least
+  `tau`); when `(1 - GLOBAL_ROUNDING_MARGIN) * ||f~|| > E_up`, also
+  `E / ||f|| <= relative_error_bound`. An audited run gives an estimate
   of `E` with the reported standard error and a plug-in estimate of the
   relative bound. An acceptance-only run gives neither; its reported number is
-  only the combined acceptance statistic. When `||f~|| <= E`, or `||f~||` is
-  not computable, no relative statement exists.
+  only the combined acceptance statistic. When the relative denominator is
+  not positive (`(1 - GLOBAL_ROUNDING_MARGIN) * ||f~|| <= E_up` if
+  certified, `||f~|| <= E` with the estimate if audited), or `||f~||` is not
+  computable, no relative statement exists.
 - **SampledMax**: exactly the M2 driver, with the engine tolerance
   `max(atol, rtol * max_reference)`; `atol = 0` reproduces M2. No measurement,
   and the rustdoc keeps the M2 statement that this is not a verified bound.
@@ -1026,10 +1035,12 @@ The M2 guarantee (identical report and bitwise identical stored node tensors
 for a fixed seed, a deterministic evaluator, and a deterministic engine)
 extends to L2 runs only if every measured network value is bitwise
 reproducible, because an acceptance decision near `tau` could otherwise flip
-between runs. The claim covers every report field except `approximation_rms`
-and the relative fields of `GlobalL2Error`, which depend on it; those are
-reproducible only up to rounding (see
-[Records and report](#records-and-report)).
+between runs. The claim covers every report field except
+`approximation_rms` and the fields derived from it, `rounding_allowance_rms`,
+`rounding_limited`, `relative_error_bound`, and `relative_bound_estimate`;
+those are reproducible only up to rounding, and the boolean
+`rounding_limited` only away from its threshold (see
+[Records and report](#records-and-report) and test 14).
 
 **Root cause.** On trees where `TreeTNCachedEvaluator` takes its generic
 `IdxTensor` path (a site-free node, a node with several sites, or `f32`/`c32`
@@ -1181,6 +1192,22 @@ evidence (one manual three-process check on one machine) does not establish;
 bitwise golden constants follow only if question 9 chooses that scope and it
 is verified.
 
+The "exact" discrete outputs still rest on floating-point decisions (LU pivot
+choices, an error estimate against a tolerance, a rank against the cap), so a
+rounding difference on another machine can flip a decision near its
+threshold. The golden scenarios are therefore chosen with **decisions well
+separated from their thresholds**: scenarios on the dense test engine decide
+on ranks of exactly representable data; for each TreeTCI scenario the
+recording test also records the ratio of every patch's engine error estimate
+to its tolerance, and the scenario is admitted only if every ratio lies
+outside `[1 / GOLDEN_DECISION_SEPARATION, GOLDEN_DECISION_SEPARATION]`. LU
+pivot choices inside TreeTCI cannot be screened this way; a TreeTCI scenario
+whose discrete output differs on another platform is evidence for question 9
+and is not silently re-recorded. This is preferred over running the golden
+check in a single pinned CI environment, because the check should hold
+wherever the tests run, and a pinned environment would hide exactly the
+portability question that question 9 asks.
+
 All tests live in `tensor4all-partitionedtreetn`, with the existing
 driver-local dense test engine and TreeTCI through the path-only
 dev-dependency. Topologies with a claim about trees use a node of degree three
@@ -1200,12 +1227,20 @@ or more, checked in the test.
    The dense path rounds differently from the cached evaluator, so its own
    absolute term `R = MEASUREMENT_ROUNDING_FACTOR * eps * ||f~||` (with
    `||f~||` from `approximation_norm()`) is added once per evaluation path.
-   Assert `diff.norm() <= delta * (1 + GLOBAL_ROUNDING_MARGIN) + 2 R`,
-   `|diff.norm() - error_norm()| <= GLOBAL_ROUNDING_MARGIN * diff.norm() +
-   2 R`, that `relative_error_bound` is `Some`, and
+   Assert `diff.norm() <= delta * (1 + GLOBAL_ROUNDING_MARGIN) + 2 R`, that
+   `relative_error_bound` is `Some`, and
    `diff.norm() / reference.norm() <= relative_error_bound + R /
    reference.norm()` (the bound already contains the margin and the
-   measurement's own term).
+   measurement's own term). In addition, as an explicit **calibration check
+   of the rounding model** and not a contract assertion,
+   `|diff.norm() - error_norm()| <= GLOBAL_ROUNDING_MARGIN * diff.norm() +
+   2 R`: it has no `delta` slack, so it holds only if
+   `MEASUREMENT_ROUNDING_FACTOR` bounds the rounding of both evaluation paths
+   on this network. The factor is set from the cancelling-network calibration
+   of [Measurements needed later](#measurements-needed-later) with a recorded
+   headroom factor, so that a correct M3 run does not fail this check
+   spuriously; a failure means the model constant must be revisited, not that
+   the certificate is wrong.
 2. **L2 against a dense reference, sampled.** The same problem with
    `samples = 16`, `max_exhaustive_points = 0`, and a fixed seed, so a patch
    is exhaustive only with at most 16 points. Assert that some accepted patch
@@ -1263,12 +1298,15 @@ or more, checked in the test.
     add no measurement evaluations.
 11. **Budget arithmetic.** Every acceptance measurement has `rms <= tau`,
     and the global quantities combine as specified, within
-    `GLOBAL_ROUNDING_MARGIN`. A function with values near `1e155` on an
-    accepted patch (so `||f~_P||` exceeds `1.34e154`) completes the run and
-    reports `approximation_rms`, the rounding term, the flag, and the
-    relative fields as `None`. A certified run with `tau` below
-    `MEASUREMENT_ROUNDING_FACTOR * eps * approximation_rms` reports
-    `rounding_limited == Some(true)`.
+    `GLOBAL_ROUNDING_MARGIN`. The overflow case is built on the exact
+    small-patch path (a patch with one active site whose values are about
+    `1e155` on enough points that `||f~_P||` exceeds `1.34e154`), or with
+    the dense test engine, so it exercises only the report's overflow
+    handling: the run completes and reports `approximation_rms`, the rounding
+    term, the flag, and the relative fields as `None`. TreeTCI's own
+    behaviour at such magnitudes is out of scope for this test. A certified
+    run with `tau` below `MEASUREMENT_ROUNDING_FACTOR * eps *
+    approximation_rms` reports `rounding_limited == Some(true)`.
 12. **Reference.** Given, not needed (`rtol = 0`), exact root, and Monte
     Carlo references; `Required` with `rtol > 0` and a non-exact root fails
     before any evaluation; a zero Monte Carlo estimate with `atol = 0` fails
@@ -1280,12 +1318,17 @@ or more, checked in the test.
     domain too large for `f64` is accepted under `SampledMax` as in M2.
 14. **Determinism.** Two L2 runs with the same seed, each on a fresh thread
     (and in separate processes if open question 9 requires it), give bitwise
-    identical patches and reports, except `approximation_rms` and the
-    relative fields, which agree within `GLOBAL_ROUNDING_MARGIN`; on the
-    branched tree with the dense engine and with TreeTCI, after the
-    prerequisite fix. Plus the fresh-thread, fresh-ID measurement test of
-    [Determinism](#determinism) on a generic-path tree and a raw-kernel
-    tree.
+    identical patches and reports, except the fields exempt from the bitwise
+    claim: `approximation_rms`, `rounding_allowance_rms`,
+    `relative_error_bound`, and `relative_bound_estimate` agree within
+    `GLOBAL_ROUNDING_MARGIN`, and
+    `rounding_limited` is compared only when `rounding_allowance_rms` is not
+    within `GLOBAL_ROUNDING_MARGIN` of `tau` (a boolean derived from a
+    rounding-level value near its threshold has no tolerance); otherwise it
+    is not compared. On the branched tree with the dense engine and with
+    TreeTCI, after the prerequisite fix. Plus the fresh-thread, fresh-ID
+    measurement test of [Determinism](#determinism) on a generic-path tree
+    and a raw-kernel tree.
 15. **Cache.** Measurement points reuse cached values, a point is never
     evaluated twice, measured values reach the children, and audit points
     never appear among pivots.
@@ -1316,11 +1359,12 @@ The M3 PR updates the rustdoc of the driver module and every changed type,
 states the definition of verified, that a sampled measurement is an estimate
 only when audited and never a bound, that a certified error is absolute with
 respect to the allowance used, that no relative statement exists for an
-acceptance-only run or when `||f~|| <= E`, that the audited relative value
-is a plug-in estimate of the bound, the absolute rounding term of a
-certificate and the `rounding_limited` flag, that `approximation_rms` is
-`None` above a patch norm of about `1.34e154`, which report fields the
-bitwise determinism claim covers, and the units of each reference.
+acceptance-only run or when the relative denominator is not positive, that
+the audited relative value is a plug-in estimate of the bound, the absolute
+rounding term of a certificate and the `rounding_limited` flag, that
+`approximation_rms` is `None` above a patch norm of about `1.34e154`, which
+report fields the bitwise determinism claim covers, and the units of each
+reference.
 
 ## Measurements needed later
 
@@ -1330,7 +1374,7 @@ None blocks the M3 implementation; the defaults below are provisional.
 |---|---|---|
 | Defaults of `samples`, `max_exhaustive_points`, `retries`, `audit` | measurement evaluations as a share of all evaluations, failure and retry rates | M9, on M2 patches of a real workload (TreeTCI, `rtol` near `1e-4`), chain and branched tree |
 | Retry pivots and their cap | retry success, starting and final rank, evaluations per retry | M9, same workloads |
-| `MEASUREMENT_ROUNDING_FACTOR` | evaluation error of the cached evaluator against exact values for networks of known values on the test trees, including cancelling ones | M3 implementation, confirmed in M9; the value stays a model, not a bound |
+| `MEASUREMENT_ROUNDING_FACTOR` | evaluation error of the cached evaluator and of `contract_to_tensor` against exact values for networks of known values on the test trees, including cancelling ones; the constant is the largest observed ratio times a recorded headroom factor | M3 implementation, confirmed in M9; the value stays a model, not a bound |
 | Engine tolerance below `tau` | total evaluations and patch count against the factor | M9, same workloads, at matched measured accuracy |
 | Volume versus norm-proportional allocation | patches and evaluations on localized functions at matched measured error | M9, only if open question 2 selects both |
 
@@ -1356,7 +1400,9 @@ None blocks the M3 implementation; the defaults below are provisional.
    ones are decision statistics, and unbiased estimates only through an
    independent audit; a certified error does not cover an estimated
    reference, and a run without a complete audit is labelled acceptance-only
-   and makes no error or relative claim. Is
+   and makes no error or relative claim. A certified error also includes a
+   measurement-rounding term that is modelled (a calibrated constant times
+   `eps * ||f~||`), not proven, so "certified" holds up to that model. Is
    this acceptable, or should the public API avoid the word "verified" for
    sampled measurements (for example "measured")?
 2. **Budget allocation.** Proposed: volume-proportional with one pinned
