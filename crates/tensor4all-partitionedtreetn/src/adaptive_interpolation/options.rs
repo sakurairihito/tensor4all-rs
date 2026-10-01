@@ -274,7 +274,8 @@ impl PatchedInterpolationOptions {
 /// measured exhaustively, a certificate up to rounding; a larger one on
 /// `samples` fresh uniform points, a decision statistic. With `audit`, every
 /// sampled acceptance gets an independent audit sample after the decision,
-/// whose estimate is unbiased (still not a bound).
+/// whose mean square is an unbiased estimate (its RMS is not; neither is a
+/// bound).
 ///
 /// The defaults are provisional; their measured cost is a later milestone.
 /// When in doubt keep them: `samples = 64`, `max_exhaustive_points = 1024`,

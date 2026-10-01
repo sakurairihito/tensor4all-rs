@@ -291,6 +291,7 @@ fn measurement_rounding_calibration() {
     let options = PatchedInterpolationOptions::new(4)
         .with_error_norm(ErrorNorm::l2(L2Reference::Given(norm)))
         .with_tolerance(tol(1e-6))
+        .with_patch_order(extended_order(&problem))
         .with_seed(5);
     let result = run(
         &TreeTciInterpolator::default(),

@@ -66,34 +66,37 @@ where
 /// Which points a measurement uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PointPlan {
-    /// Every point of the patch, column-major (first active site fastest).
-    Exhaustive,
+    /// Every point of the patch, column-major (first active site fastest);
+    /// `count` is the patch's point count, whose point list fits in `usize`.
+    Exhaustive { count: usize },
     /// `count` uniform points with replacement from the stream `seed`.
     Sampled { count: usize, seed: u64 },
 }
 
 impl PointPlan {
-    /// The plan for a patch of `patch_count` points (saturating): exhaustive
-    /// up to `max(max_exhaustive_points, samples)` points, else sampled.
+    /// The plan for a patch of `patch_count` points, `None` when the count
+    /// or its point-list capacity cannot fit in a `Vec`: exhaustive up to
+    /// `max(max_exhaustive_points, samples)` points, else sampled.
     pub(super) fn for_patch(
-        patch_count: usize,
+        patch_count: Option<usize>,
         samples: usize,
         max_exhaustive_points: usize,
         seed: u64,
     ) -> Self {
-        if patch_count <= max_exhaustive_points.max(samples) {
-            Self::Exhaustive
-        } else {
-            Self::Sampled {
+        match patch_count {
+            Some(count) if count <= max_exhaustive_points.max(samples) => {
+                Self::Exhaustive { count }
+            }
+            _ => Self::Sampled {
                 count: samples,
                 seed,
-            }
+            },
         }
     }
 
     fn method(self) -> MeasurementMethod {
         match self {
-            Self::Exhaustive => MeasurementMethod::Exhaustive,
+            Self::Exhaustive { .. } => MeasurementMethod::Exhaustive,
             Self::Sampled { .. } => MeasurementMethod::Sampled,
         }
     }
@@ -129,6 +132,8 @@ impl Measured {
 
 /// Why a measurement failed.
 pub(super) enum MeasureError {
+    /// The requested measurement point list cannot be represented or reserved.
+    PointList(String),
     /// The function evaluator failed or returned an unusable value.
     Evaluator(anyhow::Error),
     /// The patch network could not be evaluated or gave a non-finite value.
@@ -166,9 +171,10 @@ where
 {
     let n_active = target.active_dims.len();
     let flat = match plan {
-        PointPlan::Exhaustive => all_points(target.active_dims),
+        PointPlan::Exhaustive { count } => all_points(target.active_dims, count),
         PointPlan::Sampled { count, seed } => uniform_points(target.active_dims, count, seed),
     };
+    let flat = flat.map_err(MeasureError::PointList)?;
     let n_points = flat.len() / n_active.max(1);
     let shape = [n_active, n_points];
     let batch = ColMajorArrayRef::new(&flat, &shape)

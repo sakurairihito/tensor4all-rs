@@ -8,6 +8,7 @@ use tensor4all_core::{ColMajorArray, DynIndex, IndexLike};
 use tensor4all_treetn::interpolation::{validate_layout, InterpolationError, InterpolationProblem};
 use tensor4all_treetn::NodeNameNetwork;
 
+use super::sampling::point_list_capacity;
 use super::{invalid, PatchedInterpolationError, PatchedInterpolationOptions};
 use crate::{ErrorNorm, L2Reference, Projector};
 
@@ -53,6 +54,14 @@ where
         let dims: Vec<usize> = sites.iter().map(IndexLike::dim).collect();
         let split_order = resolve_patch_order(&options.patch_order, &sites)?;
         validate_options(options)?;
+        if point_list_capacity(dims.len(), options.verification.samples).is_none() {
+            return Err(invalid(format!(
+                "verification.samples ({}) times the number of sites ({}) exceeds the \
+                 representable point-list capacity",
+                options.verification.samples,
+                dims.len()
+            )));
+        }
         validate_initial_pivots(initial_pivots, &dims)?;
         let domain_points: f64 = dims.iter().map(|&dim| dim as f64).product();
         if let ErrorNorm::L2 { reference, .. } = options.error_norm {

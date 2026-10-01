@@ -48,8 +48,9 @@
 //! measurement is only a decision statistic: it is conditioned on the
 //! acceptance it decided, and a residual concentrated on unsampled points is
 //! missed. With [`VerificationOptions::audit`], an independent audit sample
-//! drawn after the decision gives an unbiased estimate with a standard error;
-//! it is never a bound. No finite sample bounds the L2 error of a black-box
+//! drawn after the decision gives an unbiased estimate of the mean square
+//! residual (its square root, the reported RMS, is not unbiased) with a
+//! standard error; it is never a bound. No finite sample bounds the L2 error of a black-box
 //! function.
 //!
 //! The report's [`GlobalL2Error`] says what the run can claim:
@@ -122,16 +123,18 @@
 //!
 //! For a fixed seed, a deterministic evaluator, and a deterministic engine,
 //! the report and every stored node tensor (values and positional axis order)
-//! are identical across runs, provided every measured network value is
-//! reproducible. Each measurement uses a fresh `TreeTNCachedEvaluator`
-//! centered at the smallest node name, the default hint, and fixed-size
-//! chunks. On trees where every node carries exactly one site (`f64` or
-//! `Complex64`) the evaluator's raw kernels are bitwise reproducible across
-//! threads. On other trees (a site-free node or a node with several sites)
-//! its generic path can differ at rounding level between threads and
-//! processes, so an L2 acceptance near `tau` may then differ between runs;
-//! this is an open evaluator issue (open question 8 of
-//! `docs/design/tree-patching-error-contract.md`). The bitwise claim never
+//! are identical across runs on fresh threads within one process, provided
+//! every measured network value is reproducible; this is tested for `f64` on
+//! trees where every node carries exactly one site, where the measurement
+//! takes the cached evaluator's raw kernels. Reproducibility across separate
+//! processes is not established (open question 9 of
+//! `docs/design/tree-patching-error-contract.md`). Each measurement uses a
+//! fresh `TreeTNCachedEvaluator` centered at the smallest node name, the
+//! default hint, and fixed-size chunks. On other trees (a site-free node or a
+//! node with several sites) the evaluator's generic path can differ at
+//! rounding level between threads and processes, so an L2 acceptance near
+//! `tau` may then differ between runs; this is an open evaluator issue (open
+//! question 8). The bitwise claim never
 //! covers `approximation_rms` and the fields derived from it. The stored
 //! patches are `TreeTN`s, so what is derived from them may still differ
 //! across runs, for a single patch as for the whole partition, on any topology
@@ -224,7 +227,9 @@ use tensor4all_treetn::interpolation::{
     InterpolationError, InterpolationOutcome, InterpolationProblem, InterpolationTermination,
     TreeInterpolator,
 };
-use tensor4all_treetn::{NodeNameNetwork, TreeTN};
+use tensor4all_treetn::{NodeNameNetwork, TreeTN, TreeTNOperationError};
+
+use self::sampling::point_list_capacity;
 
 use crate::error::PartitionedTreeTNError;
 use crate::{ErrorNorm, L2Reference, PartitionedTreeTN, Projector, SubDomainTreeTN};
@@ -629,6 +634,9 @@ fn engine_error(projector: &Projector, message: String) -> PatchedInterpolationE
 
 fn measure_error(projector: &Projector, error: MeasureError) -> PatchedInterpolationError {
     match error {
+        MeasureError::PointList(message) => invalid(format!(
+            "could not construct the verification point list: {message}"
+        )),
         MeasureError::Evaluator(source) => evaluator_error(projector, source),
         MeasureError::Network(message) => engine_error(projector, message),
     }
@@ -914,10 +922,16 @@ where
 
         let approximation_rms = verify::approximation_rms(
             accepted.iter().map(|(_, entry)| {
-                (
-                    entry.subdomain.data().clone().log_norm(),
-                    entry.patch_points,
-                )
+                let data = entry.subdomain.data();
+                let log_norm = if self.has_wide_site_free_leaf(data) {
+                    Err(TreeTNOperationError::from(anyhow::anyhow!(
+                        "a site-free leaf with a bond wider than one: TreeTN::log_norm is not \
+                         reliable there"
+                    )))
+                } else {
+                    data.clone().log_norm()
+                };
+                (log_norm, entry.patch_points)
             }),
             domain_points,
         );
@@ -933,6 +947,28 @@ where
                 certified_fraction,
                 approximation_rms,
             },
+        })
+    }
+
+    /// Whether a stored patch has a node without sites and with one neighbor
+    /// whose bond is wider than one. `TreeTN::log_norm` overestimates the
+    /// norm of such networks unless that leaf is the canonicalization center
+    /// (a known `tensor4all-treetn` defect), so the approximation norm is
+    /// then reported as not computable.
+    fn has_wide_site_free_leaf(&self, data: &TreeTN<IdxTensor, V>) -> bool {
+        self.layout.node_positions.iter().any(|(node, positions)| {
+            positions.is_empty()
+                && self
+                    .layout
+                    .edges
+                    .iter()
+                    .filter(|(left, right)| left == node || right == node)
+                    .count()
+                    == 1
+                && data
+                    .node_index(node)
+                    .and_then(|index| data.tensor(index))
+                    .is_some_and(|tensor| tensor.indices().iter().any(|index| index.dim > 1))
         })
     }
 
@@ -993,7 +1029,7 @@ where
     }
 
     /// The measurement plan of a patch with the given point count.
-    fn plan(&self, patch_count: usize, seed: u64) -> PointPlan {
+    fn plan(&self, patch_count: Option<usize>, seed: u64) -> PointPlan {
         let verification = self.options.verification;
         PointPlan::for_patch(
             patch_count,
@@ -1066,7 +1102,12 @@ where
             active: &active,
             layout: cache.layout(),
         };
-        let patch_count = domain.point_count();
+        // `None` when the point count or its exhaustive point-list capacity
+        // cannot fit in a Vec: such a patch is measured by sampling.
+        let patch_count = active_dims
+            .iter()
+            .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+            .filter(|&count| point_list_capacity(active.len(), count).is_some());
         // User pivots come first inside `patch_candidates`; then the recycled
         // pivots and the parent's worst points, each kept once.
         let prior: Vec<Vec<usize>> = recycled.into_iter().chain(worst).collect();
@@ -1231,11 +1272,15 @@ where
                 return Ok(accepted(record, subdomain, patch_points));
             }
             Counters::add(&self.verification_failures, 1);
-            let worst = measured.worst_points(tolerance, limit);
+            // Every distinct worst point, largest first: a rerun drops the
+            // base candidates before truncating (step 9); a split passes the
+            // first `max_bond_dim - 1` of them (step 10).
+            let all_worst = measured.worst_points(tolerance, usize::MAX);
+            let worst: Vec<Vec<usize>> = all_worst.iter().take(limit).cloned().collect();
             if attempt < retries {
                 let pivots = active_pivots(outcome.pivots.as_ref(), &active, &layout.dims)
                     .map_err(|message| engine_error(projector, message))?;
-                added = added_pivots(&base_set, &worst, &pivots, limit);
+                added = added_pivots(&base_set, &all_worst, &pivots, limit);
                 failure = Some(Failure {
                     measurement: measured.measurement,
                     worst,

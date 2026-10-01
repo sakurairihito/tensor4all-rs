@@ -15,8 +15,10 @@
 //! splits the patches that cannot be accepted. The accuracy requirement is an
 //! [`ErrorNorm`] with an [`ErrorTolerance`]: by default the L2 error over the
 //! whole domain, measured by the driver itself (a certificate where patches
-//! are exact or measured exhaustively, a statistical estimate where they are
-//! sampled), or the M2 sampled max-norm criterion of the engine. The crate
+//! are exact or measured exhaustively, up to a calibrated, not proven,
+//! rounding model; a statistical estimate where they are sampled, with the
+//! audit on, and otherwise only an acceptance statistic), or the M2 sampled
+//! max-norm criterion of the engine. The crate
 //! depends on the engine trait only, not on an engine crate.
 //!
 //! The representation follows the partitioned tensor-network approach used by

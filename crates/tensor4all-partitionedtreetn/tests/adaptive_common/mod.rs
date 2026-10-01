@@ -339,6 +339,18 @@ pub(crate) fn max_degree(problem: &Problem) -> usize {
         .unwrap_or(0)
 }
 
+/// Split order of [`extended_quantics_tree`]: most significant bits first,
+/// then the flag and the two sites of the leaf `w`.
+pub(crate) fn extended_order(problem: &Problem) -> Vec<DynIndex> {
+    let mut order: Vec<DynIndex> = ["x0", "y0", "x1", "y1", "x2", "y2", "z"]
+        .iter()
+        .map(|node| problem.site(node, 0))
+        .collect();
+    order.push(problem.site("w", 0));
+    order.push(problem.site("w", 1));
+    order
+}
+
 /// A localized peak on [`extended_quantics_tree`]: a narrow Gaussian in
 /// (x, y) whose height depends on the flag `z` and the leaf `w`.
 pub(crate) fn extended_peak(p: &[usize]) -> f64 {
@@ -823,32 +835,61 @@ pub(crate) fn assert_same_run(
     assert_eq!(fingerprint(first, problem), fingerprint(second, problem));
 }
 
-/// Two reports of runs on separately built problems (fresh site IDs) agree:
-/// every count and record bitwise, except projectors, which carry the IDs
-/// and are compared through `fingerprint`, and the fields exempt from the
-/// determinism claim (see [`assert_same_norm`]).
-pub(crate) fn assert_same_report_across_problems(
-    first: &PatchedInterpolationReport,
-    second: &PatchedInterpolationReport,
-) {
-    assert_same_norm(&first.norm, &second.norm);
-    assert_eq!(first.splits, second.splits);
-    assert_eq!(first.function_evaluations, second.function_evaluations);
-    assert_eq!(first.cache_hits, second.cache_hits);
-    assert_eq!(
-        first.measurement_evaluations,
-        second.measurement_evaluations
-    );
-    assert_eq!(first.audit_evaluations, second.audit_evaluations);
-    assert_eq!(first.verification_failures, second.verification_failures);
-    assert_eq!(first.engine_retries, second.engine_retries);
-    assert_eq!(first.zero_patches.len(), second.zero_patches.len());
-    for (x, y) in first.zero_patches.iter().zip(&second.zero_patches) {
+/// What two runs on separately built problems (fresh site IDs) can be
+/// compared by: the ID-free fingerprint of the stored patches, the zero-patch
+/// projectors as sorted (site position, coordinate) pairs, and the report.
+pub(crate) struct RunDigest {
+    pub(crate) patches: Vec<PatchFingerprint>,
+    pub(crate) zero_patches: Vec<Vec<(usize, usize)>>,
+    pub(crate) report: PatchedInterpolationReport,
+}
+
+/// The digest of one run.
+pub(crate) fn run_digest(result: PatchedInterpolationResult<Name>, problem: &Problem) -> RunDigest {
+    let patches = fingerprint(&result, problem);
+    let zero_patches = result
+        .report
+        .zero_patches
+        .iter()
+        .map(|record| {
+            let mut key: Vec<(usize, usize)> = record
+                .projector
+                .iter()
+                .map(|(site, &value)| (problem.position(site), value))
+                .collect();
+            key.sort_unstable();
+            key
+        })
+        .collect();
+    RunDigest {
+        patches,
+        zero_patches,
+        report: result.report,
+    }
+}
+
+/// Two runs on separately built problems agree: every count and record
+/// bitwise, the projectors (accepted and zero) by site position, the stored
+/// patches by fingerprint, and the fields exempt from the determinism claim
+/// as in [`assert_same_norm`].
+pub(crate) fn assert_same_runs_across_problems(first: &RunDigest, second: &RunDigest) {
+    let (a, b) = (&first.report, &second.report);
+    assert_same_norm(&a.norm, &b.norm);
+    assert_eq!(a.splits, b.splits);
+    assert_eq!(a.function_evaluations, b.function_evaluations);
+    assert_eq!(a.cache_hits, b.cache_hits);
+    assert_eq!(a.measurement_evaluations, b.measurement_evaluations);
+    assert_eq!(a.audit_evaluations, b.audit_evaluations);
+    assert_eq!(a.verification_failures, b.verification_failures);
+    assert_eq!(a.engine_retries, b.engine_retries);
+    assert_eq!(first.zero_patches, second.zero_patches);
+    assert_eq!(a.zero_patches.len(), b.zero_patches.len());
+    for (x, y) in a.zero_patches.iter().zip(&b.zero_patches) {
         assert_eq!(x.acceptance, y.acceptance);
         assert_eq!(x.audit, y.audit);
     }
-    assert_eq!(first.accepted.len(), second.accepted.len());
-    for (x, y) in first.accepted.iter().zip(&second.accepted) {
+    assert_eq!(a.accepted.len(), b.accepted.len());
+    for (x, y) in a.accepted.iter().zip(&b.accepted) {
         assert_eq!(x.termination, y.termination);
         assert_eq!(x.max_bond_dim, y.max_bond_dim);
         assert_eq!(x.retries_used, y.retries_used);
@@ -863,4 +904,6 @@ pub(crate) fn assert_same_report_across_problems(
         assert_eq!(x.acceptance, y.acceptance);
         assert_eq!(x.audit, y.audit);
     }
+    // Accepted projectors by position, and the stored data.
+    assert_eq!(first.patches, second.patches);
 }

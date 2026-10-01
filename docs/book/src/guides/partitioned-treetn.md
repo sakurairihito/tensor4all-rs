@@ -189,12 +189,13 @@ pivots, then splits the patch. What a run can claim is the report's
 `GlobalL2Error`:
 
 - `Certified`: every contribution is exact or exhaustive, and the absolute
-  error is at most `delta` up to a small relative margin and a modelled
-  rounding term (`rounding_limited` says when that term is not below `tau`);
+  error is at most `delta` up to a small relative margin and a rounding term
+  from a calibrated, not proven, model (`rounding_limited` says when that term is not below `tau`);
   `relative_error_bound` bounds `E / ||f||` when `||f~||` exceeds `E`.
 - `Audited`: some contribution was sampled, and every sampled one was
-  audited. The audited value is an unbiased estimate with a standard error,
-  never a bound: a residual concentrated on unsampled points is missed.
+  audited. The audited mean square is an unbiased estimate (its square root
+  is not) with a standard error, never a bound: a residual concentrated on
+  unsampled points is missed.
 - `AcceptanceOnly`: audits were disabled. The combined acceptance statistics
   are neither a bound nor an estimate.
 
@@ -217,10 +218,12 @@ patch as zero.
 
 Execution is sequential. For a fixed `seed`, a deterministic evaluator, and a
 deterministic engine, the report and every stored node tensor (values and
-positional axis order) are identical across runs as long as the measured
-network values are reproducible. They are on trees with exactly one site per
-node; on trees with a site-free node or a node with several sites the cached
-evaluator can round differently between threads and processes, an open issue.
+positional axis order) are identical across runs on fresh threads within one
+process as long as the measured network values are reproducible. This is
+tested for `f64` on trees with exactly one site per node; reproducibility
+across separate processes is not established. On trees with a site-free node
+or a node with several sites the cached evaluator can round differently
+between threads and processes, an open issue.
 What is derived from the stored `TreeTN`s may still differ across runs, for a
 single patch as for the whole partition, on any topology
 ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)):

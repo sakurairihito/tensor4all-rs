@@ -6,25 +6,13 @@ mod adaptive_common;
 use std::sync::OnceLock;
 
 use adaptive_common::*;
-use tensor4all_core::{DynIndex, IdxTensor};
+use tensor4all_core::IdxTensor;
 use tensor4all_partitionedtreetn::adaptive_interpolation::{
     GlobalL2Error, MeasurementMethod, PatchedInterpolationOptions, PatchedInterpolationResult,
     VerificationOptions, GLOBAL_ROUNDING_MARGIN, MEASUREMENT_ROUNDING_FACTOR,
 };
 use tensor4all_partitionedtreetn::{ErrorNorm, L2Reference};
 use tensor4all_treetci::TreeTciInterpolator;
-
-/// Split order of [`extended_quantics_tree`]: most significant bits first,
-/// then the flag and the two sites of the leaf `w`.
-fn extended_order(problem: &Problem) -> Vec<DynIndex> {
-    let mut order: Vec<DynIndex> = ["x0", "y0", "x1", "y1", "x2", "y2", "z"]
-        .iter()
-        .map(|node| problem.site(node, 0))
-        .collect();
-    order.push(problem.site("w", 0));
-    order.push(problem.site("w", 1));
-    order
-}
 
 /// L2 options with the given reference norm.
 fn l2_options(problem: &Problem, norm: f64) -> PatchedInterpolationOptions {
@@ -218,16 +206,12 @@ fn assert_deterministic_across_threads(problem: fn() -> Problem, f: fn(&[usize])
                 .with_tolerance(tol(1e-6))
                 .with_seed(11);
             let result = run(&TreeTciInterpolator::default(), &problem, &f, &[], &options).unwrap();
-            let fingerprint = fingerprint(&result, &problem);
-            (fingerprint, result.report)
+            run_digest(result, &problem)
         })
         .join()
         .unwrap()
     };
-    let (first_fingerprint, first) = one_run();
-    let (second_fingerprint, second) = one_run();
-    assert_same_report_across_problems(&first, &second);
-    assert_eq!(first_fingerprint, second_fingerprint);
+    assert_same_runs_across_problems(&one_run(), &one_run());
 }
 
 fn raw_kernel_peak(p: &[usize]) -> f64 {

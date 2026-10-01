@@ -1569,7 +1569,18 @@ text left open.
   committed one before comparison, because the default JSON float parser can
   differ by one unit in the last place; with that, the reproduction is
   bitwise on the recording machine. Re-recording is an ignored test that
-  requires `T4A_RECORD_M2_GOLDEN=1`.
+  requires `T4A_RECORD_M2_GOLDEN=1`. The ten dense cases mirror
+  `splits_at_the_junction`, `splits_at_a_multi_site_node`,
+  `splits_until_every_site_of_a_node_is_fixed`,
+  `reports_are_in_canonical_path_order`,
+  `vanishing_regions_are_reported_as_zero_patches`,
+  `one_site_patches_below_the_root_are_evaluated_exactly`,
+  `recycled_pivots_seed_the_children`,
+  `runs_are_deterministic_and_seeds_depend_on_the_patch`,
+  `complex_patches_have_one_dtype`, and
+  `iteration_limit_splits_like_the_bond_cap`. The two TreeTCI cases are the
+  no-recycling and recycling runs of
+  `treetci_patches_a_function_on_a_branched_tree_deterministically`.
 - **A golden scenario was excluded (deviation from "the M2 test
   scenarios").** The M2 TreeTCI scenario on a seven-bit quantics chain fails
   the separation screen at every `rtol` tried from `1e-6` to `1e-12` (at the
@@ -1583,9 +1594,10 @@ text left open.
   random networks (bond dimensions 2, 4, 8) on the extended `quantics_tree`,
   a raw-kernel tree, and `branched`, for cancelling networks `A - A'` with
   `A'` perturbed by 10% and 1% per entry, and for the TreeTCI patches of
-  test 1. The ratio `||evaluated - exact|| / (eps ||exact||)` was at most 1.8
-  for random networks, 13.2 at 10% cancellation, 161.2 at 1% cancellation,
-  and 0.93 for interpolated patches. The constant is 162 (the largest ratio
+  test 1. The ratio `||evaluated - exact|| / (eps ||exact||)` was at most 1.9
+  for random networks, 13.2 at 10% cancellation, 161.23 at 1% cancellation,
+  and 0.65 for the four TreeTCI patches of test 1's run (with its split
+  order). The constant is 162 (the largest ratio
   rounded up) times a headroom factor of 4. Heavier cancellation exceeds it,
   as the text anticipates.
 - **Test 14.** The fresh-thread run tests pass on the raw-kernel tree with
@@ -1595,41 +1607,81 @@ text left open.
   in the last place between two threads). With the dense engine, whose patches
   there have rank one, they passed in three processes, which is not a
   guarantee.
-- **Lower-layer finding (not changed here).** `TreeTN::norm` and
-  `TreeTN::norm_squared` return wrong values for a direct sum whose
-  site-free leaf has a bond of dimension two: for the chain `a - b - e` with
-  `e` site-free and two rank-one networks of norms 5 and 10 on disjoint
-  supports, `x.add(&y).norm()` returns `sqrt(250)` instead of `sqrt(125)`; it
-  is correct when the site-free node is the canonicalization center (the
-  smallest name) or absent. `PartitionedTreeTN::to_treetn().norm()` on
-  `branched` patches inherits this. The driver is not affected: it takes
-  `log_norm` per patch, whose site-free leaves have bonds of dimension one
-  for the engines tested; tests compare with dense materializations.
+- **Lower-layer defect, relied on by the report (not fixed here).**
+  `TreeTN::log_norm`, and with it `TreeTN::norm` (`log_norm().exp()`) and
+  `norm_squared`, overestimates the norm of a network in which a site-free
+  leaf (a node without sites and with one neighbor) that is not the
+  canonicalization center has a bond of dimension two or more. Minimal
+  reproduction (the ignored test
+  `treetn_log_norm_of_a_site_free_leaf_with_a_wide_bond` in
+  `tests/adaptive_l2.rs`): the chain `a - b - e` with `a = [1, 0]` on its
+  binary site and a dimension-one bond to `b`, `b(y, k) = [[3, 0], [0, 4]]`
+  over its binary site `y` and the bond `k` (dimension two) to `e`, and the
+  site-free leaf `e = [1, 1]` represents `f(x, y) = [1, 0]_x [3, 4]_y` of norm
+  5; the dense contraction gives 5, `log_norm().exp()` gives `7.0710678...`
+  (`5 sqrt(2)`). Random networks on the same chain give ratios 1.24 (bond 2)
+  and 1.40 (bond 3); a site-free leaf that is the smallest node name, a
+  site-free junction, a site-free internal node, and bonds of dimension one
+  are correct. A direct sum of patches has such leaves, so
+  `PartitionedTreeTN::to_treetn().norm()` on `branched` patches gave 213.09
+  against a dense 150.68.
+
+  **The M3 report relies on it**: `approximation_rms` comes from
+  `log_norm` per accepted patch, and a too large `||f~||` would make
+  `relative_error_bound` and `relative_bound_estimate` anti-conservative.
+  The engines tested here (TreeTCI, the dense test engine) give site-free
+  leaves bonds of dimension one, and their patches matched the dense norms
+  exactly. The driver guards the trigger condition: when a stored patch has
+  a site-free leaf with a bond wider than one, `approximation_rms` is
+  reported as `None`, with the rounding term, the flag, and the relative
+  fields (test `a_site_free_leaf_with_a_wide_bond_makes_the_approximation_norm_unavailable`).
+  The rustdoc of `approximation_rms` and of the relative fields names the
+  defect. **Follow-up for the user to decide:** file a `tensor4all-treetn`
+  issue for `log_norm` with this reproduction; once fixed, the guard and the
+  ignored test can go.
+
+### Review fixes
+
+- **Overflowing exhaustive plans.** A patch is measured exhaustively only
+  when its point count, computed with checked multiplication, exists and is
+  at most `max(max_exhaustive_points, samples)`, and the point-list length and
+  byte capacity fit in a `Vec`; otherwise it is sampled. Both exhaustive and
+  sampled point-list constructors use checked capacity arithmetic and
+  fallible reservation. `verification.samples` whose list cannot fit a `Vec`
+  is `InvalidInput` before any evaluation, a new validation branch.
+- **Rerun list.** A rerun receives the distinct worst points of the failed
+  measurement, without the base candidates, then the outcome pivots,
+  truncated to `max_bond_dim - 1` after the base candidates are dropped
+  (step 9); a split still passes the first `max_bond_dim - 1` worst points
+  (step 10).
 
 ### Evidence for the open questions
 
 Gathered with small release-mode runs on the real producer (TreeTCI through
-the M3 driver), unless stated otherwise. The runs used a branched quantics
+the M3 driver), unless stated otherwise. Reproducible ignored diagnostic
+tests and their commands are in
+`crates/tensor4all-partitionedtreetn/tests/adaptive_l2_diagnostics.rs`.
+The runs used a branched quantics
 tree with two six-bit variables on the branches of a site-free junction and a
 binary flag (8192 points, junction of degree three), `seed = 1`, an MSB-first
 interleaved split order, and two functions: a smooth one (`rms / max = 0.66`)
-and a localized cusp `exp(-r / 0.03)` (`rms / max = 0.040`). TreeTCI's global
-pivot search is still slow on this branch (issue #792): one run took up to
-130 s. The measurement scripts were not committed; this record is their
-result.
+and a localized cusp `exp(-r / 0.03)` (`rms / max = 0.040`). These diagnostics
+record evaluation counts and approximation errors, not elapsed time.
 
-- **OQ2 (budget allocation).** With cap 4, the effective local relative
-  tolerance `tau / rms_P(f)` of the accepted patches lay between 0.78 and 1.9
-  times `rtol` for the smooth function, so volume and norm allocation nearly
-  coincide there. For the localized function it ranged from 0.072 `rtol` (the
-  patches at the peak, a factor close to `sqrt(rho)`) to `6e5 rtol` (the
-  tails). Patches and evaluations at `rtol = 1e-4` (`1e-6`): smooth, L2
-  16 (108) patches and 8192 (8192) evaluations, against 14 (86) and 6368 (8101)
-  under SampledMax; localized, L2 45 (99) patches and 6837 (8192) evaluations,
-  against 22 (56) and 3531 (5745) under SampledMax. The comparison mixes the
-  allocation with the change of norm: SampledMax at `rtol = 1e-4` reached an
-  L2 relative error of `1.2e-3` on the localized function, where L2 reached
-  `3.8e-5`. The small domain caps evaluations at 8192.
+- **OQ2 (budget allocation; diagnostic, not a comparison of allocations).**
+  The volume-versus-norm allocation question was not directly measured. The
+  committed diagnostic reports the effective local relative tolerance
+  `tau / rms_P(f)` of the accepted patches: values ranged from 0.78 to 1.9
+  times `rtol` for the smooth function and from 0.072 `rtol` (patches at the
+  peak, close to a `sqrt(rho)` factor) to `6e5 rtol` (tails) for the localized
+  function. It describes the volume allocation only; it does not compare it
+  with a norm-proportional allocation. At `rtol = 1e-4` (`1e-6`), patches and
+  evaluations were: smooth L2, 16 (108) patches and 8192 (8192) evaluations;
+  SampledMax, 14 (86) and 6368 (8101); localized L2, 45 (99) and 6837 (8192);
+  SampledMax, 22 (56) and 3531 (5745). The SampledMax numbers are a separate
+  diagnostic of the change of norm at unmatched achieved accuracy: at
+  `rtol = 1e-4` its localized run reached L2 relative error `1.2e-3`, while the
+  L2 run reached `3.8e-5`. The small domain caps evaluations at 8192.
 - **OQ3 (reference).** Every L2 test with a root that is not exact passes
   `L2Reference::Given` (36 uses in the test files), with 18 dense-reference
   computations that exist only to supply it; every runnable rustdoc and guide
@@ -1648,8 +1700,7 @@ result.
   sampled, with the selection effects described above.
 - **OQ5 (audit).** Cap 6, `rtol = 1e-4`, defaults otherwise: the audit added
   73 of 2937 evaluations (2.5%) on the smooth function and 48 of 5019 (1.0%)
-  on the localized one, with no measurable change in run time (the engine
-  dominates). The audited relative-bound estimates were `2.25e-5` and
+  on the localized one. The audited relative-bound estimates were `2.25e-5` and
   `3.19e-5` against true relative errors of `2.76e-5` and `3.20e-5`; the
   acceptance-only statistics were `3.2e-5` and `1.5e-6` in RMS units.
 - **OQ8 and OQ9 (determinism).** The stage-1 test: on the raw-kernel tree,

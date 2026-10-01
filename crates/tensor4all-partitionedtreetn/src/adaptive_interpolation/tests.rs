@@ -12,8 +12,8 @@ use super::cache::{
 use super::embed::{check_outcome_layout, embed_fixed_sites, exact_active_network};
 use super::layout::SiteLayout;
 use super::sampling::{
-    all_points, build_candidates, mix64, patch_candidates, patch_seeds, uniform_points,
-    PatchDomain, SplitMix64,
+    all_points, build_candidates, mix64, patch_candidates, patch_seeds, point_list_capacity,
+    uniform_points, PatchDomain, SplitMix64,
 };
 use super::{active_pivots, added_pivots, complete_points, PatchedInterpolationOptions};
 use crate::{PartitionedTreeTN, PartitionedTreeTNError, Projector, SubDomainTreeTN};
@@ -109,12 +109,12 @@ fn measurement_streams_follow_the_documented_mapping() {
     assert_eq!(child.engine_run(1), 15_846_517_643_923_597_972);
     // Sampled points draw every coordinate in active-site order.
     assert_eq!(
-        columns(&uniform_points(&[3, 5, 7], 4, 42), 3),
+        columns(&uniform_points(&[3, 5, 7], 4, 42).unwrap(), 3),
         [vec![2, 0, 1], vec![1, 0, 6], vec![0, 4, 2], vec![1, 1, 3]]
     );
     // Exhaustive points are column-major, first active site fastest.
     assert_eq!(
-        columns(&all_points(&[2, 3]), 2),
+        columns(&all_points(&[2, 3], 6).unwrap(), 2),
         [
             vec![0, 0],
             vec![1, 0],
@@ -124,6 +124,13 @@ fn measurement_streams_follow_the_documented_mapping() {
             vec![1, 2]
         ]
     );
+}
+
+#[test]
+fn point_lists_reject_lengths_that_cannot_fit_a_vec_allocation() {
+    assert_eq!(point_list_capacity(1, usize::MAX), None);
+    assert!(all_points(&[2], usize::MAX).is_err());
+    assert!(uniform_points(&[2], usize::MAX, 7).is_err());
 }
 
 fn domain_parts(dims: &[usize], fixed: &[Option<usize>]) -> (Vec<usize>, KeyLayout) {

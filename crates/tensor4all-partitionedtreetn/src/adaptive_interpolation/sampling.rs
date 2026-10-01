@@ -13,6 +13,14 @@ use tensor4all_core::ColMajorArray;
 
 use super::cache::KeyLayout;
 
+/// The number of coordinate entries a point list can hold without its byte
+/// length exceeding Rust's maximum `Vec` allocation size.
+pub(super) fn point_list_capacity(n_active: usize, count: usize) -> Option<usize> {
+    let entries = n_active.checked_mul(count)?;
+    let bytes = entries.checked_mul(std::mem::size_of::<usize>())?;
+    (bytes <= isize::MAX as usize).then_some(entries)
+}
+
 /// SplitMix64 increment (the golden-ratio gamma).
 const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 /// Domain separator mixed into the root seed before absorbing a patch path.
@@ -142,9 +150,19 @@ pub(super) fn patch_seeds(root_seed: u64, path: &[(usize, usize)]) -> PatchSeeds
 /// `count` uniform points of a patch with the given active dimensions, drawn
 /// with replacement from the stream seeded with `seed`: each coordinate in
 /// active-site order with Lemire's draw. Column-major `[n_active, count]`.
-pub(super) fn uniform_points(active_dims: &[usize], count: usize, seed: u64) -> Vec<usize> {
+/// Returns an error if the point list cannot be represented or reserved.
+pub(super) fn uniform_points(
+    active_dims: &[usize],
+    count: usize,
+    seed: u64,
+) -> Result<Vec<usize>, String> {
+    let capacity = point_list_capacity(active_dims.len(), count)
+        .ok_or_else(|| "sample point-list length exceeds Vec capacity".to_owned())?;
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(capacity)
+        .map_err(|error| format!("could not reserve sampled point list: {error}"))?;
     let mut rng = SplitMix64::new(seed);
-    let mut points = Vec::with_capacity(active_dims.len().saturating_mul(count));
     for _ in 0..count {
         points.extend(
             active_dims
@@ -152,21 +170,27 @@ pub(super) fn uniform_points(active_dims: &[usize], count: usize, seed: u64) -> 
                 .map(|&dim| rng.below(dim as u64) as usize),
         );
     }
-    points
+    Ok(points)
 }
 
-/// Every point of a patch with the given active dimensions, column-major
-/// (first active site fastest). The caller bounds the count.
-pub(super) fn all_points(active_dims: &[usize]) -> Vec<usize> {
-    let count: usize = active_dims.iter().product();
-    let mut points = Vec::with_capacity(active_dims.len() * count);
+/// The first `count` points of a patch with the given active dimensions in
+/// column-major order (first active site fastest): every point when `count`
+/// is the patch's point count. Returns an error if the point list cannot be
+/// represented or reserved.
+pub(super) fn all_points(active_dims: &[usize], count: usize) -> Result<Vec<usize>, String> {
+    let capacity = point_list_capacity(active_dims.len(), count)
+        .ok_or_else(|| "exhaustive point-list length exceeds Vec capacity".to_owned())?;
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(capacity)
+        .map_err(|error| format!("could not reserve exhaustive point list: {error}"))?;
     for mut linear in 0..count {
         for &dim in active_dims {
             points.push(linear % dim);
             linear /= dim;
         }
     }
-    points
+    Ok(points)
 }
 
 /// Candidate pivots of a patch in active coordinates.

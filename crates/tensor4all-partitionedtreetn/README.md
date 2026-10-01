@@ -40,7 +40,7 @@ The accuracy requirement is `PatchedInterpolationOptions::error_norm` with
 The report's `GlobalL2Error` states what an L2 run can claim. `Certified`
 (every contribution exact or exhaustive) bounds the absolute error
 `E <= delta (1 + GLOBAL_ROUNDING_MARGIN) + MEASUREMENT_ROUNDING_FACTOR * eps *
-||f~||`, up to a calibrated rounding model, and carries a conservative bound
+||f~||`, up to a calibrated (not proven) rounding model, and carries a conservative bound
 on `E / ||f||` when `||f~||` exceeds `E`. `Audited` gives an estimate with a
 standard error, never a bound; `AcceptanceOnly` (audits off) gives neither an
 estimate nor a relative statement. Sampled measurements cannot bound the L2
@@ -57,11 +57,12 @@ error of a black-box function.
 - Randomness comes from per-patch seeds derived from
   `PatchedInterpolationOptions::seed`. For a fixed seed, a deterministic
   evaluator, and a deterministic engine the report and every stored node
-  tensor are identical across runs, provided the measured network values are
-  reproducible: they are on trees with exactly one site per node, while the
-  cached evaluator's generic path (a site-free node or a node with several
-  sites) can differ at rounding level between threads and processes, an open
-  issue. What is derived from the stored `TreeTN`s may still differ across
+  tensor are identical across runs on fresh threads within one process,
+  provided the measured network values are reproducible. This is tested for
+  `f64` on trees with exactly one site per node; reproducibility across
+  separate processes is not established. The cached evaluator's generic path
+  (a site-free node or a node with several sites) can differ at rounding
+  level between threads and processes, an open issue. What is derived from the stored `TreeTN`s may still differ across
   runs ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)):
   materializing (`to_dense`, `contract_to_tensor`, `to_treetn`) in axis order
   and at rounding level, and the iteration order of `external_indices`,

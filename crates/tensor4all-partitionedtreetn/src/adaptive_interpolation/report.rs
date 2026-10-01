@@ -19,7 +19,7 @@ use crate::{ErrorTolerance, PartitionedTreeTN, Projector};
 /// ```
 /// use tensor4all_partitionedtreetn::adaptive_interpolation::GLOBAL_ROUNDING_MARGIN;
 ///
-/// assert!(GLOBAL_ROUNDING_MARGIN > 1e3 * f64::EPSILON && GLOBAL_ROUNDING_MARGIN < 1e-6);
+/// assert_eq!(GLOBAL_ROUNDING_MARGIN, 1e-8);
 /// ```
 pub const GLOBAL_ROUNDING_MARGIN: f64 = 1e-8;
 
@@ -32,9 +32,9 @@ pub const GLOBAL_ROUNDING_MARGIN: f64 = 1e-8;
 /// acceptance decision; it only sets the absolute rounding term of a
 /// certified error ([`GlobalL2Error::Certified`]). The value is the largest
 /// ratio `||evaluated - exact|| / (eps ||exact||)` observed in a calibration
-/// on the test trees (162, rounded up from 161.2, for a network whose
+/// on the test trees (162, rounded up from 161.23, for a network whose
 /// contraction cancels to about 1% of its terms; random networks gave at
-/// most 1.8 and interpolated patches at most 0.93) times a headroom factor
+/// most 1.9 and interpolated patches at most 0.65) times a headroom factor
 /// of 4. The calibration is the ignored test
 /// `tests/adaptive_rounding_calibration.rs`.
 ///
@@ -69,8 +69,8 @@ pub enum MeasurementMethod {
     /// floating-point rounding, a certificate unaffected by selection.
     Exhaustive,
     /// The residual was evaluated at fresh uniform points of the patch. As an
-    /// acceptance measurement it is only a decision statistic; as an audit it
-    /// is an unbiased estimate, never a bound.
+    /// acceptance measurement it is only a decision statistic; as an audit its
+    /// mean square is an unbiased estimate (its RMS is not), never a bound.
     Sampled,
 }
 
@@ -346,6 +346,8 @@ pub enum GlobalL2Error {
         /// E_up)` on `E / ||f||`, with `E_up = E (1 + GLOBAL_ROUNDING_MARGIN)
         /// + rounding`. `None` when the denominator is not positive or
         /// `approximation_rms` is `None`: then no relative statement exists.
+        /// The bound relies on `||f~||` from `TreeTN::log_norm`; see
+        /// [`L2ErrorReport::approximation_rms`] for its known defect.
         relative_error_bound: Option<f64>,
     },
     /// Every `Sampled` contribution has an audit: an estimate, not a bound.
@@ -359,7 +361,8 @@ pub enum GlobalL2Error {
         /// Plug-in estimate of the bound `E / (||f~|| - E)` with the audited
         /// estimate of `E` inserted; not an unbiased estimate of `E / ||f||`.
         /// `None` when `||f~||` does not exceed the estimated `E` or
-        /// `approximation_rms` is `None`.
+        /// `approximation_rms` is `None`. It relies on `||f~||` from
+        /// `TreeTN::log_norm`; see [`L2ErrorReport::approximation_rms`].
         relative_bound_estimate: Option<f64>,
     },
     /// Some `Sampled` contribution has no audit: the combined acceptance
@@ -426,6 +429,7 @@ impl GlobalL2Error {
 ///     GlobalL2Error::Certified { rms_error, relative_error_bound: Some(bound), .. }
 ///         if rms_error == 0.0 && bound < 1e-12
 /// ));
+/// assert_eq!(error.global.rms_value(), 0.0);
 /// assert_eq!(error.error_norm(), Some(0.0));
 /// // ||f~|| = 5 up to rounding.
 /// assert!((error.approximation_norm().unwrap() - 5.0).abs() < 1e-12);
@@ -446,6 +450,14 @@ pub struct L2ErrorReport {
     /// covered by the bitwise determinism claim: the canonicalization it
     /// relies on is not audited for reproducibility. It feeds the report
     /// only, never a decision.
+    ///
+    /// Known `tensor4all-treetn` defect: `TreeTN::log_norm` overestimates the
+    /// norm of a network in which a node without sites and with one
+    /// neighbor (a site-free leaf), other than the canonicalization center,
+    /// has a bond wider than one; too large a `||f~||` would make the
+    /// relative bounds anti-conservative. The driver therefore also reports
+    /// `None` when a stored patch has a site-free leaf with a bond wider than
+    /// one. The engines tested here give such leaves bonds of dimension one.
     pub approximation_rms: Option<f64>,
 }
 

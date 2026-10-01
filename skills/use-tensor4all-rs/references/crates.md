@@ -176,7 +176,9 @@ engine implementing `tensor4all_treetn::interpolation::TreeInterpolator`
   (exhaustive up to `max_exhaustive_points`, else sampled plus audit) and
   reports `report.norm` (`NormReport::L2 { tau, error: L2ErrorReport { global:
   GlobalL2Error::{Certified, Audited, AcceptanceOnly}, .. }, .. }`): only
-  `Certified` is a bound. `ErrorNorm::sampled_max()` /
+  `Certified` is a bound, and only up to a calibrated (not proven) rounding
+  model; a sampled run is an estimate only with the audit on, otherwise
+  acceptance-only (neither a bound nor an estimate). `ErrorNorm::sampled_max()` /
   `sampled_max_with_reference(max_abs)` keep the M2 engine criterion (no
   verified bound, no L2 claim). `MaxAbs`/`WeightedL2` are placeholders
   (`UnsupportedNorm`). Zero patches are in `report.zero_patches` (absent from

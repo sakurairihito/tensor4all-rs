@@ -311,13 +311,23 @@ fn bits(values: &[f64]) -> Vec<u64> {
 }
 
 /// Whether every node of every stored patch satisfies the raw-kernel
-/// condition of the cached evaluator: exactly one site leg, and legs equal
-/// to its neighbor count plus one.
+/// condition of the cached evaluator: exactly one site leg, and its legs equal
+/// to its neighbor count plus one. A neighbor is a node sharing a bond leg.
 fn takes_raw_kernels(patches: &[RawPatch], sites: &[DynIndex]) -> bool {
     patches.iter().all(|patch| {
-        patch.nodes.iter().all(|(_, legs, _)| {
+        patch.nodes.iter().all(|(name, legs, _)| {
             let site_legs = legs.iter().filter(|leg| sites.contains(leg)).count();
-            site_legs == 1
+            let neighbors = patch
+                .nodes
+                .iter()
+                .filter(|(other, other_legs, _)| {
+                    other != name
+                        && other_legs
+                            .iter()
+                            .any(|leg| !sites.contains(leg) && legs.contains(leg))
+                })
+                .count();
+            site_legs == 1 && legs.len() == neighbors + 1
         })
     })
 }
@@ -429,19 +439,26 @@ fn worst_points_are_distinct_and_sorted_with_ties_in_measurement_order() {
 
 #[test]
 fn point_plans_are_exhaustive_up_to_the_inclusive_threshold() {
-    assert_eq!(PointPlan::for_patch(16, 16, 0, 7), PointPlan::Exhaustive);
     assert_eq!(
-        PointPlan::for_patch(17, 16, 0, 7),
+        PointPlan::for_patch(Some(16), 16, 0, 7),
+        PointPlan::Exhaustive { count: 16 }
+    );
+    assert_eq!(
+        PointPlan::for_patch(Some(17), 16, 0, 7),
         PointPlan::Sampled { count: 16, seed: 7 }
     );
     assert_eq!(
-        PointPlan::for_patch(1024, 64, 1024, 7),
-        PointPlan::Exhaustive
+        PointPlan::for_patch(Some(1024), 64, 1024, 7),
+        PointPlan::Exhaustive { count: 1024 }
     );
-    assert!(matches!(
-        PointPlan::for_patch(usize::MAX, 64, 1024, 7),
-        PointPlan::Sampled { .. }
-    ));
+    // A point count that overflows usize is never exhaustive, even with an
+    // unbounded limit.
+    for (samples, max_exhaustive) in [(64, usize::MAX), (usize::MAX, 0)] {
+        assert!(matches!(
+            PointPlan::for_patch(None, samples, max_exhaustive, 7),
+            PointPlan::Sampled { .. }
+        ));
+    }
 }
 
 #[test]

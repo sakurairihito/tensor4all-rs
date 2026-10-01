@@ -1029,13 +1029,13 @@ fn dense_run_on_a_fresh_thread(
     problem: fn() -> Problem,
     f: fn(&[usize]) -> f64,
     verification: VerificationOptions,
-) -> (Vec<PatchFingerprint>, PatchedInterpolationReport) {
+) -> RunDigest {
     std::thread::spawn(move || {
         let problem = problem();
         let (_, norm) = dense_reference(&problem, &f);
         let options = l2_given(2, norm, 1e-10).with_verification(verification);
         let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
-        (fingerprint(&result, &problem), result.report)
+        run_digest(result, &problem)
     })
     .join()
     .unwrap()
@@ -1058,13 +1058,10 @@ fn dense_engine_l2_runs_are_reproducible_on_fresh_threads_on_a_raw_kernel_tree()
             .with_samples(8)
             .with_max_exhaustive_points(0),
     ] {
-        let (first_fingerprint, first) =
-            dense_run_on_a_fresh_thread(raw_kernel_tree, raw_kernel_switch, verification);
-        let (second_fingerprint, second) =
-            dense_run_on_a_fresh_thread(raw_kernel_tree, raw_kernel_switch, verification);
-        assert!(first.splits >= 1);
-        assert_same_report_across_problems(&first, &second);
-        assert_eq!(first_fingerprint, second_fingerprint);
+        let first = dense_run_on_a_fresh_thread(raw_kernel_tree, raw_kernel_switch, verification);
+        let second = dense_run_on_a_fresh_thread(raw_kernel_tree, raw_kernel_switch, verification);
+        assert!(first.report.splits >= 1);
+        assert_same_runs_across_problems(&first, &second);
     }
 }
 
@@ -1080,12 +1077,11 @@ fn dense_engine_l2_runs_are_reproducible_on_fresh_threads_on_a_generic_path_tree
             .with_samples(8)
             .with_max_exhaustive_points(0),
     ] {
-        let (first_fingerprint, first) =
+        let first =
             dense_run_on_a_fresh_thread(extended_quantics_tree, generic_path_switch, verification);
-        let (second_fingerprint, second) =
+        let second =
             dense_run_on_a_fresh_thread(extended_quantics_tree, generic_path_switch, verification);
-        assert_same_report_across_problems(&first, &second);
-        assert_eq!(first_fingerprint, second_fingerprint);
+        assert_same_runs_across_problems(&first, &second);
     }
 }
 
@@ -1280,4 +1276,339 @@ fn complex_residual_magnitudes_are_measured_by_abs_val() {
     };
     assert_eq!(measurement.rms, 1.0);
     assert_eq!(measurement.max_residual, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes: overflowing plans, the rerun list, the log-norm guard, and
+// the L2 error branches
+// ---------------------------------------------------------------------------
+
+/// A product over 65 binary sites (2^65 points, more than usize holds) and
+/// its exact L2 norm.
+fn wide_product() -> (Problem, impl Fn(&[usize]) -> f64 + Sync + Copy, f64) {
+    let problem = chain("s", 65, 2);
+    let factor = |i: usize, x: usize| 1.0 + 0.1 * ((i % 3) * x) as f64;
+    let f = move |p: &[usize]| {
+        p.iter()
+            .enumerate()
+            .map(|(i, &x)| factor(i, x))
+            .product::<f64>()
+    };
+    let norm = (0..65)
+        .map(|i| (factor(i, 0).powi(2) + factor(i, 1).powi(2)).sqrt())
+        .product::<f64>();
+    (problem, f, norm)
+}
+
+#[test]
+fn unbounded_exhaustive_limits_never_measure_an_overflowing_patch_exhaustively() {
+    let (problem, f, norm) = wide_product();
+    let pivots = [vec![0; 65], vec![1; 65]];
+    let options = l2_given(2, norm, 1e-6)
+        .with_verification(VerificationOptions::new().with_max_exhaustive_points(usize::MAX));
+    let result = run(&FiberEngine, &problem, &f, &pivots, &options).unwrap();
+    let record = &result.report.accepted[0];
+    let measurement = record.acceptance.as_ref().unwrap();
+    assert_eq!(measurement.method, MeasurementMethod::Sampled);
+    assert_eq!(measurement.points, 64);
+    assert_eq!(measurement.patch_points, 2f64.powi(65));
+    assert!(record.audit.is_some());
+    assert!(matches!(
+        result.report.norm.l2_error().unwrap().global,
+        GlobalL2Error::Audited { .. }
+    ));
+
+    // A sample count whose point list overflows usize is rejected before any
+    // evaluation.
+    let options = l2_given(2, norm, 1e-6)
+        .with_verification(VerificationOptions::new().with_samples(usize::MAX));
+    expect_invalid(
+        patched_interpolate(
+            &FiberEngine,
+            problem.topology.clone(),
+            problem.node_sites.clone(),
+            problem.pivots(&pivots),
+            never,
+            &options,
+        ),
+        "verification.samples",
+    );
+}
+
+/// `f = 1` plus spikes A (+9), B (+7), C (+5) on `single_node(&[4, 4])`.
+fn three_spikes(p: &[usize]) -> f64 {
+    match p {
+        [1, 2] => 10.0,
+        [3, 0] => 8.0,
+        [0, 3] => 6.0,
+        _ => 1.0,
+    }
+}
+
+#[test]
+fn a_base_candidate_among_the_worst_points_does_not_shorten_the_added_list() {
+    let problem = single_node(&[4, 4]);
+    let (_, norm) = dense_reference(&problem, &three_spikes);
+    let constant = Step::converged(Network::Constant(1.0));
+    let engine = ScriptedEngine::new(vec![
+        constant.clone().with_pivots(vec![vec![2, 2], vec![1, 1]]),
+        constant,
+        Step::converged(Network::Exact),
+    ]);
+    // A is a user pivot, so a base candidate; max_bond_dim - 1 = 2.
+    let options = l2_given(3, norm, 1e-6)
+        .with_n_initial_pivots(1)
+        .with_patch_order(vec![problem.site("only", 0)]);
+    run(&engine, &problem, &three_spikes, &[vec![1, 2]], &options).unwrap();
+    let calls = engine.calls();
+    let base = calls[0].initial_pivots.clone();
+    assert_eq!(base, [vec![1, 2]]);
+    // Step 9: drop the base candidates, then truncate: B and C, not B and an
+    // outcome pivot.
+    let mut expected = base.clone();
+    expected.extend([vec![3, 0], vec![0, 3]]);
+    assert_eq!(calls[1].initial_pivots, expected);
+}
+
+/// Returns, for the problem `a(2) - b(2) - e()` with `e` site-free, the exact
+/// network of `f(x, y) = (1 + x)(3 + y)` whose bond `b - e` has dimension
+/// two: `b(y, k) = (3 + y) / 2` and `e = [1, 1]`.
+struct WideLeafEngine;
+
+impl tensor4all_treetn::interpolation::TreeInterpolator<f64> for WideLeafEngine {
+    fn interpolate<V, F>(
+        &self,
+        problem: &tensor4all_treetn::interpolation::InterpolationProblem<V>,
+        _evaluate: F,
+    ) -> Result<tensor4all_treetn::interpolation::InterpolationOutcome<V>, InterpolationError>
+    where
+        V: Clone + std::hash::Hash + Eq + Ord + std::fmt::Debug + Send + Sync,
+        F: Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<f64>>,
+    {
+        use tensor4all_core::{DynIndex, IdxTensor};
+        let sites: Vec<(V, Vec<DynIndex>)> = problem
+            .node_sites()
+            .iter()
+            .map(|(n, s)| (n.clone(), s.clone()))
+            .collect();
+        let (ab, be) = (DynIndex::new_dyn(1), DynIndex::new_dyn(2));
+        let a =
+            IdxTensor::from_dense(vec![sites[0].1[0].clone(), ab.clone()], vec![1.0, 2.0]).unwrap();
+        let b = IdxTensor::from_dense(
+            vec![sites[1].1[0].clone(), ab, be.clone()],
+            vec![1.5, 2.0, 1.5, 2.0],
+        )
+        .unwrap();
+        let e = IdxTensor::from_dense(vec![be], vec![1.0, 1.0]).unwrap();
+        let names = sites.into_iter().map(|(n, _)| n).collect();
+        Ok(tensor4all_treetn::interpolation::InterpolationOutcome {
+            network: tensor4all_treetn::TreeTN::from_tensors(vec![a, b, e], names).unwrap(),
+            termination: tensor4all_treetn::interpolation::InterpolationTermination::Converged,
+            error_estimate: 0.0,
+            max_sample_magnitude: 8.0,
+            pivots: None,
+        })
+    }
+}
+
+#[test]
+fn a_site_free_leaf_with_a_wide_bond_makes_the_approximation_norm_unavailable() {
+    let problem = Problem::new(
+        &[("a", &[2]), ("b", &[2]), ("e", &[])],
+        &[("a", "b"), ("b", "e")],
+    );
+    let f = |p: &[usize]| ((1 + p[0]) * (3 + p[1])) as f64;
+    let (_, norm) = dense_reference(&problem, &f);
+    let result = run(
+        &WideLeafEngine,
+        &problem,
+        &f,
+        &[],
+        &l2_given(3, norm, 1e-10),
+    )
+    .unwrap();
+    let error = result.report.norm.l2_error().unwrap();
+    // The patch is exact and certified, but TreeTN::log_norm is unreliable
+    // for this network, so no norm-derived field is reported.
+    assert_eq!(error.approximation_rms, None);
+    assert!(matches!(
+        error.global,
+        GlobalL2Error::Certified {
+            rounding_allowance_rms: None,
+            rounding_limited: None,
+            relative_error_bound: None,
+            ..
+        }
+    ));
+}
+
+/// Minimal reproduction of a `tensor4all-treetn` defect (not fixed here):
+/// `TreeTN::log_norm` overestimates the norm when a site-free leaf that is
+/// not the smallest node name has a bond of dimension two or more.
+#[test]
+#[ignore = "known tensor4all-treetn defect: TreeTN::log_norm is wrong for a site-free leaf with a \
+            bond wider than one (follow-up issue to file; see the M3 design record)"]
+fn treetn_log_norm_of_a_site_free_leaf_with_a_wide_bond() {
+    use tensor4all_core::{DynIndex, IdxTensor};
+    use tensor4all_treetn::TreeTN;
+    // f(x, y) = a(x) sum_k b(y, k) e(k) = [1, 0]_x [3, 4]_y, norm 5.
+    let (sa, sb) = (DynIndex::new_dyn(2), DynIndex::new_dyn(2));
+    let (ab, be) = (DynIndex::new_dyn(1), DynIndex::new_dyn(2));
+    let a = IdxTensor::from_dense(vec![sa, ab.clone()], vec![1.0, 0.0]).unwrap();
+    let b = IdxTensor::from_dense(vec![sb, ab, be.clone()], vec![3.0, 0.0, 0.0, 4.0]).unwrap();
+    let e = IdxTensor::from_dense(vec![be], vec![1.0, 1.0]).unwrap();
+    let mut network = TreeTN::<IdxTensor, String>::from_tensors(
+        vec![a, b, e],
+        vec!["a".to_string(), "b".to_string(), "e".to_string()],
+    )
+    .unwrap();
+    let dense = network.contract_to_tensor().unwrap().norm().unwrap();
+    assert!((dense - 5.0).abs() < 1e-12);
+    let log_norm = network.log_norm().unwrap();
+    assert!(
+        (log_norm.exp() - 5.0).abs() < 1e-12,
+        "log_norm.exp() = {}",
+        log_norm.exp()
+    );
+}
+
+/// An evaluator of `f` that fails on its call number `fail_on` and counts
+/// its calls.
+fn failing_on(
+    f: fn(&[usize]) -> f64,
+    n_sites: usize,
+    fail_on: usize,
+    calls: &std::sync::atomic::AtomicUsize,
+) -> impl Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<f64>> + Send + Sync + '_ {
+    move |batch| {
+        let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(call != fail_on, "user failure on call {call}");
+        Ok(batch.data().chunks(n_sites).map(f).collect())
+    }
+}
+
+/// Run a scenario without failure to count its evaluator calls, check that
+/// the last call is the measurement under test, then fail exactly that call.
+fn assert_last_call_failure_is_reported<E>(
+    engine: impl Fn() -> E,
+    problem: &Problem,
+    f: fn(&[usize]) -> f64,
+    options: &PatchedInterpolationOptions,
+    expected_calls: usize,
+) where
+    E: tensor4all_treetn::interpolation::TreeInterpolator<f64> + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = AtomicUsize::new(0);
+    run_with(
+        &engine(),
+        problem,
+        failing_on(f, problem.sites.len(), usize::MAX, &calls),
+        &[],
+        options,
+    )
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+    let calls = AtomicUsize::new(0);
+    let (projector, source) = expect_interpolation(run_with(
+        &engine(),
+        problem,
+        failing_on(f, problem.sites.len(), expected_calls - 1, &calls),
+        &[],
+        options,
+    ));
+    assert!(projector.is_empty());
+    match source {
+        InterpolationError::Evaluator { source } => {
+            assert!(format!("{source:#}").contains("user failure"), "{source:#}")
+        }
+        other => panic!("expected Evaluator, got {other:?}"),
+    }
+}
+
+#[test]
+fn evaluator_failures_in_l2_measurements_are_evaluator_errors() {
+    let problem = branched();
+    // Monte Carlo reference: the first call of the run.
+    let monte_carlo = PatchedInterpolationOptions::new(2)
+        .with_error_norm(ErrorNorm::l2(L2Reference::MonteCarlo))
+        .with_tolerance(tol(1e-6));
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let (_, source) = expect_interpolation(run_with(
+        &DenseEngine::new(),
+        &problem,
+        failing_on(|p| product(p, 0), problem.sites.len(), 0, &calls),
+        &[],
+        &monte_carlo,
+    ));
+    assert!(matches!(source, InterpolationError::Evaluator { .. }));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Zero screen: candidates, then the exhaustive screen of the zero root.
+    assert_last_call_failure_is_reported(
+        DenseEngine::new,
+        &problem,
+        |_| 0.0,
+        &l2_given(2, 1.0, 1e-6),
+        2,
+    );
+    // Verification: candidates (re-read from the cache by the engine), then
+    // the exhaustive measurement.
+    assert_last_call_failure_is_reported(
+        || ScriptedEngine::new(vec![Step::converged(Network::Constant(1.0))]),
+        &problem,
+        |_| 1.0,
+        &l2_given(2, 96f64.sqrt(), 1e-6),
+        2,
+    );
+    // Audit: candidates, the sampled verification, then the audit.
+    let wide = chain("s", 12, 2);
+    let sampled = l2_given(2, 64.0, 1e-6).with_verification(
+        VerificationOptions::new()
+            .with_samples(16)
+            .with_max_exhaustive_points(0),
+    );
+    assert_last_call_failure_is_reported(
+        || ScriptedEngine::new(vec![Step::converged(Network::Constant(1.0))]),
+        &wide,
+        |_| 1.0,
+        &sampled,
+        3,
+    );
+}
+
+#[test]
+fn malformed_outcome_pivots_fail_a_rerun_without_recycling() {
+    let problem = single_node(&[4, 4]);
+    let two = |_: &[usize]| 2.0;
+    let engine = ScriptedEngine::new(vec![
+        Step::converged(Network::Constant(1.0)).with_pivots(vec![vec![9, 9]])
+    ]);
+    let options = l2_given(2, 8.0, 1e-6);
+    assert!(!options.recycle_pivots);
+    assert!(options.verification.retries >= 1);
+    let (projector, source) = expect_interpolation(run(&engine, &problem, &two, &[], &options));
+    assert!(projector.is_empty());
+    assert!(matches!(source, InterpolationError::Engine { .. }));
+    assert!(source.to_string().contains("coordinate 9"), "{source}");
+}
+
+#[test]
+fn a_capped_rerun_after_a_failed_verification_keeps_no_split_index_left() {
+    let problem = single_node(&[2, 4, 4]);
+    let p0 = problem.site("only", 0);
+    let two = |_: &[usize]| 2.0;
+    // Root: fails, rerun capped, split. Child 0: fails, rerun capped, and no
+    // split site is left.
+    let wrong = Step::converged(Network::Constant(1.0));
+    let engine = ScriptedEngine::new(vec![wrong.clone(), Step::capped(), wrong, Step::capped()]);
+    let options = l2_given(2, 2.0 * 32f64.sqrt(), 1e-6).with_patch_order(vec![p0.clone()]);
+    match run(&engine, &problem, &two, &[], &options) {
+        Err(PatchedInterpolationError::NoSplitIndexLeft { projector }) => {
+            assert_eq!(projector, Projector::from_pairs([(p0, 0)]).unwrap());
+        }
+        other => panic!("expected NoSplitIndexLeft, got {other:?}"),
+    }
+    let calls = engine.calls();
+    assert_eq!(calls.len(), 4);
 }
