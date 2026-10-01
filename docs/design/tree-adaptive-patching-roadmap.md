@@ -170,8 +170,9 @@ reported errors (bounds and estimates) against dense references on small
 problems.
 
 Design: [tree-patching-error-contract.md](./tree-patching-error-contract.md)
-(proposal; the interpolation side in full, the patched-algebra mode scoped for
-a separate record).
+(the interpolation side implemented; the patched-algebra mode, M3b, scoped for
+a separate record and not implemented; the open questions are still with the
+user).
 
 ### M4. Patch representation decision (M)
 

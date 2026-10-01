@@ -102,10 +102,10 @@ storage payload length and AD state are not used as the metric.
 `adaptive_interpolation::patched_interpolate` interpolates a function on an
 arbitrary named tree directly into a partition. It runs an engine implementing
 `tensor4all_treetn::interpolation::TreeInterpolator`, such as
-`tensor4all_treetci::TreeTciInterpolator`, on the whole domain. An outcome is
-accepted only when it converged strictly below `max_bond_dim`; otherwise the
-next unfixed site of `patch_order` is fixed and every child is interpolated in
-turn. For quantics grids, list the most significant bits first.
+`tensor4all_treetci::TreeTciInterpolator`, on the whole domain. A patch that
+cannot be accepted is split: the next unfixed site of `patch_order` is fixed
+and every child is interpolated in turn. For quantics grids, list the most
+significant bits first.
 
 The evaluator receives a column-major `[n_sites, n_points]` batch of
 zero-based full-domain points in the derived site order: nodes in ascending
@@ -113,12 +113,19 @@ name order, each node's sites in the given order. Each patch caches its
 samples and hands them to its children, so no point is evaluated twice, and a
 patch with at most one unfixed site is evaluated exactly without the engine.
 
+The accuracy requirement is an `ErrorNorm` with an
+`ErrorTolerance { rtol, atol }`. The default, `ErrorNorm::L2`, bounds the L2
+error over the whole domain by `delta = max(atol, rtol * S)`, where `S` is an
+L2 norm of the function, usually given as `L2Reference::Given(S)`. The driver
+measures every accepted and zero patch itself.
+
 ```rust
 # use std::collections::BTreeMap;
 # use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex, IdxTensor};
 # use tensor4all_partitionedtreetn::adaptive_interpolation::{
-#     patched_interpolate, PatchedInterpolationOptions,
+#     patched_interpolate, GlobalL2Error, PatchedInterpolationOptions,
 # };
+# use tensor4all_partitionedtreetn::{ErrorNorm, ErrorTolerance, L2Reference};
 # use tensor4all_treetci::TreeTciInterpolator;
 # use tensor4all_treetn::NodeNameNetwork;
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -140,9 +147,11 @@ let node_sites = BTreeMap::from([
 
 // Site order [x, y, z]. f vanishes for x = 0 and has rank three otherwise.
 let f = |p: &[usize]| (p[0] * (1 + p[1] + p[2]).pow(2)) as f64;
+let values: Vec<f64> = (0..18).map(|k| f(&[k % 2, (k / 2) % 3, k / 6])).collect();
+let norm = values.iter().map(|v| v * v).sum::<f64>().sqrt();
 let options = PatchedInterpolationOptions::new(3)
-    .with_rtol(1e-10)
-    .with_reference_scale(25.0)
+    .with_error_norm(ErrorNorm::l2(L2Reference::Given(norm)))
+    .with_tolerance(ErrorTolerance { rtol: 1e-10, atol: 0.0 })
     .with_patch_order(vec![x.clone(), y.clone()]);
 let result = patched_interpolate(
     &TreeTciInterpolator::default(),
@@ -155,32 +164,66 @@ let result = patched_interpolate(
     &options,
 )?;
 
-// The x = 0 half is a zero patch; the rest is split at y.
-assert_eq!(result.report.zero_projectors.len(), 1);
+// The x = 0 half is a measured zero patch; the rest is split at y.
+assert_eq!(result.report.zero_patches.len(), 1);
 assert_eq!(result.partition.len(), 3);
+// Every patch was measured exhaustively: the global error is certified.
+let error = result.report.norm.l2_error().unwrap();
+assert!(matches!(error.global, GlobalL2Error::Certified { .. }));
 
-let values: Vec<f64> = (0..18).map(|k| f(&[k % 2, (k / 2) % 3, k / 6])).collect();
 let reference = IdxTensor::from_dense(vec![x, y, z], values)?;
 let dense = result.partition.to_treetn()?.contract_to_tensor()?;
-assert!(dense.sub(&reference)?.maxabs()? < 1e-8);
+assert!(dense.sub(&reference)?.norm()? <= result.report.norm.delta().unwrap() + 1e-12 * norm);
 # Ok(())
 # }
 ```
 
-A patch whose candidate samples are all exactly zero is reported in
-`report.zero_projectors` and left out of the partition, which treats an absent
-patch as zero. This is a finite-sampling policy: pass initial pivots in the
-support of a sparse function. Acceptance uses the engine's sampled error
-estimate against `rtol * reference_scale`; it is not a verified error bound and
-makes no L2 claim. Pass a known `reference_scale`: without one, the scale is
-pinned to the largest magnitude among the root patch's candidate samples (or
-its exact values when the root has at most one site), a sampled lower bound on
-`max |f|` that tightens the tolerance for localized functions. Execution is
-sequential; for a fixed `seed`, a deterministic evaluator, and a deterministic
-engine, the report and every stored node tensor (values and positional axis
-order) are identical across runs. What is derived from the stored `TreeTN`s
-may still differ across runs, for a single patch as for the whole partition,
-on any topology ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)):
+Under `ErrorNorm::L2` the allowance is split by patch volume: every accepted
+or zero patch must have a root-mean-square residual of at most
+`tau = delta / sqrt(|X|)`, which is also the engine's absolute tolerance. A
+patch with at most `max(max_exhaustive_points, samples)` points (see
+`VerificationOptions`) is measured at every point; a larger patch on fresh
+uniform samples, followed by an independent audit sample. A failed
+measurement reruns the engine with the worst measured points added to its
+pivots, then splits the patch. What a run can claim is the report's
+`GlobalL2Error`:
+
+- `Certified`: every contribution is exact or exhaustive, and the absolute
+  error is at most `delta` up to a small relative margin and a modelled
+  rounding term (`rounding_limited` says when that term is not below `tau`);
+  `relative_error_bound` bounds `E / ||f||` when `||f~||` exceeds `E`.
+- `Audited`: some contribution was sampled, and every sampled one was
+  audited. The audited value is an unbiased estimate with a standard error,
+  never a bound: a residual concentrated on unsampled points is missed.
+- `AcceptanceOnly`: audits were disabled. The combined acceptance statistics
+  are neither a bound nor an estimate.
+
+The reference norm defaults to `L2Reference::Required`, which fails before any
+evaluation unless `rtol = 0` (use `atol` alone) or the root has at most one
+site (the reference is then exact). `L2Reference::MonteCarlo` estimates it
+from uniform root samples; the estimate is heavy-tailed for localized
+functions and can make the allowance looser than requested. With a tiny or
+zero tolerance the driver may split down to exact patches, so set
+`max_patches`.
+
+`ErrorNorm::sampled_max()` keeps the M2 criterion: the engine's sampled error
+estimate against `max(atol, rtol * max_reference)`, where `max_reference` is a
+function value (`sampled_max_with_reference(max_abs)`, or the largest root
+sample). It runs no measurement, is not a verified bound, and makes no L2
+claim. Under every norm, a patch whose candidate samples are all exactly zero
+is first screened (and under L2 measured); zero patches are reported in
+`report.zero_patches` and left out of the partition, which treats an absent
+patch as zero.
+
+Execution is sequential. For a fixed `seed`, a deterministic evaluator, and a
+deterministic engine, the report and every stored node tensor (values and
+positional axis order) are identical across runs as long as the measured
+network values are reproducible. They are on trees with exactly one site per
+node; on trees with a site-free node or a node with several sites the cached
+evaluator can round differently between threads and processes, an open issue.
+What is derived from the stored `TreeTN`s may still differ across runs, for a
+single patch as for the whole partition, on any topology
+([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)):
 materializing (`to_dense`, `contract_to_tensor`, `to_treetn`) in axis order and
 at rounding level, and the iteration order of `external_indices`, `site_space`,
 and `neighbors`.

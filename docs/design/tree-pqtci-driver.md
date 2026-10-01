@@ -176,6 +176,16 @@ the default (Decision 3); the options and report types are
 `#[non_exhaustive]` so that M3 extends them without silently changing the
 meaning of `rtol` and `reference_scale`.
 
+**Superseded in M3** ([tree-patching-error-contract.md](./tree-patching-error-contract.md)).
+This criterion is now `ErrorNorm::SampledMax`: `rtol` moved into
+`tolerance: ErrorTolerance { rtol, atol }`, `reference_scale` became
+`ErrorNorm::SampledMax { max_reference }` with engine tolerance
+`max(atol, rtol * max_reference)`, `PatchRecord::error_estimate` became
+`engine_error_estimate`, and `report.reference_scale` / `zero_projectors`
+became `report.norm` / `zero_patches`. `ErrorNorm::sampled_max()` reproduces
+the M2 outputs (checked against frozen golden outputs); the default is the
+driver-measured L2 norm. The rest of this record describes M2 as built.
+
 ## Algorithm
 
 1. **Validate** the inputs before any evaluation. The topology and sites are

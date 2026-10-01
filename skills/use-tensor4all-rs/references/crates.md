@@ -162,18 +162,26 @@ engine implementing `tensor4all_treetn::interpolation::TreeInterpolator`
   initial_pivots, evaluate, &PatchedInterpolationOptions)` — sequential tree
   pQTCI. `evaluate` receives a column-major `[n_sites, n_points]` batch of
   0-based full-domain points in the derived site order (nodes ascending, each
-  node's sites in order). A patch is accepted only on
-  `InterpolationTermination::Converged` (strictly below `max_bond_dim`, at
-  least 2); otherwise the next site of the (partial) `patch_order` is fixed.
-  `PatchedInterpolationOptions::new(max_bond_dim)` plus `with_*` builders:
-  `rtol` (default `1e-8`; engine tolerance `rtol * reference_scale`, a sampled
-  criterion — no verified bound, no L2 claim), `reference_scale` (pass a known
-  `max |f|`; else pinned from the root samples), `n_initial_pivots` (5),
-  `recycle_pivots` (false), `seed` (0; per-patch sub-seeds, no `&mut R` API),
-  `max_patches`. All-zero candidate samples make a zero patch
-  (`report.zero_projectors`, absent from the partition): supply pivots in the
-  support of sparse functions. Patches with at most one free site are
-  evaluated exactly; every point is evaluated at most once.
+  node's sites in order). An unaccepted patch splits at the next site of the
+  (partial) `patch_order`. `PatchedInterpolationOptions::new(max_bond_dim)`
+  (at least 2) plus `with_*` builders: `error_norm` (crate-root `ErrorNorm`;
+  default `ErrorNorm::L2 { reference: L2Reference::Required }`), `tolerance`
+  (`ErrorTolerance { rtol, atol }`, default `1e-8`, `0`), `verification`
+  (`VerificationOptions`: `samples` 64, `max_exhaustive_points` 1024,
+  `retries` 1, `audit` true), `n_initial_pivots` (5), `recycle_pivots`
+  (false), `seed` (0; per-patch streams, no `&mut R` API), `max_patches`.
+  Under L2 pass `ErrorNorm::l2(L2Reference::Given(l2_norm_of_f))` (an L2 norm,
+  not `max |f|`), or `rtol = 0` with `atol`; `L2Reference::MonteCarlo` is an
+  opt-in estimate. The driver measures every accepted and zero patch
+  (exhaustive up to `max_exhaustive_points`, else sampled plus audit) and
+  reports `report.norm` (`NormReport::L2 { tau, error: L2ErrorReport { global:
+  GlobalL2Error::{Certified, Audited, AcceptanceOnly}, .. }, .. }`): only
+  `Certified` is a bound. `ErrorNorm::sampled_max()` /
+  `sampled_max_with_reference(max_abs)` keep the M2 engine criterion (no
+  verified bound, no L2 claim). `MaxAbs`/`WeightedL2` are placeholders
+  (`UnsupportedNorm`). Zero patches are in `report.zero_patches` (absent from
+  the partition); supply pivots in the support of sparse functions. Patches
+  with at most one free site are exact; every point is evaluated at most once.
 - `truncate_adaptive(&partition, &center, cutoff, max_bond_dim)` — assign
   volume-proportional absolute local cutoffs and drop patches at/below theirs.
 - `contract_adaptive(&left, &right, &center, &contract_options, &patching_options)` —

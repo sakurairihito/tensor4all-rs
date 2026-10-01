@@ -2,33 +2,26 @@
 
 ## Status
 
-Approved for implementation, for milestone M3 of
-[tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md),
-after four rounds of independent review. It changes the public API and the
-acceptance semantics of the M2 driver
-([tree-pqtci-driver.md](./tree-pqtci-driver.md)). The user chose to check the
-open questions while implementing: each one starts from the proposal written
-here, and implementation reports the evidence that bears on it. The
-implementation record states which proposals were kept and which were
-changed, and why. It covers the interpolation side of M3 in full. The
-patched-algebra side (the optional global-budget mode for addition and
-contraction) is scoped here and gets its own design record before
-implementation ([Patched algebra](#patched-algebra-m3b)).
+Implemented for the interpolation side of milestone M3 of
+[tree-adaptive-patching-roadmap.md](./tree-adaptive-patching-roadmap.md), on
+`feat/tree-adaptive-patching`. It changes the public API and the acceptance
+semantics of the M2 driver ([tree-pqtci-driver.md](./tree-pqtci-driver.md)).
+The proposals were implemented as written; the decisions taken during
+implementation, the deviations and their reasons, and the evidence gathered
+for the open questions are recorded under
+[Implementation decisions](#implementation-decisions). The patched-algebra
+side (M3b) is scoped here and is not implemented
+([Patched algebra](#patched-algebra-m3b)).
 
-Implementation has two prerequisites, both stated below: frozen M2 golden
-outputs committed before the refactor ([Tests](#tests)), and a fix that
-makes the TreeTN evaluator used by the measurement reproducible on trees that
-take its generic path ([Determinism](#determinism)); which fix is an open
-question for the user. The golden outputs are committed first. The
-evaluator fix does not block the rest of the implementation: the
-cross-thread determinism test runs early, and if the fix is still open, its
-result on generic-path trees is reported to the user before M3 is declared
-done.
+The two prerequisites: the frozen M2 golden outputs were committed before the
+refactor ([Tests](#tests)); the evaluator fix of
+[Determinism](#determinism) is still open (open question 8). The cross-thread
+determinism test ran early: it passes on trees whose nodes carry one site
+each and fails, as predicted, on the generic path, where it is kept as an
+ignored test with that reason.
 
-The decisions that depend on the user are collected under
-[Open questions](#open-questions-for-the-user). No measurement was run for
-this record; the defaults that need data name the measurement and the
-milestone that takes it.
+The open questions remain with the user; every proposal was implemented as
+the default, and the evidence that bears on each is recorded below.
 
 ## Goal
 
@@ -1486,3 +1479,188 @@ None blocks the M3 implementation; the defaults below are provisional.
    threads once M7 runs patches in parallel, so the thread-local plan cache
    alone does not suffice for either scope. The choice sets whether the
    determinism tests also run in separate processes.
+
+## Implementation decisions
+
+Recorded during implementation. "Deviation" marks a place where the code
+differs from the text above, with the reason; everything else fills a gap the
+text left open.
+
+### Public surface
+
+- **Accessor placement (deviation).** The text puts `approximation_norm()`,
+  `delta()`, and `error_norm()` "on `GlobalL2Error`", which does not know
+  `|X|`. They live where the data is: `L2ErrorReport::error_norm()` (the
+  global value of whichever variant, in L2 units) and
+  `L2ErrorReport::approximation_norm()`, `NormReport::delta()` and
+  `NormReport::reference_norm()` (`None` under `SampledMax`, without a
+  reference, or on overflow). Added for convenience: `GlobalL2Error::rms_value()`,
+  `NormReport::l2_error()`, `L2Measurement::error_norm()`, and
+  `ErrorTolerance::allowance(reference)`.
+- `L2ReferenceSource::MonteCarlo` is a `#[non_exhaustive]` variant, like the
+  other variants with data.
+- `GLOBAL_ROUNDING_MARGIN = 1e-8` and `MEASUREMENT_ROUNDING_FACTOR` are public
+  constants of `adaptive_interpolation`; `MEASUREMENT_CHUNK = 256` is private.
+- The new stream selectors are `ZERO_SCREEN_STREAM = "zeroscrn"`,
+  `VERIFY_STREAM = "verifyst"`, `AUDIT_STREAM = "auditstr"`, and
+  `SCALE_STREAM = "scalestr"` (ASCII as big-endian `u64`), pinned by a unit
+  test against an independent Python implementation.
+- `measurement_evaluations` counts the new evaluations of zero screens,
+  verifications, audits, and the Monte Carlo reference estimate (the text did
+  not classify the latter).
+
+### Validation and pinning
+
+- **Validation order (deviation in detail).** Step 1 lists "the norm, then
+  the tolerance, the reference, the verification options, and `|X|`". The
+  implemented order is: the norm (`UnsupportedNorm`, before everything,
+  including the layout), the layout (`validate_layout`), `patch_order`, the
+  tolerance, a given reference, the remaining M2 option checks, the
+  verification options, the initial pivots, and under L2 the domain size and
+  then `L2Reference::Required`. The layout and `patch_order` keep their M2
+  place; the `Required` check needs the layout (whether the root is exact).
+- References known before any evaluation (a given norm, `NotNeeded`, a given
+  `max_reference`) are pinned before the queue starts; the exact root and the
+  Monte Carlo estimate pin at the root. The Monte Carlo sample is drawn
+  through the root cache before the root's candidates are sampled.
+- The SampledMax root that cannot pin its reference keeps the M2 error, with
+  the remedy now naming `ErrorNorm::sampled_max_with_reference`. An all-zero
+  exact root without a given reference reports `max_reference = 0` with
+  source `ExactRoot`.
+
+### Algorithm
+
+- **Measured network.** A measurement evaluates the stored re-embedded patch
+  at full-domain points with every site requested (fixed sites at their
+  coordinates). On a tree with one site per node every stored node then keeps
+  exactly one site leg, so the cached evaluator's raw kernels apply to stored
+  patches too; this was checked in the determinism test.
+- **Zero screen.** The points added to the candidates are the distinct
+  measured points with `f != 0`, largest `|f|` first (ties in measurement
+  order), at most `max_bond_dim - 1`. They cannot duplicate a candidate,
+  whose samples are all zero.
+- **Worst points.** Duplicates (a sampled measurement draws with
+  replacement) are removed before the truncation to `max_bond_dim - 1`.
+- **Outcome pivots in a rerun.** They are checked for shape and range
+  whenever a rerun uses them, independently of `recycle_pivots`; a malformed
+  list is `Interpolation { source: Engine }`, as it is for recycling in M2.
+- **Recycled pivots after a failed verification** come from the last engine
+  run: the converged outcome whose verification failed, or the rerun that did
+  not converge.
+- **End of the order.** With no split site left, the error is
+  `VerificationFailed` when the last engine run converged and failed its
+  measurement, and `NoSplitIndexLeft` when it did not converge (even after an
+  earlier failed verification).
+- **Approximation norm.** A patch whose `log_norm` is `-inf` (norm zero)
+  contributes zero; `+inf`, NaN, or an error makes `approximation_rms`
+  `None`.
+- **Exact patches** get an `Exact` measurement with `points = |P|` and add no
+  evaluation; an exact all-zero patch is a zero patch with an `Exact`
+  measurement.
+
+### Tests and calibration
+
+- **Golden outputs.** `tests/adaptive_m2_golden.rs` and
+  `tests/golden/adaptive_m2.json`, recorded on the unmodified M2 driver and
+  reproduced under `ErrorNorm::sampled_max()`. `M2_GOLDEN_RTOL = 1e-10`;
+  `GOLDEN_DECISION_SEPARATION = 10`. The dense-engine scenarios use dyadic
+  variants of the M2 functions, so ranks are decided on exactly representable
+  data. The actual record goes through the same JSON text round trip as the
+  committed one before comparison, because the default JSON float parser can
+  differ by one unit in the last place; with that, the reproduction is
+  bitwise on the recording machine. Re-recording is an ignored test that
+  requires `T4A_RECORD_M2_GOLDEN=1`.
+- **A golden scenario was excluded (deviation from "the M2 test
+  scenarios").** The M2 TreeTCI scenario on a seven-bit quantics chain fails
+  the separation screen at every `rtol` tried from `1e-6` to `1e-12` (at the
+  M2 `rtol = 1e-8`, two engine calls have error-to-tolerance ratios 0.22 and
+  0.64). As the screen requires, it is not admitted. Both TreeTCI scenarios on
+  the branched `quantics_tree` (with and without recycling) are admitted; their
+  largest ratio is `1.4e-8`.
+- **`MEASUREMENT_ROUNDING_FACTOR = 648`.** The ignored measurement
+  `tests/adaptive_rounding_calibration.rs` compares the cached evaluator (as
+  the driver uses it) and `contract_to_tensor` with double-double values for
+  random networks (bond dimensions 2, 4, 8) on the extended `quantics_tree`,
+  a raw-kernel tree, and `branched`, for cancelling networks `A - A'` with
+  `A'` perturbed by 10% and 1% per entry, and for the TreeTCI patches of
+  test 1. The ratio `||evaluated - exact|| / (eps ||exact||)` was at most 1.8
+  for random networks, 13.2 at 10% cancellation, 161.2 at 1% cancellation,
+  and 0.93 for interpolated patches. The constant is 162 (the largest ratio
+  rounded up) times a headroom factor of 4. Heavier cancellation exceeds it,
+  as the text anticipates.
+- **Test 14.** The fresh-thread run tests pass on the raw-kernel tree with
+  the dense engine and with TreeTCI. The generic-path variants are ignored
+  with a reference to open question 8. With TreeTCI on the extended
+  `quantics_tree` they fail (the certified `rms_error` differed by 13 units
+  in the last place between two threads). With the dense engine, whose patches
+  there have rank one, they passed in three processes, which is not a
+  guarantee.
+- **Lower-layer finding (not changed here).** `TreeTN::norm` and
+  `TreeTN::norm_squared` return wrong values for a direct sum whose
+  site-free leaf has a bond of dimension two: for the chain `a - b - e` with
+  `e` site-free and two rank-one networks of norms 5 and 10 on disjoint
+  supports, `x.add(&y).norm()` returns `sqrt(250)` instead of `sqrt(125)`; it
+  is correct when the site-free node is the canonicalization center (the
+  smallest name) or absent. `PartitionedTreeTN::to_treetn().norm()` on
+  `branched` patches inherits this. The driver is not affected: it takes
+  `log_norm` per patch, whose site-free leaves have bonds of dimension one
+  for the engines tested; tests compare with dense materializations.
+
+### Evidence for the open questions
+
+Gathered with small release-mode runs on the real producer (TreeTCI through
+the M3 driver), unless stated otherwise. The runs used a branched quantics
+tree with two six-bit variables on the branches of a site-free junction and a
+binary flag (8192 points, junction of degree three), `seed = 1`, an MSB-first
+interleaved split order, and two functions: a smooth one (`rms / max = 0.66`)
+and a localized cusp `exp(-r / 0.03)` (`rms / max = 0.040`). TreeTCI's global
+pivot search is still slow on this branch (issue #792): one run took up to
+130 s. The measurement scripts were not committed; this record is their
+result.
+
+- **OQ2 (budget allocation).** With cap 4, the effective local relative
+  tolerance `tau / rms_P(f)` of the accepted patches lay between 0.78 and 1.9
+  times `rtol` for the smooth function, so volume and norm allocation nearly
+  coincide there. For the localized function it ranged from 0.072 `rtol` (the
+  patches at the peak, a factor close to `sqrt(rho)`) to `6e5 rtol` (the
+  tails). Patches and evaluations at `rtol = 1e-4` (`1e-6`): smooth, L2
+  16 (108) patches and 8192 (8192) evaluations, against 14 (86) and 6368 (8101)
+  under SampledMax; localized, L2 45 (99) patches and 6837 (8192) evaluations,
+  against 22 (56) and 3531 (5745) under SampledMax. The comparison mixes the
+  allocation with the change of norm: SampledMax at `rtol = 1e-4` reached an
+  L2 relative error of `1.2e-3` on the localized function, where L2 reached
+  `3.8e-5`. The small domain caps evaluations at 8192.
+- **OQ3 (reference).** Every L2 test with a root that is not exact passes
+  `L2Reference::Given` (36 uses in the test files), with 18 dense-reference
+  computations that exist only to supply it; every runnable rustdoc and guide
+  example with a non-exact root computes the norm from its dense values. The
+  Monte Carlo estimate (64 uniform samples, 10000 repetitions, the same
+  estimator outside the driver) gave `S_MC / S` within 0.91 to 1.08 (1% and
+  99% quantiles) for the smooth function, and a median of 0.53 with 10% and
+  90% quantiles 0.11 and 1.70 for the localized one: too large by more than
+  1.5 times (a looser allowance) with probability 0.14, and below half with
+  probability 0.48.
+- **OQ4 (capped outcomes).** A test-local wrapper measured every
+  `BondCapReached` outcome exhaustively against its `tau` (cap 4,
+  `rtol = 1e-4`). Of 15 capped outcomes of the smooth run, 13 fit their
+  allowance; of 44 of the localized run, 28 fit. Every one of them was split.
+  The measurement was exhaustive; under the proposal a large patch would be
+  sampled, with the selection effects described above.
+- **OQ5 (audit).** Cap 6, `rtol = 1e-4`, defaults otherwise: the audit added
+  73 of 2937 evaluations (2.5%) on the smooth function and 48 of 5019 (1.0%)
+  on the localized one, with no measurable change in run time (the engine
+  dominates). The audited relative-bound estimates were `2.25e-5` and
+  `3.19e-5` against true relative errors of `2.76e-5` and `3.20e-5`; the
+  acceptance-only statistics were `3.2e-5` and `1.5e-6` in RMS units.
+- **OQ8 and OQ9 (determinism).** The stage-1 test: on the raw-kernel tree,
+  bitwise identical measured values across six fresh threads and three
+  processes; on the generic-path tree, 5 to 198 of 768 values differ between
+  threads (largest relative difference `1.2e-16` of the largest magnitude),
+  and every thread and process gave a different digest. An L2 run with TreeTCI
+  on the extended `quantics_tree` (cap 3, 83 patches) in two fresh threads
+  gave identical patches, decisions, and stored node data (TreeTCI itself was
+  reproducible), but the acceptance `rms` differed in 55 of 83 patches, up to
+  100% relative, because those residuals are at rounding level; no decision
+  flipped, since every residual was far below `tau`. A decision can flip
+  only when a measured residual lies within the evaluation's rounding (about
+  `eps` times the network values) of `tau`.

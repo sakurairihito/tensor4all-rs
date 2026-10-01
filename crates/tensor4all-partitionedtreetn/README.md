@@ -12,32 +12,60 @@ Adaptive patching is bond-cap-driven and independent of adaptive interpolation.
 `adaptive_interpolation::patched_interpolate` builds a partition directly from
 a batch evaluator on an arbitrary named tree. It runs an interpolation engine
 implementing `tensor4all_treetn::interpolation::TreeInterpolator` (for example
-`tensor4all_treetci::TreeTciInterpolator`) on the whole domain, accepts only
-outcomes that converged strictly below `max_bond_dim`, and otherwise fixes the
-next site of `patch_order` and retries on every child. The crate depends on the
-engine trait only, not on `tensor4all-treetci`.
+`tensor4all_treetci::TreeTciInterpolator`) on the whole domain, and otherwise
+fixes the next site of `patch_order` and retries on every child. The crate
+depends on the engine trait only, not on `tensor4all-treetci`.
+
+The accuracy requirement is `PatchedInterpolationOptions::error_norm` with
+`tolerance: ErrorTolerance { rtol, atol }`:
+
+- `ErrorNorm::L2` (the default) is the unweighted discrete L2 error over the
+  whole domain against `delta = max(atol, rtol * S)`, with `S` an L2 norm of
+  the function. `L2Reference::Given(S)` is the usual choice;
+  `L2Reference::Required` (the default) fails before any evaluation unless
+  `rtol = 0` or the root has at most one site, and `L2Reference::MonteCarlo`
+  is an explicit opt-in estimate that can loosen the allowance for localized
+  functions. The allowance is split by patch volume (`rms_P(f - f~) <= tau`
+  with `tau = delta / sqrt(|X|)`), and the driver measures every accepted and
+  zero patch itself: exhaustively up to
+  `VerificationOptions::max_exhaustive_points`, otherwise on fresh uniform
+  samples with an independent audit. A failed measurement reruns the engine
+  with the worst points as pivots, then splits.
+- `ErrorNorm::SampledMax` is the M2 criterion: the engine's sampled error
+  estimate against `max(atol, rtol * max_reference)`. It is **not** a
+  verified bound and makes no L2 claim.
+- `ErrorNorm::MaxAbs` and `ErrorNorm::WeightedL2` are placeholders that fail
+  with `UnsupportedNorm` before any evaluation.
+
+The report's `GlobalL2Error` states what an L2 run can claim. `Certified`
+(every contribution exact or exhaustive) bounds the absolute error
+`E <= delta (1 + GLOBAL_ROUNDING_MARGIN) + MEASUREMENT_ROUNDING_FACTOR * eps *
+||f~||`, up to a calibrated rounding model, and carries a conservative bound
+on `E / ||f||` when `||f~||` exceeds `E`. `Audited` gives an estimate with a
+standard error, never a bound; `AcceptanceOnly` (audits off) gives neither an
+estimate nor a relative statement. Sampled measurements cannot bound the L2
+error of a black-box function.
 
 - Patches are processed sequentially in FIFO order; each has an evaluation
-  cache, so no point is evaluated twice. Patches with at most one active site
-  are evaluated exactly without the engine.
-- A patch whose candidate samples are all exactly zero is reported in
-  `PatchedInterpolationReport::zero_projectors` and omitted from the partition.
-  This is a finite-sampling policy: sparse functions need initial pivots in
-  their support.
-- Acceptance uses the engine's sampled error estimate against
-  `rtol * reference_scale`. It is **not** a verified error bound and makes no
-  L2 claim. Pass a known `reference_scale`; otherwise it is pinned from the
-  root patch's samples.
-- Randomness comes from a per-patch seed derived from
-  `PatchedInterpolationOptions::seed`; for a fixed seed, a deterministic
+  cache, so no point is evaluated twice, and measured values reach the
+  children of a split. Patches with at most one active site are evaluated
+  exactly without the engine.
+- A patch whose candidate samples are all exactly zero is a zero patch under
+  `SampledMax`; under L2 the zero approximation is measured first. Zero
+  patches are reported in `PatchedInterpolationReport::zero_patches` and
+  omitted from the partition.
+- Randomness comes from per-patch seeds derived from
+  `PatchedInterpolationOptions::seed`. For a fixed seed, a deterministic
   evaluator, and a deterministic engine the report and every stored node
-  tensor (values and positional axis order) are identical across runs. What
-  is derived from the stored `TreeTN`s may still differ across runs, for a
-  single patch as for the whole partition, on any topology
-  ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)): materializing
-  (`to_dense`, `contract_to_tensor`, `to_treetn`) in axis order and at rounding
-  level, and the iteration order of `external_indices`, `site_space`, and
-  `neighbors`.
+  tensor are identical across runs, provided the measured network values are
+  reproducible: they are on trees with exactly one site per node, while the
+  cached evaluator's generic path (a site-free node or a node with several
+  sites) can differ at rounding level between threads and processes, an open
+  issue. What is derived from the stored `TreeTN`s may still differ across
+  runs ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)):
+  materializing (`to_dense`, `contract_to_tensor`, `to_treetn`) in axis order
+  and at rounding level, and the iteration order of `external_indices`,
+  `site_space`, and `neighbors`.
 
 The patch queue and pivot recycling derive from TCIAlgorithms.jl (MIT) through
 the deprecated `tensor4all-partitionedtt`; this crate carries
