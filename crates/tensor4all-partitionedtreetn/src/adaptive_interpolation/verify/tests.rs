@@ -7,9 +7,17 @@ use tensor4all_treetci::TreeTciInterpolator;
 use tensor4all_treetn::interpolation::InterpolationProblem;
 use tensor4all_treetn::{NodeNameNetwork, TreeTN};
 
-use super::network_values;
+use super::{
+    approximation_rms, global_error, network_values, statistics, Contribution, Measured, PointPlan,
+    ScaledSquares, MEASUREMENT_CHUNK,
+};
 use crate::adaptive_interpolation::{patched_interpolate, PatchedInterpolationOptions};
+use crate::adaptive_interpolation::{
+    GlobalL2Error, L2Measurement, MeasurementMethod, GLOBAL_ROUNDING_MARGIN,
+    MEASUREMENT_ROUNDING_FACTOR,
+};
 use crate::{ErrorNorm, ErrorTolerance};
+use tensor4all_treetn::{CachedEvaluatorOptions, EvaluationHint, TreeTNCachedEvaluator};
 
 /// A named tree with its sites in the derived site order.
 struct Tree {
@@ -370,4 +378,337 @@ fn measurement_is_bitwise_reproducible_across_threads_on_generic_path_trees() {
             "max relative difference {difference:e}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Statistics, worst points, and the global error
+// ---------------------------------------------------------------------------
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-14 * a.abs().max(b.abs())
+}
+
+#[test]
+fn statistics_use_scaled_sums_and_report_the_relative_standard_error() {
+    let exhaustive = statistics(&[3.0, 4.0], MeasurementMethod::Exhaustive, 2.0);
+    assert!(close(exhaustive.rms, (12.5_f64).sqrt()));
+    assert_eq!(exhaustive.max_residual, 4.0);
+    assert_eq!(exhaustive.mean_square_rel_std_error, 0.0);
+    assert_eq!(exhaustive.points, 2);
+    assert!(close(exhaustive.error_norm().unwrap(), 5.0));
+
+    // Sampled: squares 1, 4, 9, 16 have mean 7.5 and sample variance 43.
+    let sampled = statistics(&[1.0, 2.0, 3.0, 4.0], MeasurementMethod::Sampled, 100.0);
+    assert!(close(sampled.rms, 7.5_f64.sqrt()));
+    let expected = (43.0 / 4.0_f64).sqrt() / 7.5;
+    assert!(close(sampled.mean_square_rel_std_error, expected));
+
+    // Residuals near the largest float do not overflow the sum of squares.
+    let large = statistics(&[1e300, 1e300], MeasurementMethod::Exhaustive, 2.0);
+    assert!(close(large.rms, 1e300));
+    // A zero residual carries no information.
+    let zero = statistics(&[0.0, 0.0], MeasurementMethod::Sampled, 4.0);
+    assert_eq!((zero.rms, zero.mean_square_rel_std_error), (0.0, 0.0));
+    assert_eq!(statistics(&[], MeasurementMethod::Sampled, 4.0).rms, 0.0);
+    // An overflowing L2 norm is reported as None.
+    let huge = statistics(&[1e300], MeasurementMethod::Exhaustive, 1e300);
+    assert_eq!(huge.error_norm(), None);
+}
+
+#[test]
+fn worst_points_are_distinct_and_sorted_with_ties_in_measurement_order() {
+    let measured = Measured {
+        measurement: statistics(&[], MeasurementMethod::Sampled, 1.0),
+        points: vec![vec![0], vec![1], vec![2], vec![1], vec![3], vec![4]],
+        residuals: vec![0.5, 2.0, 3.0, 2.0, 2.0, 0.1],
+    };
+    assert_eq!(measured.worst_points(1.0, 10), [vec![2], vec![1], vec![3]]);
+    assert_eq!(measured.worst_points(1.0, 2), [vec![2], vec![1]]);
+    assert_eq!(measured.worst_points(0.0, 10).len(), 5);
+}
+
+#[test]
+fn point_plans_are_exhaustive_up_to_the_inclusive_threshold() {
+    assert_eq!(PointPlan::for_patch(16, 16, 0, 7), PointPlan::Exhaustive);
+    assert_eq!(
+        PointPlan::for_patch(17, 16, 0, 7),
+        PointPlan::Sampled { count: 16, seed: 7 }
+    );
+    assert_eq!(
+        PointPlan::for_patch(1024, 64, 1024, 7),
+        PointPlan::Exhaustive
+    );
+    assert!(matches!(
+        PointPlan::for_patch(usize::MAX, 64, 1024, 7),
+        PointPlan::Sampled { .. }
+    ));
+}
+
+#[test]
+fn scaled_squares_match_the_plain_sum() {
+    let mut sum = ScaledSquares::default();
+    for a in [3.0, 0.0, 4.0, 12.0] {
+        sum.add(a);
+    }
+    assert!(close(sum.norm(), 13.0));
+    let mut large = ScaledSquares::default();
+    large.add(1e300);
+    large.add(1e300);
+    assert!(close(large.norm(), 2.0_f64.sqrt() * 1e300));
+}
+
+fn measurement(method: MeasurementMethod, patch_points: f64, rms: f64, rel: f64) -> L2Measurement {
+    let mut measurement = statistics(&[], method, patch_points);
+    measurement.rms = rms;
+    measurement.mean_square_rel_std_error = rel;
+    measurement
+}
+
+#[test]
+fn global_error_combines_disjoint_patches_by_volume() {
+    let a = measurement(MeasurementMethod::Exhaustive, 3.0, 0.1, 0.0);
+    let b = measurement(MeasurementMethod::Exact, 1.0, 0.0, 0.0);
+    let contributions = [
+        Contribution {
+            patch_points: 3.0,
+            acceptance: &a,
+            audit: None,
+        },
+        Contribution {
+            patch_points: 1.0,
+            acceptance: &b,
+            audit: None,
+        },
+    ];
+    let (global, certified) = global_error(&contributions, 4.0, 0.2, Some(1.0));
+    assert_eq!(certified, 1.0);
+    let GlobalL2Error::Certified {
+        rms_error,
+        rounding_allowance_rms,
+        rounding_limited,
+        relative_error_bound,
+    } = global
+    else {
+        panic!("expected a certified error");
+    };
+    assert!(close(rms_error, (0.75_f64 * 0.01).sqrt()));
+    let rounding = MEASUREMENT_ROUNDING_FACTOR * f64::EPSILON;
+    assert_eq!(rounding_allowance_rms, Some(rounding));
+    assert_eq!(rounding_limited, Some(false));
+    let upper = rms_error * (1.0 + GLOBAL_ROUNDING_MARGIN) + rounding;
+    let bound = upper / ((1.0 - GLOBAL_ROUNDING_MARGIN) - upper);
+    assert!(close(relative_error_bound.unwrap(), bound));
+
+    // No approximation norm: no rounding term, flag, or relative bound.
+    let (global, _) = global_error(&contributions, 4.0, 0.2, None);
+    assert!(matches!(
+        global,
+        GlobalL2Error::Certified {
+            rounding_allowance_rms: None,
+            rounding_limited: None,
+            relative_error_bound: None,
+            ..
+        }
+    ));
+    // A denominator that is not positive gives no relative statement.
+    let (global, _) = global_error(&contributions, 4.0, 0.2, Some(0.05));
+    assert!(matches!(
+        global,
+        GlobalL2Error::Certified {
+            relative_error_bound: None,
+            ..
+        }
+    ));
+    // A tau below the rounding term is rounding-limited.
+    let (global, _) = global_error(&contributions, 4.0, 1e-20, Some(1.0));
+    assert!(matches!(
+        global,
+        GlobalL2Error::Certified {
+            rounding_limited: Some(true),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn sampled_contributions_are_audited_or_acceptance_only() {
+    let exact = measurement(MeasurementMethod::Exhaustive, 2.0, 0.1, 0.0);
+    let sampled = measurement(MeasurementMethod::Sampled, 2.0, 0.05, 0.3);
+    let audit = measurement(MeasurementMethod::Sampled, 2.0, 0.2, 0.5);
+    let audited = [
+        Contribution {
+            patch_points: 2.0,
+            acceptance: &exact,
+            audit: None,
+        },
+        Contribution {
+            patch_points: 2.0,
+            acceptance: &sampled,
+            audit: Some(&audit),
+        },
+    ];
+    let (global, certified) = global_error(&audited, 4.0, 0.1, Some(1.0));
+    assert_eq!(certified, 0.5);
+    let GlobalL2Error::Audited {
+        rms_error_estimate,
+        mean_square_rel_std_error,
+        relative_bound_estimate,
+    } = global
+    else {
+        panic!("expected an audited error");
+    };
+    // Mean square 0.5 * 0.01 + 0.5 * 0.04 = 0.025; the audited term 0.02
+    // has standard error 0.01.
+    assert!(close(rms_error_estimate, 0.025_f64.sqrt()));
+    assert!(close(mean_square_rel_std_error, 0.01 / 0.025));
+    let estimate = 0.025_f64.sqrt();
+    assert!(close(
+        relative_bound_estimate.unwrap(),
+        estimate / (1.0 - estimate)
+    ));
+    let (global, _) = global_error(&audited, 4.0, 0.1, Some(0.1));
+    assert!(matches!(
+        global,
+        GlobalL2Error::Audited {
+            relative_bound_estimate: None,
+            ..
+        }
+    ));
+
+    let unaudited = [
+        Contribution {
+            patch_points: 2.0,
+            acceptance: &exact,
+            audit: None,
+        },
+        Contribution {
+            patch_points: 2.0,
+            acceptance: &sampled,
+            audit: None,
+        },
+    ];
+    let (global, _) = global_error(&unaudited, 4.0, 0.1, Some(1.0));
+    let GlobalL2Error::AcceptanceOnly {
+        acceptance_statistic_rms,
+    } = global
+    else {
+        panic!("expected an acceptance-only error");
+    };
+    assert!(close(
+        acceptance_statistic_rms,
+        (0.5_f64 * 0.01 + 0.5 * 0.0025).sqrt()
+    ));
+}
+
+#[test]
+fn approximation_rms_combines_log_norms_and_reports_overflow() {
+    // Patches of norms 3 and 4 on a domain of 8 points: ||f~|| = 5.
+    let rms = approximation_rms(
+        [(Ok(3.0_f64.ln()), 2.0), (Ok(4.0_f64.ln()), 6.0)].into_iter(),
+        8.0,
+    )
+    .unwrap();
+    assert!(close(rms, 5.0 / 8.0_f64.sqrt()));
+    // A zero patch contributes nothing; an overflowing one gives None.
+    let zero = approximation_rms([(Ok(f64::NEG_INFINITY), 2.0)].into_iter(), 8.0);
+    assert_eq!(zero, Some(0.0));
+    assert_eq!(
+        approximation_rms([(Ok(f64::INFINITY), 2.0)].into_iter(), 8.0),
+        None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Chunked evaluation
+// ---------------------------------------------------------------------------
+
+/// A star of three arms of three binary sites around a binary center: 1024
+/// points, more than `MEASUREMENT_CHUNK`.
+fn star_tree() -> Tree {
+    let names = ["c", "a0", "a1", "a2", "b0", "b1", "b2", "d0", "d1", "d2"];
+    let nodes: Vec<(&str, &[usize])> = names.iter().map(|name| (*name, &[2usize][..])).collect();
+    tree(
+        &nodes,
+        &[
+            ("c", "a0"),
+            ("a0", "a1"),
+            ("a1", "a2"),
+            ("c", "b0"),
+            ("b0", "b1"),
+            ("b1", "b2"),
+            ("c", "d0"),
+            ("d0", "d1"),
+            ("d1", "d2"),
+        ],
+    )
+}
+
+#[test]
+fn chunked_measurement_matches_a_single_batch_on_exact_data() {
+    let tree = star_tree();
+    assert_eq!(max_degree(&tree), 3);
+    // Small integers make every contraction exact, whatever the batching.
+    let mut links: HashMap<(String, String), DynIndex> = HashMap::new();
+    let graph = tree.topology.graph();
+    for edge in graph.edge_indices() {
+        let (a, b) = graph.edge_endpoints(edge).unwrap();
+        let (a, b) = (
+            tree.topology.node_name(a).unwrap().clone(),
+            tree.topology.node_name(b).unwrap().clone(),
+        );
+        links.insert((a, b), DynIndex::new_dyn(2));
+    }
+    let mut names = Vec::new();
+    let mut tensors = Vec::new();
+    for (k, (node, sites)) in tree.node_sites.iter().enumerate() {
+        let mut legs = sites.clone();
+        legs.extend(
+            links
+                .iter()
+                .filter(|((a, b), _)| a == node || b == node)
+                .map(|(_, link)| link.clone()),
+        );
+        let size: usize = legs.iter().map(IndexLike::dim).product();
+        let data: Vec<f64> = (0..size)
+            .map(|i| ((i * 7 + k * 3) % 5) as f64 - 2.0)
+            .collect();
+        names.push(node.clone());
+        tensors.push(IdxTensor::from_dense(legs, data).unwrap());
+    }
+    let network = TreeTN::from_tensors(tensors, names).unwrap();
+    let dims: Vec<usize> = tree.sites.iter().map(IndexLike::dim).collect();
+    let points: Vec<usize> = domain(&dims).into_iter().flatten().collect();
+    let n_points = points.len() / tree.sites.len();
+    assert!(n_points > 2 * MEASUREMENT_CHUNK);
+
+    let chunked = network_values::<f64, String>(&network, &tree.sites, &points).unwrap();
+    let center = network.node_names().into_iter().min();
+    let options = CachedEvaluatorOptions {
+        center,
+        ..CachedEvaluatorOptions::default()
+    };
+    let mut evaluator = TreeTNCachedEvaluator::new(&network, &tree.sites, options).unwrap();
+    let shape = [tree.sites.len(), n_points];
+    let single: Vec<f64> = evaluator
+        .evaluate_batched_typed(
+            ColMajorArrayRef::new(&points, &shape).unwrap(),
+            EvaluationHint::default(),
+        )
+        .unwrap();
+    assert_eq!(bits(&chunked), bits(&single));
+    // The data is exact: every value is an integer.
+    assert!(chunked.iter().all(|value| value.fract() == 0.0));
+    assert!(chunked.iter().any(|&value| value != 0.0));
+    // The measurements of the two agree exactly.
+    let a = statistics(
+        &chunked.iter().map(|v| v.abs()).collect::<Vec<_>>(),
+        MeasurementMethod::Exhaustive,
+        n_points as f64,
+    );
+    let b = statistics(
+        &single.iter().map(|v| v.abs()).collect::<Vec<_>>(),
+        MeasurementMethod::Exhaustive,
+        n_points as f64,
+    );
+    assert_eq!(a, b);
 }

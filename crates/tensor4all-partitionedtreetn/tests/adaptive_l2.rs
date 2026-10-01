@@ -1,0 +1,1283 @@
+//! `patched_interpolate` under `ErrorNorm::L2` with the dense and scripted
+//! test engines: the verification, retry, split, zero-patch, reference, and
+//! error paths of the M3 error contract.
+
+mod adaptive_common;
+
+use std::collections::HashSet;
+
+use adaptive_common::*;
+use num_complex::Complex64;
+use tensor4all_core::{ColMajorArray, ColMajorArrayRef};
+use tensor4all_partitionedtreetn::adaptive_interpolation::{
+    patched_interpolate, GlobalL2Error, L2ReferenceSource, MeasurementMethod, NormReport,
+    PatchedInterpolationError, PatchedInterpolationOptions, PatchedInterpolationReport,
+    VerificationOptions, GLOBAL_ROUNDING_MARGIN, MEASUREMENT_ROUNDING_FACTOR,
+};
+use tensor4all_partitionedtreetn::{ErrorNorm, ErrorTolerance, L2Reference, Projector};
+use tensor4all_treetn::interpolation::InterpolationError;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// L2 options with a given reference norm and relative tolerance.
+fn l2_given(cap: usize, norm: f64, rtol: f64) -> PatchedInterpolationOptions {
+    PatchedInterpolationOptions::new(cap)
+        .with_error_norm(ErrorNorm::l2(L2Reference::Given(norm)))
+        .with_tolerance(tol(rtol))
+}
+
+/// The `tau` of an L2 report.
+fn tau(report: &PatchedInterpolationReport) -> f64 {
+    match report.norm {
+        NormReport::L2 { tau, .. } => tau,
+        ref other => panic!("expected an L2 report, got {other:?}"),
+    }
+}
+
+/// Every acceptance measurement of the report, accepted and zero patches.
+fn acceptances(report: &PatchedInterpolationReport) -> Vec<f64> {
+    report
+        .accepted
+        .iter()
+        .map(|record| record.acceptance.as_ref().unwrap().rms)
+        .chain(
+            report
+                .zero_patches
+                .iter()
+                .map(|record| record.acceptance.as_ref().unwrap().rms),
+        )
+        .collect()
+}
+
+/// Exact-reference check of a certified run: `||f - f~|| <= delta (1 +
+/// margin) + 2 R`, with `R` the rounding term of one evaluation path.
+fn assert_certified_bound<T>(
+    result: &tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationResult<Name>,
+    problem: &Problem,
+    f: &dyn Fn(&[usize]) -> T,
+) where
+    T: tensor4all_core::CommonScalar + tensor4all_core::TensorElement,
+{
+    let error = result.report.norm.l2_error().unwrap();
+    assert!(
+        matches!(error.global, GlobalL2Error::Certified { .. }),
+        "{:?}",
+        error.global
+    );
+    let (reference, _) = dense_reference(problem, f);
+    let diff = dense_l2_residual(result, &reference);
+    let rounding =
+        MEASUREMENT_ROUNDING_FACTOR * f64::EPSILON * error.approximation_norm().unwrap_or(0.0);
+    let delta = result.report.norm.delta().unwrap();
+    assert!(
+        diff <= delta * (1.0 + GLOBAL_ROUNDING_MARGIN) + 2.0 * rounding,
+        "diff {diff:e}, delta {delta:e}"
+    );
+}
+
+/// The full-domain point `point` restricted to the sites of a call.
+fn local(problem: &Problem, call: &Call, point: &[usize]) -> Vec<usize> {
+    call.site_order
+        .iter()
+        .map(|site| point[problem.position(site)])
+        .collect()
+}
+
+/// An evaluator that must never be called.
+fn never(batch: ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<f64>> {
+    panic!("the evaluator was called with shape {:?}", batch.shape())
+}
+
+fn no_pivots(problem: &Problem) -> ColMajorArray<usize> {
+    ColMajorArray::new(vec![], vec![problem.sites.len(), 0]).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Budget arithmetic on a dense-engine run (test 11)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dense_engine_runs_meet_the_l2_budget() {
+    let problem = branched();
+    assert_eq!(max_degree(&problem), 3);
+    let j0 = problem.site("j", 0);
+    let f = switch_on(problem.position(&j0));
+    let (_, norm) = dense_reference(&problem, &f);
+    let options = l2_given(2, norm, 1e-8).with_patch_order(vec![j0]);
+    let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+    let report = &result.report;
+    assert_eq!(report.splits, 1);
+    let tau = tau(report);
+    assert!(acceptances(report).iter().all(|&rms| rms <= tau));
+
+    // The global error combines the patches by volume.
+    let error = report.norm.l2_error().unwrap();
+    assert_eq!(error.domain_points, 96.0);
+    assert_eq!(error.certified_fraction, 1.0);
+    let combined: f64 = report
+        .accepted
+        .iter()
+        .map(|record| {
+            let m = record.acceptance.as_ref().unwrap();
+            m.patch_points / error.domain_points * m.rms * m.rms
+        })
+        .sum::<f64>()
+        .sqrt();
+    let GlobalL2Error::Certified { rms_error, .. } = error.global else {
+        panic!("expected a certified error");
+    };
+    assert!((rms_error - combined).abs() <= GLOBAL_ROUNDING_MARGIN * combined);
+    assert!(rms_error <= tau * (1.0 + GLOBAL_ROUNDING_MARGIN));
+    // The approximation norm matches the norm of the materialized partition.
+    // (`to_treetn().norm()` is not used: on this tree the direct sum has a
+    // site-free leaf with a bond of dimension two, where `TreeTN::norm`
+    // returns sqrt(2) times the true norm; see the M3 implementation report.)
+    let approximation = error.approximation_norm().unwrap();
+    let direct = result
+        .partition
+        .to_treetn()
+        .unwrap()
+        .contract_to_tensor()
+        .unwrap()
+        .norm()
+        .unwrap();
+    assert!(
+        (approximation - direct).abs() <= 1e-12 * direct,
+        "approximation {approximation:e}, direct {direct:e}"
+    );
+    assert_certified_bound(&result, &problem, &f);
+}
+
+// ---------------------------------------------------------------------------
+// A missed feature (test 3)
+// ---------------------------------------------------------------------------
+
+/// A product function with a narrow spike at `SPIKE` (site order a0, b0, c0,
+/// d0, d1, j0 of `branched`).
+const SPIKE: [usize; 6] = [2, 1, 1, 1, 0, 1];
+
+fn spiked(p: &[usize]) -> f64 {
+    product(p, 0) + if p == SPIKE { 3.0 } else { 0.0 }
+}
+
+#[test]
+fn a_missed_feature_is_caught_and_rerun_with_the_worst_point() {
+    let problem = branched();
+    let (_, norm) = dense_reference(&problem, &spiked);
+    let options = l2_given(3, norm, 1e-10);
+    assert_eq!(options.verification.retries, 1);
+    let engine = SpikeBlindEngine::new(&problem.sites, &SPIKE);
+    let result = run(&engine, &problem, &spiked, &[], &options).unwrap();
+    let calls = engine.calls();
+    // Run 0 misses the spike and converges with rank one; the exhaustive
+    // verification rejects it, and run 1 receives the spike first.
+    assert_eq!(calls.len(), 2);
+    assert!(!calls[0].initial_pivots.contains(&SPIKE.to_vec()));
+    let base = calls[0].initial_pivots.len();
+    assert_eq!(calls[1].initial_pivots[..base], calls[0].initial_pivots[..]);
+    assert_eq!(calls[1].initial_pivots[base], SPIKE.to_vec());
+    assert_ne!(calls[0].seed, calls[1].seed);
+    let report = &result.report;
+    assert_eq!(report.splits, 0);
+    assert_eq!(
+        (report.verification_failures, report.engine_retries),
+        (1, 1)
+    );
+    let record = &report.accepted[0];
+    assert_eq!(record.retries_used, 1);
+    assert_eq!(record.max_bond_dim, 2);
+    assert_eq!(
+        record.acceptance.as_ref().unwrap().method,
+        MeasurementMethod::Exhaustive
+    );
+    assert_certified_bound(&result, &problem, &spiked);
+}
+
+#[test]
+fn without_retries_a_missed_feature_splits_and_the_child_gets_the_worst_point() {
+    let problem = branched();
+    let j0 = problem.site("j", 0);
+    let (_, norm) = dense_reference(&problem, &spiked);
+    let options = l2_given(3, norm, 1e-10)
+        .with_verification(VerificationOptions::new().with_retries(0))
+        .with_patch_order(vec![j0.clone()]);
+    let engine = SpikeBlindEngine::new(&problem.sites, &SPIKE);
+    let result = run(&engine, &problem, &spiked, &[], &options).unwrap();
+    let report = &result.report;
+    assert_eq!(report.splits, 1);
+    assert_eq!(
+        (report.verification_failures, report.engine_retries),
+        (1, 0)
+    );
+    // The child that contains the spike receives it as a candidate.
+    let calls = engine.calls();
+    let child = calls.iter().find(|call| {
+        !call.site_order.contains(&j0) && {
+            let spike = local(&problem, call, &SPIKE);
+            call.initial_pivots.contains(&spike)
+        }
+    });
+    assert!(child.is_some(), "no child received the spike");
+    assert!(report.accepted.iter().all(|r| r.retries_used == 0));
+    assert_certified_bound(&result, &problem, &spiked);
+}
+
+/// `f = 1` except at two points with residuals 5 and 3 against the
+/// constant network 1.
+fn two_spikes(p: &[usize]) -> f64 {
+    match p {
+        [1, 2] => 6.0,
+        [3, 0] => 4.0,
+        _ => 1.0,
+    }
+}
+
+/// The added list of a rerun computed from the documented rule.
+fn expected_added(
+    base: &[Vec<usize>],
+    worst: &[Vec<usize>],
+    outcome: &[Vec<usize>],
+    limit: usize,
+) -> Vec<Vec<usize>> {
+    let mut seen: HashSet<Vec<usize>> = base.iter().cloned().collect();
+    worst
+        .iter()
+        .chain(outcome)
+        .filter(|p| seen.insert((*p).clone()))
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn rerun_pivots_put_the_worst_points_before_the_outcome_pivots_without_accumulating() {
+    let problem = single_node(&[4, 4]);
+    let (_, norm) = dense_reference(&problem, &two_spikes);
+    let first_outcome = vec![vec![0, 0], vec![2, 2], vec![3, 3], vec![0, 3], vec![1, 1]];
+    let second_outcome = vec![vec![2, 1], vec![1, 3], vec![3, 2]];
+    let constant = Step::converged(Network::Constant(1.0));
+    let engine = ScriptedEngine::new(vec![
+        constant.clone().with_pivots(first_outcome.clone()),
+        constant.clone().with_pivots(second_outcome.clone()),
+        constant,
+        Step::converged(Network::Exact),
+    ]);
+    let cap = 5;
+    let options = l2_given(cap, norm, 1e-6)
+        .with_n_initial_pivots(2)
+        .with_verification(VerificationOptions::new().with_retries(2))
+        .with_patch_order(vec![problem.site("only", 0)]);
+    let result = run(&engine, &problem, &two_spikes, &[vec![0, 0]], &options).unwrap();
+    let calls = engine.calls();
+    let base = calls[0].initial_pivots.clone();
+    assert_eq!(base[0], vec![0, 0]);
+    let worst = [vec![1, 2], vec![3, 0]];
+    let added = |outcome: &[Vec<usize>]| {
+        let mut initial = base.clone();
+        initial.extend(expected_added(&base, &worst, outcome, cap - 1));
+        initial
+    };
+    assert_eq!(calls[1].initial_pivots, added(&first_outcome));
+    assert_eq!(calls[2].initial_pivots, added(&second_outcome));
+    // At most max_bond_dim - 1 added points, and none of the first rerun's
+    // outcome pivots carried into the second.
+    assert_eq!(calls[1].initial_pivots.len() - base.len(), cap - 1);
+    assert!(!calls[2].initial_pivots.contains(&vec![2, 2]));
+    let report = &result.report;
+    assert_eq!(
+        (report.verification_failures, report.engine_retries),
+        (3, 2)
+    );
+    assert_eq!(report.splits, 1);
+}
+
+// ---------------------------------------------------------------------------
+// A sampled retry on a fresh stream (tests 4 and 15)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_sampled_retry_measures_on_a_fresh_stream_and_audit_points_never_become_pivots() {
+    let problem = chain("s", 12, 2);
+    let one = |_: &[usize]| 1.0;
+    let engine = ScriptedEngine::new(vec![
+        Step::converged(Network::Constant(0.0)),
+        Step::converged(Network::Constant(1.0)),
+    ]);
+    let seed = 3;
+    let options = l2_given(2, 64.0, 1e-6).with_seed(seed).with_verification(
+        VerificationOptions::new()
+            .with_samples(16)
+            .with_max_exhaustive_points(0),
+    );
+    let recorder = Recorder::default();
+    let evaluate = recording_evaluator(&one, problem.sites.len(), &recorder);
+    let result = run_with(&engine, &problem, evaluate, &[], &options).unwrap();
+    let record = &result.report.accepted[0];
+    assert_eq!(record.retries_used, 1);
+    assert_eq!(
+        record.acceptance.as_ref().unwrap().method,
+        MeasurementMethod::Sampled
+    );
+    assert!(record.audit.is_some());
+
+    let dims = problem.dims();
+    let state = streams::path_state(seed, &[]);
+    let stream = |stream_seed| streams::draw(&dims, 16, stream_seed);
+    let evaluated = recorder.seen.lock().unwrap().clone();
+    let all_evaluated = |points: &[Vec<usize>]| points.iter().all(|p| evaluated.contains(p));
+    let (first, second) = (
+        stream(streams::verify(state, 0)),
+        stream(streams::verify(state, 1)),
+    );
+    assert_ne!(first, second);
+    assert!(all_evaluated(&first));
+    assert!(all_evaluated(&second));
+    // A stream the run did not use is not evaluated.
+    assert!(!all_evaluated(&stream(streams::verify(state, 2))));
+    let audit = stream(streams::audit(state));
+    assert!(all_evaluated(&audit));
+    for call in engine.calls() {
+        assert!(audit.iter().all(|p| !call.initial_pivots.contains(p)));
+    }
+    // The rerun received the first worst point of the failed measurement.
+    let calls = engine.calls();
+    assert!(calls[1].initial_pivots.contains(&first[0]));
+}
+
+#[test]
+fn measured_values_reach_the_children_without_reevaluation() {
+    let problem = branched();
+    let j0 = problem.site("j", 0);
+    let f = switch_on(problem.position(&j0));
+    let (_, norm) = dense_reference(&problem, &f);
+    let engine = ScriptedEngine::new(vec![
+        Step::converged(Network::Constant(0.0)),
+        Step::converged(Network::Exact),
+    ]);
+    let options = l2_given(2, norm, 1e-8)
+        .with_verification(VerificationOptions::new().with_retries(0))
+        .with_patch_order(vec![j0]);
+    let result = run(&engine, &problem, &f, &[], &options).unwrap();
+    let report = &result.report;
+    // The root's exhaustive measurement evaluated every point that its
+    // candidates had not; the children evaluate nothing new.
+    let candidates = engine.calls()[0].initial_pivots.len();
+    assert_eq!(report.function_evaluations, 96);
+    assert_eq!(report.measurement_evaluations, 96 - candidates);
+    assert_eq!(report.accepted.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Split-time candidates (test 5)
+// ---------------------------------------------------------------------------
+
+/// `f = 1` plus spikes of decreasing size at A, B, C, D, E (site order p0,
+/// p1, p2 of `single_node(&[2, 4, 4])`).
+const SPIKES: [([usize; 3], f64); 5] = [
+    ([0, 0, 1], 9.0),
+    ([1, 3, 3], 7.0),
+    ([0, 2, 0], 5.0),
+    ([1, 0, 2], 3.0),
+    ([0, 3, 2], 2.0),
+];
+
+fn spikes(p: &[usize]) -> f64 {
+    1.0 + SPIKES
+        .iter()
+        .find(|(point, _)| point == p)
+        .map_or(0.0, |(_, size)| *size)
+}
+
+/// Run the split-time candidate scenario and return the initial pivots of
+/// the two children, in child coordinates.
+fn split_children(
+    recycle: bool,
+    n_initial_pivots: usize,
+    rerun_caps: bool,
+) -> (Vec<Vec<usize>>, Vec<Vec<usize>>, PatchedInterpolationReport) {
+    let problem = single_node(&[2, 4, 4]);
+    let (_, norm) = dense_reference(&problem, &spikes);
+    let root =
+        Step::converged(Network::Constant(1.0)).with_pivots(vec![vec![0, 1, 2], vec![1, 1, 0]]);
+    let mut steps = vec![root];
+    let retries = if rerun_caps {
+        steps.push(Step::capped().with_pivots(vec![vec![0, 3, 0], vec![1, 2, 1]]));
+        1
+    } else {
+        0
+    };
+    steps.push(Step::converged(Network::Exact));
+    let engine = ScriptedEngine::new(steps);
+    let options = l2_given(4, norm, 1e-6)
+        .with_recycle_pivots(recycle)
+        .with_n_initial_pivots(n_initial_pivots)
+        .with_verification(VerificationOptions::new().with_retries(retries))
+        .with_patch_order(vec![problem.site("only", 0)]);
+    let result = run(
+        &engine,
+        &problem,
+        &spikes,
+        &[vec![0, 1, 1], vec![1, 2, 2]],
+        &options,
+    )
+    .unwrap();
+    let calls = engine.calls();
+    let children = &calls[calls.len() - 2..];
+    assert!(children.iter().all(|call| call.site_order.len() == 2));
+    (
+        children[0].initial_pivots.clone(),
+        children[1].initial_pivots.clone(),
+        result.report,
+    )
+}
+
+#[test]
+fn split_children_start_from_user_recycled_and_worst_points_then_random_fill() {
+    // Worst points of the root, truncated to max_bond_dim - 1 = 3 for the
+    // whole patch: A (child 0), B (child 1), C (child 0).
+    let (first, second, report) = split_children(true, 6, false);
+    assert_eq!(
+        (report.verification_failures, report.engine_retries),
+        (1, 0)
+    );
+    // User pivot, recycled pivot, then the worst points in descending |r|.
+    assert_eq!(first[..4], [vec![1, 1], vec![1, 2], vec![0, 1], vec![2, 0]]);
+    assert_eq!(first.len(), 6);
+    assert_eq!(second[..3], [vec![2, 2], vec![1, 0], vec![3, 3]]);
+    assert_eq!(second.len(), 6);
+    let distinct: HashSet<&Vec<usize>> = first.iter().collect();
+    assert_eq!(distinct.len(), first.len());
+
+    // Without recycling the recycled pivots are absent.
+    let (first, second, _) = split_children(false, 6, false);
+    assert_eq!(first[..3], [vec![1, 1], vec![0, 1], vec![2, 0]]);
+    assert_eq!(second[..2], [vec![2, 2], vec![3, 3]]);
+    assert_eq!(first.len(), 6);
+
+    // Earlier sources reaching n_initial_pivots leave no random fill.
+    let (first, second, _) = split_children(true, 2, false);
+    assert_eq!(first, [vec![1, 1], vec![1, 2], vec![0, 1], vec![2, 0]]);
+    assert_eq!(second, [vec![2, 2], vec![1, 0], vec![3, 3]]);
+}
+
+#[test]
+fn a_rerun_that_does_not_converge_passes_the_preceding_worst_points() {
+    let (first, second, report) = split_children(true, 2, true);
+    assert_eq!(
+        (report.verification_failures, report.engine_retries),
+        (1, 1)
+    );
+    // Recycled pivots come from the capped rerun, worst points from the
+    // failed measurement before it.
+    assert_eq!(first, [vec![1, 1], vec![3, 0], vec![0, 1], vec![2, 0]]);
+    assert_eq!(second, [vec![2, 2], vec![2, 1], vec![3, 3]]);
+}
+
+// ---------------------------------------------------------------------------
+// Failure at the end of the order (test 6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failures_at_the_end_of_the_order_are_typed() {
+    let problem = single_node(&[2, 4, 4]);
+    let p0 = problem.site("only", 0);
+    let two = |_: &[usize]| 2.0;
+    let options = l2_given(2, 2.0 * 32f64.sqrt(), 1e-6)
+        .with_verification(VerificationOptions::new().with_retries(0))
+        .with_patch_order(vec![p0.clone()]);
+    let wrong = || ScriptedEngine::new(vec![Step::converged(Network::Constant(1.0))]);
+    match run(&wrong(), &problem, &two, &[], &options) {
+        Err(PatchedInterpolationError::VerificationFailed {
+            projector,
+            measurement,
+        }) => {
+            assert_eq!(projector, Projector::from_pairs([(p0.clone(), 0)]).unwrap());
+            assert_eq!(measurement.method, MeasurementMethod::Exhaustive);
+            assert_eq!(measurement.rms, 1.0);
+        }
+        other => panic!("expected VerificationFailed, got {other:?}"),
+    }
+    // A patch that does not converge keeps the M2 error.
+    let capped = ScriptedEngine::new(vec![Step::capped()]);
+    match run(&capped, &problem, &two, &[], &options) {
+        Err(PatchedInterpolationError::NoSplitIndexLeft { projector }) => {
+            assert_eq!(projector, Projector::from_pairs([(p0, 0)]).unwrap());
+        }
+        other => panic!("expected NoSplitIndexLeft, got {other:?}"),
+    }
+    // The patch limit after a failed verification.
+    match run(
+        &wrong(),
+        &problem,
+        &two,
+        &[],
+        &options.clone().with_max_patches(1),
+    ) {
+        Err(PatchedInterpolationError::ResourceLimit { resource, limit }) => {
+            assert_eq!((resource, limit), ("max_patches", 1));
+        }
+        other => panic!("expected ResourceLimit, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tolerances below roundoff (test 7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tolerances_below_roundoff_follow_the_retry_and_split_path() {
+    let problem = branched();
+    let f = |p: &[usize]| product(p, 0);
+    let (_, norm) = dense_reference(&problem, &f);
+    // Far below eps times any value scale of f.
+    for tolerance in [
+        ErrorTolerance {
+            rtol: 1e-30,
+            atol: 0.0,
+        },
+        ErrorTolerance {
+            rtol: 0.0,
+            atol: 0.0,
+        },
+    ] {
+        let options = PatchedInterpolationOptions::new(2)
+            .with_error_norm(ErrorNorm::l2(L2Reference::Given(norm)))
+            .with_tolerance(tolerance);
+        let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+        let report = &result.report;
+        assert!(report.verification_failures >= 1);
+        assert!(report.splits >= 1);
+        let tau = tau(report);
+        assert!(acceptances(report).iter().all(|&rms| rms <= tau));
+        assert!(report.accepted.iter().any(|record| {
+            record.acceptance.as_ref().unwrap().method == MeasurementMethod::Exact
+        }));
+        let error = report.norm.l2_error().unwrap();
+        assert!(matches!(error.global, GlobalL2Error::Certified { .. }));
+
+        // Constrained runs report their normal errors.
+        let limited = options.clone().with_max_patches(3);
+        assert!(matches!(
+            run(&DenseEngine::new(), &problem, &f, &[], &limited),
+            Err(PatchedInterpolationError::ResourceLimit { .. })
+        ));
+        let partial = options.with_patch_order(vec![problem.site("a", 0)]);
+        assert!(matches!(
+            run(&DenseEngine::new(), &problem, &f, &[], &partial),
+            Err(PatchedInterpolationError::VerificationFailed { .. })
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Zero patches (test 8)
+// ---------------------------------------------------------------------------
+
+/// Seed whose single random root candidate of `branched` has b0 = 0.
+const ZERO_CANDIDATE_SEED: u64 = 1;
+
+#[test]
+fn a_failed_zero_screen_hands_its_largest_points_to_the_engine() {
+    let problem = branched();
+    let pb = problem.position(&problem.site("b", 0));
+    // Nonzero on half of the domain (b0 = 1).
+    let f = move |p: &[usize]| if p[pb] == 1 { product(p, 0) } else { 0.0 };
+    let (_, norm) = dense_reference(&problem, &f);
+    let options = l2_given(2, norm, 1e-8)
+        .with_n_initial_pivots(1)
+        .with_seed(ZERO_CANDIDATE_SEED);
+    let engine = DenseEngine::new();
+    let result = run(&engine, &problem, &f, &[], &options).unwrap();
+    let seen = engine.seen();
+    let initial = &seen[0].initial_pivots;
+    // The candidate is a zero; the screen adds max_bond_dim - 1 = 1 point,
+    // the largest |f| of the exhaustive screen.
+    assert_eq!(initial.len(), 2);
+    assert_eq!(f(&initial[0]), 0.0);
+    let largest = full_domain(&problem.dims())
+        .iter()
+        .map(|p| f(p))
+        .fold(0.0, f64::max);
+    assert_eq!(f(&initial[1]), largest);
+    let report = &result.report;
+    assert_eq!(report.zero_patches.len(), 0);
+    assert_eq!(report.accepted.len(), 1);
+    assert_eq!(report.accepted[0].retries_used, 0);
+    assert_eq!(
+        (report.verification_failures, report.engine_retries),
+        (0, 0)
+    );
+    // The screen evaluated every point but the candidate; the verification
+    // then needs no new value.
+    assert_eq!(report.function_evaluations, 96);
+    assert_eq!(report.measurement_evaluations, 95);
+    assert_certified_bound(&result, &problem, &f);
+}
+
+#[test]
+fn a_truly_zero_region_is_a_verified_zero_patch() {
+    let problem = branched();
+    let (j0, a0) = (problem.site("j", 0), problem.site("a", 0));
+    let (pj, pa) = (problem.position(&j0), problem.position(&a0));
+    let f = move |p: &[usize]| if p[pj] == 0 { 0.0 } else { product(p, p[pa]) };
+    let (_, norm) = dense_reference(&problem, &f);
+    let options = l2_given(2, norm, 1e-12).with_patch_order(vec![j0.clone(), a0]);
+    let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+    let zero = &result.report.zero_patches;
+    assert_eq!(zero.len(), 1);
+    assert_eq!(zero[0].projector, Projector::from_pairs([(j0, 0)]).unwrap());
+    let measurement = zero[0].acceptance.as_ref().unwrap();
+    assert_eq!(measurement.method, MeasurementMethod::Exhaustive);
+    assert_eq!((measurement.points, measurement.rms), (48, 0.0));
+    assert!(zero[0].audit.is_none());
+    assert_certified_bound(&result, &problem, &f);
+}
+
+#[test]
+fn a_run_whose_approximation_does_not_exceed_its_error_has_no_relative_statement() {
+    let problem = branched();
+    // Nonzero only at one point outside the single candidate; within atol.
+    let f = |p: &[usize]| if p == SPIKE { 1e-3 } else { 0.0 };
+    let options = PatchedInterpolationOptions::new(2)
+        .with_tolerance(ErrorTolerance {
+            rtol: 0.0,
+            atol: 1.0,
+        })
+        .with_n_initial_pivots(1)
+        .with_seed(ZERO_CANDIDATE_SEED);
+    let engine = DenseEngine::new();
+    let result = run(&engine, &problem, &f, &[], &options).unwrap();
+    assert!(engine.seen().is_empty());
+    assert!(result.partition.is_empty());
+    let error = result.report.norm.l2_error().unwrap();
+    assert_eq!(error.approximation_rms, Some(0.0));
+    let GlobalL2Error::Certified {
+        rms_error,
+        relative_error_bound,
+        ..
+    } = error.global
+    else {
+        panic!("expected a certified error");
+    };
+    assert!(rms_error > 0.0);
+    assert_eq!(relative_error_bound, None);
+}
+
+// ---------------------------------------------------------------------------
+// The exhaustive threshold and exact small patches (tests 9 and 10)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_exhaustive_threshold_is_inclusive() {
+    let problem = single_node(&[4, 4]);
+    let f = |p: &[usize]| product(p, 0);
+    let (_, norm) = dense_reference(&problem, &f);
+    for (samples, max_exhaustive, method) in [
+        (16, 0, MeasurementMethod::Exhaustive),
+        (15, 0, MeasurementMethod::Sampled),
+        (2, 16, MeasurementMethod::Exhaustive),
+        (2, 15, MeasurementMethod::Sampled),
+    ] {
+        let options = l2_given(2, norm, 1e-8).with_verification(
+            VerificationOptions::new()
+                .with_samples(samples)
+                .with_max_exhaustive_points(max_exhaustive),
+        );
+        let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+        let measurement = result.report.accepted[0].acceptance.clone().unwrap();
+        assert_eq!(measurement.method, method, "{samples} {max_exhaustive}");
+        let expected_points = if method == MeasurementMethod::Exhaustive {
+            16
+        } else {
+            samples
+        };
+        assert_eq!(measurement.points, expected_points);
+        assert_eq!(measurement.patch_points, 16.0);
+    }
+}
+
+#[test]
+fn exact_small_patches_carry_exact_measurements_and_add_no_evaluations() {
+    // Rank two at the root; every child has one active site.
+    let problem = Problem::new(&[("s", &[3]), ("t", &[8])], &[("s", "t")]);
+    let f = |p: &[usize]| match p[0] {
+        0 => 0.0,
+        1 => 1.0 + p[1] as f64,
+        _ => 2.0 - p[1] as f64,
+    };
+    let (_, norm) = dense_reference(&problem, &f);
+    let result = run(
+        &DenseEngine::new(),
+        &problem,
+        &f,
+        &[],
+        &l2_given(2, norm, 1e-12),
+    )
+    .unwrap();
+    let report = &result.report;
+    assert_eq!(report.splits, 1);
+    assert_eq!(report.measurement_evaluations, 0);
+    let measurements = report
+        .accepted
+        .iter()
+        .map(|record| record.acceptance.clone().unwrap())
+        .chain(
+            report
+                .zero_patches
+                .iter()
+                .map(|record| record.acceptance.clone().unwrap()),
+        );
+    for measurement in measurements {
+        assert_eq!(measurement.method, MeasurementMethod::Exact);
+        assert_eq!((measurement.points, measurement.rms), (8, 0.0));
+        assert_eq!(measurement.max_residual, 0.0);
+    }
+    assert_eq!(report.zero_patches.len(), 1);
+    let error = report.norm.l2_error().unwrap();
+    assert!(matches!(
+        error.global,
+        GlobalL2Error::Certified { rms_error, .. } if rms_error == 0.0
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Overflow and rounding-limited reports (test 11)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_overflowing_approximation_norm_is_reported_as_none() {
+    // ||f~|| = 2e155 exceeds sqrt(f64::MAX); the exact path builds the patch.
+    let problem = single_node(&[4]);
+    let f = |_: &[usize]| 1e155;
+    let options = PatchedInterpolationOptions::new(2)
+        .with_error_norm(ErrorNorm::l2(L2Reference::Given(2e155)))
+        .with_tolerance(tol(1e-6));
+    let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+    let error = result.report.norm.l2_error().unwrap();
+    assert_eq!(error.approximation_rms, None);
+    assert_eq!(error.approximation_norm(), None);
+    assert!(matches!(
+        error.global,
+        GlobalL2Error::Certified {
+            rms_error,
+            rounding_allowance_rms: None,
+            rounding_limited: None,
+            relative_error_bound: None,
+            ..
+        } if rms_error == 0.0
+    ));
+}
+
+#[test]
+fn a_tau_below_the_rounding_term_is_rounding_limited() {
+    let problem = single_node(&[4]);
+    let f = |_: &[usize]| 1.0;
+    let options = PatchedInterpolationOptions::new(2)
+        .with_error_norm(ErrorNorm::l2(L2Reference::Given(2.0)))
+        .with_tolerance(tol(1e-20));
+    let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+    let error = result.report.norm.l2_error().unwrap();
+    let GlobalL2Error::Certified {
+        rounding_allowance_rms,
+        rounding_limited,
+        ..
+    } = error.global
+    else {
+        panic!("expected a certified error");
+    };
+    assert!(rounding_allowance_rms.unwrap() > tau(&result.report));
+    assert_eq!(rounding_limited, Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// References (test 12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_reference_source_pins_tau() {
+    let problem = branched();
+    let f = |p: &[usize]| product(p, 0);
+    let (_, norm) = dense_reference(&problem, &f);
+    let root_points = 96f64.sqrt();
+
+    let given = run(
+        &DenseEngine::new(),
+        &problem,
+        &f,
+        &[],
+        &l2_given(2, norm, 1e-6),
+    )
+    .unwrap();
+    let NormReport::L2 {
+        reference_rms,
+        source,
+        tau,
+        ..
+    } = given.report.norm
+    else {
+        panic!("expected an L2 report");
+    };
+    assert_eq!(source, L2ReferenceSource::Given);
+    assert_eq!(reference_rms, Some(norm / root_points));
+    assert_eq!(tau, 1e-6 * (norm / root_points));
+    assert!((given.report.norm.reference_norm().unwrap() - norm).abs() <= 1e-12 * norm);
+
+    // Not needed when rtol = 0, whatever the reference option.
+    for reference in [L2Reference::Required, L2Reference::MonteCarlo] {
+        let options = PatchedInterpolationOptions::new(2)
+            .with_error_norm(ErrorNorm::l2(reference))
+            .with_tolerance(ErrorTolerance {
+                rtol: 0.0,
+                atol: 1e-3,
+            });
+        let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+        let NormReport::L2 {
+            reference_rms,
+            source,
+            tau,
+            ..
+        } = result.report.norm
+        else {
+            panic!("expected an L2 report");
+        };
+        assert_eq!(source, L2ReferenceSource::NotNeeded);
+        assert_eq!(reference_rms, None);
+        assert_eq!(tau, 1e-3 / root_points);
+        assert_eq!(result.report.norm.reference_norm(), None);
+    }
+
+    // The Monte Carlo estimate: the RMS of f over the reference stream.
+    let options = PatchedInterpolationOptions::new(2)
+        .with_error_norm(ErrorNorm::l2(L2Reference::MonteCarlo))
+        .with_tolerance(tol(1e-6))
+        .with_seed(4);
+    let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+    let NormReport::L2 {
+        reference_rms,
+        source,
+        ..
+    } = result.report.norm
+    else {
+        panic!("expected an L2 report");
+    };
+    let L2ReferenceSource::MonteCarlo {
+        samples,
+        mean_square_rel_std_error,
+        ..
+    } = source
+    else {
+        panic!("expected a Monte Carlo reference, got {source:?}");
+    };
+    assert_eq!(samples, 64);
+    assert!(mean_square_rel_std_error > 0.0);
+    let points = streams::draw(
+        &problem.dims(),
+        64,
+        streams::scale(streams::path_state(4, &[])),
+    );
+    let expected = (points.iter().map(|p| f(p) * f(p)).sum::<f64>() / 64.0).sqrt();
+    let reference_rms = reference_rms.unwrap();
+    assert!((reference_rms - expected).abs() <= 1e-14 * expected);
+    assert!(result.report.measurement_evaluations >= 1);
+}
+
+#[test]
+fn an_exact_root_gives_the_reference_and_an_all_zero_exact_root_is_empty() {
+    let problem = single_node(&[4]);
+    let f = |p: &[usize]| [3.0, 0.0, 4.0, 0.0][p[0]];
+    let result = run(
+        &DenseEngine::new(),
+        &problem,
+        &f,
+        &[],
+        &PatchedInterpolationOptions::new(2).with_tolerance(tol(1e-6)),
+    )
+    .unwrap();
+    let NormReport::L2 {
+        reference_rms,
+        source,
+        ..
+    } = result.report.norm
+    else {
+        panic!("expected an L2 report");
+    };
+    assert_eq!(source, L2ReferenceSource::ExactRoot);
+    assert_eq!(reference_rms, Some(2.5));
+
+    let problem = single_node(&[3]);
+    let zero = |_: &[usize]| 0.0;
+    for options in [
+        PatchedInterpolationOptions::new(2),
+        l2_given(2, 1.0, 1e-6),
+        PatchedInterpolationOptions::new(2).with_tolerance(tol(0.0)),
+        PatchedInterpolationOptions::new(2).with_error_norm(ErrorNorm::l2(L2Reference::MonteCarlo)),
+    ] {
+        let result = run(&DenseEngine::new(), &problem, &zero, &[], &options).unwrap();
+        assert!(result.partition.is_empty());
+        assert_eq!(result.report.zero_patches.len(), 1);
+        assert_eq!(
+            result.report.zero_patches[0]
+                .acceptance
+                .as_ref()
+                .unwrap()
+                .method,
+            MeasurementMethod::Exact
+        );
+    }
+}
+
+#[test]
+fn a_required_reference_fails_before_any_evaluation() {
+    let problem = branched();
+    let message = expect_invalid(
+        patched_interpolate(
+            &DenseEngine::new(),
+            problem.topology.clone(),
+            problem.node_sites.clone(),
+            no_pivots(&problem),
+            never,
+            &PatchedInterpolationOptions::new(2),
+        ),
+        "needs a reference norm",
+    );
+    assert!(message.contains("L2Reference::Given"));
+    assert!(message.contains("L2Reference::MonteCarlo"));
+}
+
+#[test]
+fn a_zero_monte_carlo_reference_needs_an_absolute_floor() {
+    let problem = branched();
+    let zero = |_: &[usize]| 0.0;
+    let monte_carlo = PatchedInterpolationOptions::new(2)
+        .with_error_norm(ErrorNorm::l2(L2Reference::MonteCarlo))
+        .with_tolerance(tol(1e-6));
+    let message = expect_invalid(
+        run(&DenseEngine::new(), &problem, &zero, &[], &monte_carlo),
+        "Monte Carlo reference norm is zero",
+    );
+    assert!(message.contains("tolerance.atol"));
+    // With an absolute floor the root is a verified zero patch.
+    let floor = monte_carlo.with_tolerance(ErrorTolerance {
+        rtol: 1e-6,
+        atol: 1e-9,
+    });
+    let result = run(&DenseEngine::new(), &problem, &zero, &[], &floor).unwrap();
+    assert!(result.partition.is_empty());
+    assert_eq!(result.report.zero_patches.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// SampledMax (test 13)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sampled_max_engine_tolerance_is_raised_by_atol() {
+    let problem = branched();
+    let f = |p: &[usize]| product(p, 0);
+    for (atol, expected) in [(1e-3, 1e-3), (1e-12, 2e-8)] {
+        let options = sampled_max(2)
+            .with_error_norm(ErrorNorm::sampled_max_with_reference(2.0))
+            .with_tolerance(ErrorTolerance { rtol: 1e-8, atol });
+        let engine = DenseEngine::new();
+        let result = run(&engine, &problem, &f, &[], &options).unwrap();
+        assert_eq!(engine.seen()[0].tolerance, expected);
+        assert!(matches!(
+            result.report.norm,
+            NormReport::SampledMax { engine_tolerance, .. } if engine_tolerance == expected
+        ));
+        assert_eq!(result.report.measurement_evaluations, 0);
+        assert!(result.report.accepted[0].acceptance.is_none());
+    }
+}
+
+#[test]
+fn a_domain_too_large_for_f64_is_accepted_only_under_sampled_max() {
+    // 2^1100 points overflow f64.
+    let problem = chain("s", 1100, 2);
+    let f = |p: &[usize]| {
+        p.iter()
+            .enumerate()
+            .map(|(i, &x)| 1.0 + 1e-4 * ((i % 7) * x) as f64)
+            .product::<f64>()
+    };
+    let pivots = [vec![0; 1100]];
+    let options = sampled_max(2).with_error_norm(ErrorNorm::sampled_max_with_reference(2.0));
+    let result = run(&FiberEngine, &problem, &f, &pivots, &options).unwrap();
+    assert_eq!(result.report.accepted.len(), 1);
+
+    let message = expect_invalid(
+        patched_interpolate(
+            &FiberEngine,
+            problem.topology.clone(),
+            problem.node_sites.clone(),
+            problem.pivots(&pivots),
+            never,
+            &l2_given(2, 1.0, 1e-6),
+        ),
+        "more points than f64",
+    );
+    assert!(message.contains("ErrorNorm::sampled_max()"));
+}
+
+// ---------------------------------------------------------------------------
+// Determinism on fresh threads (test 14)
+// ---------------------------------------------------------------------------
+
+fn dense_run_on_a_fresh_thread(
+    problem: fn() -> Problem,
+    f: fn(&[usize]) -> f64,
+    verification: VerificationOptions,
+) -> (Vec<PatchFingerprint>, PatchedInterpolationReport) {
+    std::thread::spawn(move || {
+        let problem = problem();
+        let (_, norm) = dense_reference(&problem, &f);
+        let options = l2_given(2, norm, 1e-10).with_verification(verification);
+        let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+        (fingerprint(&result, &problem), result.report)
+    })
+    .join()
+    .unwrap()
+}
+
+fn raw_kernel_switch(p: &[usize]) -> f64 {
+    product(p, p[4])
+}
+
+fn generic_path_switch(p: &[usize]) -> f64 {
+    product(p, p[8])
+}
+
+#[test]
+fn dense_engine_l2_runs_are_reproducible_on_fresh_threads_on_a_raw_kernel_tree() {
+    // Exhaustive and sampled measurements.
+    for verification in [
+        VerificationOptions::new(),
+        VerificationOptions::new()
+            .with_samples(8)
+            .with_max_exhaustive_points(0),
+    ] {
+        let (first_fingerprint, first) =
+            dense_run_on_a_fresh_thread(raw_kernel_tree, raw_kernel_switch, verification);
+        let (second_fingerprint, second) =
+            dense_run_on_a_fresh_thread(raw_kernel_tree, raw_kernel_switch, verification);
+        assert!(first.splits >= 1);
+        assert_same_report_across_problems(&first, &second);
+        assert_eq!(first_fingerprint, second_fingerprint);
+    }
+}
+
+#[test]
+#[ignore = "open question 8 of docs/design/tree-patching-error-contract.md: the generic IdxTensor \
+            path of TreeTNCachedEvaluator is not guaranteed reproducible across threads (omeco \
+            breaks contraction-path cost ties in HashMap order); these rank-one patches happen \
+            to agree, the TreeTCI patches of adaptive_l2_treetci do not"]
+fn dense_engine_l2_runs_are_reproducible_on_fresh_threads_on_a_generic_path_tree() {
+    for verification in [
+        VerificationOptions::new(),
+        VerificationOptions::new()
+            .with_samples(8)
+            .with_max_exhaustive_points(0),
+    ] {
+        let (first_fingerprint, first) =
+            dense_run_on_a_fresh_thread(extended_quantics_tree, generic_path_switch, verification);
+        let (second_fingerprint, second) =
+            dense_run_on_a_fresh_thread(extended_quantics_tree, generic_path_switch, verification);
+        assert_same_report_across_problems(&first, &second);
+        assert_eq!(first_fingerprint, second_fingerprint);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Errors (test 17)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn placeholder_norms_fail_before_every_other_check() {
+    let problem = branched();
+    for norm in [ErrorNorm::MaxAbs, ErrorNorm::WeightedL2] {
+        // Invalid tolerance, cap, and pivots as well: the norm comes first.
+        let options = PatchedInterpolationOptions::new(0)
+            .with_error_norm(norm)
+            .with_tolerance(tol(-1.0));
+        let bad_pivots = ColMajorArray::new(vec![0], vec![1, 1]).unwrap();
+        match patched_interpolate(
+            &DenseEngine::new(),
+            problem.topology.clone(),
+            problem.node_sites.clone(),
+            bad_pivots,
+            never,
+            &options,
+        ) {
+            Err(error @ PatchedInterpolationError::UnsupportedNorm { .. }) => {
+                assert!(matches!(
+                    error,
+                    PatchedInterpolationError::UnsupportedNorm { norm: n } if n == norm
+                ));
+                let text = error.to_string();
+                assert!(text.contains("ErrorNorm::L2 (the default) or ErrorNorm::SampledMax"));
+            }
+            other => panic!("expected UnsupportedNorm, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn new_invalid_inputs_are_rejected_before_any_evaluation() {
+    let problem = single_node(&[3, 2]);
+    let base = l2_given(2, 1.0, 1e-6);
+    let cases = [
+        (
+            base.clone().with_tolerance(ErrorTolerance {
+                rtol: 1e-6,
+                atol: -1.0,
+            }),
+            "tolerance.atol",
+        ),
+        (
+            base.clone().with_tolerance(ErrorTolerance {
+                rtol: 1e-6,
+                atol: f64::NAN,
+            }),
+            "tolerance.atol",
+        ),
+        (
+            base.clone().with_tolerance(ErrorTolerance {
+                rtol: 1e-6,
+                atol: f64::INFINITY,
+            }),
+            "tolerance.atol",
+        ),
+        (base.clone().with_tolerance(tol(f64::NAN)), "tolerance.rtol"),
+        (
+            base.clone()
+                .with_error_norm(ErrorNorm::l2(L2Reference::Given(0.0))),
+            "L2Reference::Given",
+        ),
+        (
+            base.clone()
+                .with_error_norm(ErrorNorm::l2(L2Reference::Given(-1.0))),
+            "L2Reference::Given",
+        ),
+        (
+            base.clone()
+                .with_error_norm(ErrorNorm::l2(L2Reference::Given(f64::NAN))),
+            "L2Reference::Given",
+        ),
+        (
+            base.clone()
+                .with_error_norm(ErrorNorm::l2(L2Reference::Given(f64::INFINITY))),
+            "L2Reference::Given",
+        ),
+        (
+            base.clone()
+                .with_verification(VerificationOptions::new().with_samples(1)),
+            "verification.samples",
+        ),
+        (
+            base.clone()
+                .with_verification(VerificationOptions::new().with_samples(0)),
+            "verification.samples",
+        ),
+        // Verification options are validated under every norm.
+        (
+            sampled_max(2).with_verification(VerificationOptions::new().with_samples(1)),
+            "verification.samples",
+        ),
+    ];
+    for (options, needle) in cases {
+        expect_invalid(
+            patched_interpolate(
+                &DenseEngine::new(),
+                problem.topology.clone(),
+                problem.node_sites.clone(),
+                no_pivots(&problem),
+                never,
+                &options,
+            ),
+            needle,
+        );
+    }
+}
+
+#[test]
+fn a_non_finite_network_value_is_an_engine_error() {
+    let problem = single_node(&[2, 2]);
+    let f = |_: &[usize]| 1.0;
+    let engine = ScriptedEngine::new(vec![Step::converged(Network::NonFinite)]);
+    let (projector, source) =
+        expect_interpolation(run(&engine, &problem, &f, &[], &l2_given(2, 2.0, 1e-6)));
+    assert!(projector.is_empty());
+    assert!(matches!(source, InterpolationError::Engine { .. }));
+    assert!(source.to_string().contains("non-finite"), "{source}");
+}
+
+#[test]
+fn verification_failures_display_their_remedy() {
+    let error = PatchedInterpolationError::VerificationFailed {
+        projector: Projector::new(),
+        measurement: tensor4all_partitionedtreetn::adaptive_interpolation::L2Measurement::clone(
+            &run(
+                &DenseEngine::new(),
+                &single_node(&[2]),
+                &|_: &[usize]| 1.0,
+                &[],
+                &PatchedInterpolationOptions::new(2),
+            )
+            .unwrap()
+            .report
+            .accepted[0]
+                .acceptance
+                .clone()
+                .unwrap(),
+        ),
+    };
+    let text = error.to_string();
+    assert!(text.contains("list more sites in patch_order"));
+    assert!(text.contains("raise rtol or atol"));
+    assert!(text.contains("check the reference norm"));
+}
+
+// ---------------------------------------------------------------------------
+// Complex scalars (test 18)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn complex_residual_magnitudes_are_measured_by_abs_val() {
+    let problem = branched();
+    let j0 = problem.site("j", 0);
+    let pj = problem.position(&j0);
+    let phases = [Complex64::new(0.6, 0.8), Complex64::new(-0.8, 0.6)];
+    let f = move |p: &[usize]| phases[p[pj]] * product(p, p[pj]);
+    let (_, norm) = dense_reference(&problem, &f);
+    let options = l2_given(2, norm, 1e-10).with_patch_order(vec![j0]);
+    let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
+    assert_eq!(result.report.accepted.len(), 2);
+    for patch in result.partition.values() {
+        let data = patch.data();
+        for name in data.node_names() {
+            assert!(data
+                .tensor(data.node_index(&name).unwrap())
+                .unwrap()
+                .is_c64());
+        }
+    }
+    assert_certified_bound(&result, &problem, &f);
+
+    // A complex constant network that is off by i: residual magnitude 1.
+    let problem = single_node(&[2, 2, 2]);
+    let g = |_: &[usize]| Complex64::new(1.0, 1.0);
+    let engine = ScriptedEngine::new(vec![Step::converged(Network::Constant(1.0))]);
+    let options = PatchedInterpolationOptions::new(2)
+        .with_error_norm(ErrorNorm::l2(L2Reference::Given(1.0)))
+        .with_tolerance(tol(1e-6))
+        .with_verification(VerificationOptions::new().with_retries(0))
+        .with_patch_order(vec![problem.site("only", 0)]);
+    let error = run(&engine, &problem, &g, &[], &options).unwrap_err();
+    let PatchedInterpolationError::VerificationFailed { measurement, .. } = error else {
+        panic!("expected VerificationFailed, got {error:?}");
+    };
+    assert_eq!(measurement.rms, 1.0);
+    assert_eq!(measurement.max_residual, 1.0);
+}

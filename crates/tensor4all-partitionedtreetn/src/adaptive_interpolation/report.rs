@@ -31,19 +31,24 @@ pub const GLOBAL_ROUNDING_MARGIN: f64 = 1e-8;
 /// contraction the evaluation error can exceed it. It never enters an
 /// acceptance decision; it only sets the absolute rounding term of a
 /// certified error ([`GlobalL2Error::Certified`]). The value is the largest
-/// ratio observed in a calibration on the test trees times a recorded
-/// headroom factor (see "Implementation decisions" in
-/// `docs/design/tree-patching-error-contract.md`).
+/// ratio `||evaluated - exact|| / (eps ||exact||)` observed in a calibration
+/// on the test trees (162, rounded up from 161.2, for a network whose
+/// contraction cancels to about 1% of its terms; random networks gave at
+/// most 1.8 and interpolated patches at most 0.93) times a headroom factor
+/// of 4. The calibration is the ignored test
+/// `tests/adaptive_rounding_calibration.rs`.
 ///
 /// # Examples
 ///
 /// ```
 /// use tensor4all_partitionedtreetn::adaptive_interpolation::MEASUREMENT_ROUNDING_FACTOR;
 ///
-/// let rounding_rms = MEASUREMENT_ROUNDING_FACTOR * f64::EPSILON * 2.0;
-/// assert!(rounding_rms > 0.0 && rounding_rms < 1e-10);
+/// assert_eq!(MEASUREMENT_ROUNDING_FACTOR, 4.0 * 162.0);
+/// // For ||f~|| / sqrt(|X|) = 1 the rounding term is about 1.4e-13.
+/// let rounding_rms = MEASUREMENT_ROUNDING_FACTOR * f64::EPSILON;
+/// assert!(rounding_rms > 1e-13 && rounding_rms < 2e-13);
 /// ```
-pub const MEASUREMENT_ROUNDING_FACTOR: f64 = 64.0;
+pub const MEASUREMENT_ROUNDING_FACTOR: f64 = 648.0;
 
 /// How the error of a patch was measured.
 ///

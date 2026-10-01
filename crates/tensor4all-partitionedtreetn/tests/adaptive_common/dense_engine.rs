@@ -51,6 +51,7 @@ pub(crate) struct Seen {
     pub(crate) initial_pivots: Vec<Vec<usize>>,
     pub(crate) returned_pivots: Vec<Vec<usize>>,
     pub(crate) seed: u64,
+    pub(crate) tolerance: f64,
 }
 
 /// Evaluates the whole active domain, factorizes it exactly (SVD with the
@@ -98,7 +99,6 @@ where
         V: Clone + Hash + Eq + Ord + Debug + Send + Sync,
         F: Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<T>>,
     {
-        let engine = |source: anyhow::Error| InterpolationError::Engine { source };
         let evaluator = |source: anyhow::Error| InterpolationError::Evaluator { source };
         let site_order = problem.site_order().to_vec();
         let dims: Vec<usize> = site_order.iter().map(IndexLike::dim).collect();
@@ -142,64 +142,7 @@ where
                 |best, (i, m)| if m > best.1 { (i, m) } else { best },
             );
 
-        let mut indices = site_order.clone();
-        if self.fault == Fault::WrongLayout {
-            indices[0] = indices[0].sim();
-        }
-        let mut dense =
-            IdxTensor::from_dense(indices.clone(), values).map_err(|e| engine(e.into()))?;
-        let one = vec![T::from_f64(1.0)];
-        let mut nodes = HashMap::new();
-        let mut dummies = HashMap::new();
-        let mut position = 0;
-        for (node, sites) in problem.node_sites() {
-            let node_indices = indices[position..position + sites.len()].to_vec();
-            position += sites.len();
-            if node_indices.is_empty() {
-                let dummy = DynIndex::new_dyn(1);
-                let ones = IdxTensor::from_dense(vec![dummy.clone()], one.clone()).unwrap();
-                dense = outer_product(&dense, &ones).map_err(|e| engine(e.into()))?;
-                nodes.insert(node.clone(), vec![dummy]);
-                dummies.insert(node.clone(), ones);
-            } else {
-                nodes.insert(node.clone(), node_indices);
-            }
-        }
-        let topology = problem.topology();
-        let graph = topology.graph();
-        let edges = graph
-            .edge_indices()
-            .map(|edge| {
-                let (a, b) = graph.edge_endpoints(edge).unwrap();
-                (
-                    topology.node_name(a).unwrap().clone(),
-                    topology.node_name(b).unwrap().clone(),
-                )
-            })
-            .collect();
-        let root = problem.node_sites().keys().next().unwrap();
-        let factorized = factorize_tensor_to_treetn_with(
-            &dense,
-            &TreeTopology::new(nodes, edges),
-            FactorizeOptions::svd(),
-            root,
-        )
-        .map_err(|e| engine(e.into()))?;
-        let names: Vec<V> = problem.node_sites().keys().cloned().collect();
-        let tensors = names
-            .iter()
-            .map(|name| {
-                let tensor = factorized
-                    .tensor(factorized.node_index(name).unwrap())
-                    .unwrap();
-                match dummies.get(name) {
-                    Some(ones) => contract_pair(tensor, ones).unwrap(),
-                    None => tensor.clone(),
-                }
-            })
-            .collect();
-        let network = TreeTN::from_tensors(tensors, names).map_err(|e| engine(e.into()))?;
-
+        let network = factorize_dense(problem, values, self.fault == Fault::WrongLayout)?;
         let rank = network.link_dims().into_iter().max().unwrap_or(1);
         let termination = if self.fault == Fault::IterationLimit {
             InterpolationTermination::IterationLimit
@@ -232,6 +175,7 @@ where
             initial_pivots: columns_of(problem.initial_pivots()),
             returned_pivots: returned,
             seed: problem.seed(),
+            tolerance: problem.absolute_tolerance(),
         });
         Ok(InterpolationOutcome {
             network,
@@ -241,4 +185,80 @@ where
             pivots: Some(pivots),
         })
     }
+}
+
+/// The exact network of dense active-domain `values` (column-major in the
+/// problem's site order), factorized by SVD with the default threshold.
+/// Nodes without active sites get a temporary dimension-one site that is
+/// contracted away. With `wrong_layout`, the first active site is replaced
+/// by a similar index of another identity.
+pub(crate) fn factorize_dense<T, V>(
+    problem: &InterpolationProblem<V>,
+    values: Vec<T>,
+    wrong_layout: bool,
+) -> Result<TreeTN<IdxTensor, V>, InterpolationError>
+where
+    T: CommonScalar + TensorElement,
+    V: Clone + Hash + Eq + Ord + Debug + Send + Sync,
+{
+    let engine = |source: anyhow::Error| InterpolationError::Engine { source };
+    let site_order = problem.site_order().to_vec();
+    let mut indices = site_order.clone();
+    if wrong_layout {
+        indices[0] = indices[0].sim();
+    }
+    let mut dense = IdxTensor::from_dense(indices.clone(), values).map_err(|e| engine(e.into()))?;
+    let one = vec![T::from_f64(1.0)];
+    let mut nodes = HashMap::new();
+    let mut dummies = HashMap::new();
+    let mut position = 0;
+    for (node, sites) in problem.node_sites() {
+        let node_indices = indices[position..position + sites.len()].to_vec();
+        position += sites.len();
+        if node_indices.is_empty() {
+            let dummy = DynIndex::new_dyn(1);
+            let ones = IdxTensor::from_dense(vec![dummy.clone()], one.clone()).unwrap();
+            dense = outer_product(&dense, &ones).map_err(|e| engine(e.into()))?;
+            nodes.insert(node.clone(), vec![dummy]);
+            dummies.insert(node.clone(), ones);
+        } else {
+            nodes.insert(node.clone(), node_indices);
+        }
+    }
+    let topology = problem.topology();
+    let graph = topology.graph();
+    let edges = graph
+        .edge_indices()
+        .map(|edge| {
+            let (a, b) = graph.edge_endpoints(edge).unwrap();
+            (
+                topology.node_name(a).unwrap().clone(),
+                topology.node_name(b).unwrap().clone(),
+            )
+        })
+        .collect();
+    let root = problem.node_sites().keys().next().unwrap();
+    let factorized = factorize_tensor_to_treetn_with(
+        &dense,
+        &TreeTopology::new(nodes, edges),
+        FactorizeOptions::svd(),
+        root,
+    )
+    .map_err(|e| engine(e.into()))?;
+    let names: Vec<V> = problem.node_sites().keys().cloned().collect();
+    let tensors = names
+        .iter()
+        .map(|name| {
+            let tensor = factorized
+                .tensor(factorized.node_index(name).unwrap())
+                .unwrap();
+            match dummies.get(name) {
+                Some(ones) => contract_pair(tensor, ones).unwrap(),
+                None => tensor.clone(),
+            }
+        })
+        .collect();
+    let network = TreeTN::from_tensors(tensors, names).map_err(|e| engine(e.into()))?;
+
+    Ok(network)
 }

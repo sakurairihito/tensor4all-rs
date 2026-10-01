@@ -12,7 +12,8 @@ use super::cache::{
 use super::embed::{check_outcome_layout, embed_fixed_sites, exact_active_network};
 use super::layout::SiteLayout;
 use super::sampling::{
-    build_candidates, mix64, patch_candidates, patch_seeds, PatchDomain, SplitMix64,
+    all_points, build_candidates, mix64, patch_candidates, patch_seeds, uniform_points,
+    PatchDomain, SplitMix64,
 };
 use super::{active_pivots, added_pivots, complete_points, PatchedInterpolationOptions};
 use crate::{PartitionedTreeTN, PartitionedTreeTNError, Projector, SubDomainTreeTN};
@@ -85,6 +86,44 @@ fn patch_seeds_mix_the_root_seed_with_the_path() {
         .flat_map(|seeds| [seeds.candidates, seeds.engine])
         .collect();
     assert_eq!(distinct.len(), 2 * (variants.len() + 2));
+}
+
+#[test]
+fn measurement_streams_follow_the_documented_mapping() {
+    // Expected values from an independent Python implementation of
+    // SplitMix64, the path state, and the stream selectors.
+    let root = patch_seeds(0, &[]);
+    assert_eq!(root.zero_screen(), 13_481_018_753_965_960_313);
+    assert_eq!(root.verify(0), 10_784_900_928_564_024_043);
+    assert_eq!(root.verify(1), 1_731_796_998_791_982_555);
+    assert_eq!(root.audit(), 3_965_753_011_800_562_021);
+    assert_eq!(root.scale(), 11_195_191_274_241_726_103);
+    assert_eq!(root.engine_run(0), root.engine);
+    assert_eq!(root.engine_run(1), 14_625_715_455_650_629_719);
+    let child = patch_seeds(0, &[(2, 1), (0, 3)]);
+    assert_eq!(child.zero_screen(), 1_272_130_066_354_424_498);
+    assert_eq!(child.verify(0), 977_359_825_929_394_526);
+    assert_eq!(child.verify(1), 18_371_716_087_452_245_731);
+    assert_eq!(child.audit(), 3_762_845_222_878_257_995);
+    assert_eq!(child.scale(), 7_950_964_838_826_632_979);
+    assert_eq!(child.engine_run(1), 15_846_517_643_923_597_972);
+    // Sampled points draw every coordinate in active-site order.
+    assert_eq!(
+        columns(&uniform_points(&[3, 5, 7], 4, 42), 3),
+        [vec![2, 0, 1], vec![1, 0, 6], vec![0, 4, 2], vec![1, 1, 3]]
+    );
+    // Exhaustive points are column-major, first active site fastest.
+    assert_eq!(
+        columns(&all_points(&[2, 3]), 2),
+        [
+            vec![0, 0],
+            vec![1, 0],
+            vec![0, 1],
+            vec![1, 1],
+            vec![0, 2],
+            vec![1, 2]
+        ]
+    );
 }
 
 fn domain_parts(dims: &[usize], fixed: &[Option<usize>]) -> (Vec<usize>, KeyLayout) {

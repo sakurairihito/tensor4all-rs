@@ -2,9 +2,15 @@
 #![allow(dead_code)]
 
 mod dense_engine;
+mod fiber_engine;
+mod scripted_engine;
 
 #[allow(unused_imports)]
 pub(crate) use dense_engine::*;
+#[allow(unused_imports)]
+pub(crate) use fiber_engine::*;
+#[allow(unused_imports)]
+pub(crate) use scripted_engine::*;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
@@ -265,6 +271,112 @@ pub(crate) fn quantics_tree() -> Problem {
             ("r", "z"),
         ],
     )
+}
+
+/// The M2 `quantics_tree` extended by a leaf `w` (attached to `z`) with two
+/// sites of dimensions 2 and 3: `2^7 * 6 = 768` points. The junction `r` has
+/// degree three and carries no site, and `w` carries two sites, so the
+/// cached evaluator takes its generic path. Site order w0, w1, x0, x1, x2,
+/// y0, y1, y2, z.
+pub(crate) fn extended_quantics_tree() -> Problem {
+    Problem::new(
+        &[
+            ("r", &[]),
+            ("w", &[2, 3]),
+            ("x0", &[2]),
+            ("x1", &[2]),
+            ("x2", &[2]),
+            ("y0", &[2]),
+            ("y1", &[2]),
+            ("y2", &[2]),
+            ("z", &[2]),
+        ],
+        &[
+            ("r", "x0"),
+            ("x0", "x1"),
+            ("x1", "x2"),
+            ("r", "y0"),
+            ("y0", "y1"),
+            ("y1", "y2"),
+            ("r", "z"),
+            ("z", "w"),
+        ],
+    )
+}
+
+/// One binary site per node around a junction `c` of degree three, so the
+/// cached evaluator takes its raw kernels. Site order a0, a1, b0, b1, c, d0,
+/// d1 (128 points).
+pub(crate) fn raw_kernel_tree() -> Problem {
+    Problem::new(
+        &[
+            ("a0", &[2]),
+            ("a1", &[2]),
+            ("b0", &[2]),
+            ("b1", &[2]),
+            ("c", &[2]),
+            ("d0", &[2]),
+            ("d1", &[2]),
+        ],
+        &[
+            ("c", "a0"),
+            ("a0", "a1"),
+            ("c", "b0"),
+            ("b0", "b1"),
+            ("c", "d0"),
+            ("d0", "d1"),
+        ],
+    )
+}
+
+/// Largest node degree of a problem's topology.
+pub(crate) fn max_degree(problem: &Problem) -> usize {
+    let graph = problem.topology.graph();
+    graph
+        .node_indices()
+        .map(|node| graph.neighbors(node).count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// A localized peak on [`extended_quantics_tree`]: a narrow Gaussian in
+/// (x, y) whose height depends on the flag `z` and the leaf `w`.
+pub(crate) fn extended_peak(p: &[usize]) -> f64 {
+    let (x, y) = (quantics(&p[2..5]), quantics(&p[5..8]));
+    (1.0 + 0.25 * p[0] as f64 + 0.125 * p[1] as f64)
+        * (1.0 + 0.5 * p[8] as f64)
+        * gaussian(x, 0.3, 0.12)
+        * gaussian(y, 0.6, 0.12)
+        + 0.05 * x * y
+}
+
+/// Every value of `f` on the domain of `problem` as a dense tensor, and its
+/// L2 norm.
+pub(crate) fn dense_reference<T>(problem: &Problem, f: &dyn Fn(&[usize]) -> T) -> (IdxTensor, f64)
+where
+    T: CommonScalar + TensorElement,
+{
+    let values: Vec<T> = full_domain(&problem.dims()).iter().map(|p| f(p)).collect();
+    let reference = IdxTensor::from_dense(problem.sites.clone(), values).unwrap();
+    let norm = reference.norm().unwrap();
+    (reference, norm)
+}
+
+/// `||partition - f||` over the whole domain, materialized once.
+pub(crate) fn dense_l2_residual(
+    result: &PatchedInterpolationResult<Name>,
+    reference: &IdxTensor,
+) -> f64 {
+    if result.partition.is_empty() {
+        return reference.norm().unwrap();
+    }
+    let dense = result
+        .partition
+        .to_treetn()
+        .unwrap()
+        .contract_to_tensor()
+        .unwrap();
+    dense.sub(reference).unwrap().norm().unwrap()
 }
 
 /// A peak at (0.3, 0.6) whose height depends on the flag; site order
@@ -709,4 +821,46 @@ pub(crate) fn assert_same_run(
     }
     assert_eq!(first.partition.len(), second.partition.len());
     assert_eq!(fingerprint(first, problem), fingerprint(second, problem));
+}
+
+/// Two reports of runs on separately built problems (fresh site IDs) agree:
+/// every count and record bitwise, except projectors, which carry the IDs
+/// and are compared through `fingerprint`, and the fields exempt from the
+/// determinism claim (see [`assert_same_norm`]).
+pub(crate) fn assert_same_report_across_problems(
+    first: &PatchedInterpolationReport,
+    second: &PatchedInterpolationReport,
+) {
+    assert_same_norm(&first.norm, &second.norm);
+    assert_eq!(first.splits, second.splits);
+    assert_eq!(first.function_evaluations, second.function_evaluations);
+    assert_eq!(first.cache_hits, second.cache_hits);
+    assert_eq!(
+        first.measurement_evaluations,
+        second.measurement_evaluations
+    );
+    assert_eq!(first.audit_evaluations, second.audit_evaluations);
+    assert_eq!(first.verification_failures, second.verification_failures);
+    assert_eq!(first.engine_retries, second.engine_retries);
+    assert_eq!(first.zero_patches.len(), second.zero_patches.len());
+    for (x, y) in first.zero_patches.iter().zip(&second.zero_patches) {
+        assert_eq!(x.acceptance, y.acceptance);
+        assert_eq!(x.audit, y.audit);
+    }
+    assert_eq!(first.accepted.len(), second.accepted.len());
+    for (x, y) in first.accepted.iter().zip(&second.accepted) {
+        assert_eq!(x.termination, y.termination);
+        assert_eq!(x.max_bond_dim, y.max_bond_dim);
+        assert_eq!(x.retries_used, y.retries_used);
+        assert_eq!(
+            x.engine_error_estimate.to_bits(),
+            y.engine_error_estimate.to_bits()
+        );
+        assert_eq!(
+            x.max_sample_magnitude.to_bits(),
+            y.max_sample_magnitude.to_bits()
+        );
+        assert_eq!(x.acceptance, y.acceptance);
+        assert_eq!(x.audit, y.audit);
+    }
 }
