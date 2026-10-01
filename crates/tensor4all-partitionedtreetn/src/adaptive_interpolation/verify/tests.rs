@@ -9,6 +9,7 @@ use tensor4all_treetn::{NodeNameNetwork, TreeTN};
 
 use super::network_values;
 use crate::adaptive_interpolation::{patched_interpolate, PatchedInterpolationOptions};
+use crate::{ErrorNorm, ErrorTolerance};
 
 /// A named tree with its sites in the derived site order.
 struct Tree {
@@ -159,8 +160,11 @@ fn stored_patches(tree: &Tree, f: fn(&[usize]) -> f64) -> Vec<RawPatch> {
     let all = domain(&dims);
     let scale = all.iter().map(|p| f(p).abs()).fold(0.0, f64::max);
     let options = PatchedInterpolationOptions::new(3)
-        .with_rtol(1e-8)
-        .with_reference_scale(scale)
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(scale))
+        .with_tolerance(ErrorTolerance {
+            rtol: 1e-8,
+            atol: 0.0,
+        })
         .with_seed(7);
     let result = patched_interpolate(
         &TreeTciInterpolator::default(),

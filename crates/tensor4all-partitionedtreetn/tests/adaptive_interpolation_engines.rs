@@ -13,6 +13,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use tensor4all_core::{outer_product, ColMajorArrayRef, DynIndex, IdxTensor, IndexLike};
 use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
+use tensor4all_partitionedtreetn::ErrorNorm;
 use tensor4all_treetci::TreeTciInterpolator;
 use tensor4all_treetn::interpolation::{
     InterpolationError, InterpolationOutcome, InterpolationProblem, InterpolationTermination,
@@ -33,9 +34,9 @@ fn treetci_patches_a_localized_function_on_a_quantics_chain() {
         gaussian(x, 0.3, 0.02) + 0.5 * gaussian(x, 0.71, 0.05)
     };
     let rtol = 1e-8;
-    let options = PatchedInterpolationOptions::new(4)
-        .with_rtol(rtol)
-        .with_reference_scale(max_abs(&problem, &f));
+    let options = sampled_max(4)
+        .with_tolerance(tol(rtol))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(max_abs(&problem, &f)));
     let result = run(
         &TreeTciInterpolator::default(),
         &problem,
@@ -58,9 +59,11 @@ fn quantics_tree_options(problem: &Problem, recycle: bool) -> PatchedInterpolati
         .iter()
         .map(|node| problem.site(node, 0))
         .collect();
-    PatchedInterpolationOptions::new(4)
-        .with_rtol(1e-8)
-        .with_reference_scale(max_abs(problem, &tree_peak))
+    sampled_max(4)
+        .with_tolerance(tol(1e-8))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(max_abs(
+            problem, &tree_peak,
+        )))
         .with_patch_order(order)
         .with_recycle_pivots(recycle)
         .with_seed(5)
@@ -85,7 +88,7 @@ fn treetci_patches_a_function_on_a_branched_tree_deterministically() {
             .accepted
             .iter()
             .any(|record| record.max_bond_dim >= 2));
-        assert_accurate(&result, &problem, &tree_peak, options.rtol);
+        assert_accurate(&result, &problem, &tree_peak, options.tolerance.rtol);
         runs.push(result);
     }
     assert_same_run(&problem, &runs[1], &runs[2]);
@@ -177,7 +180,7 @@ fn the_cache_supports_domains_wider_than_128_bits() {
     let problem = chain("s", 129, 2);
     // exp(x + y + z) is a product over the bits.
     let f = |p: &[usize]| p.chunks(43).map(quantics).sum::<f64>().exp();
-    let options = PatchedInterpolationOptions::new(2).with_reference_scale(20.0);
+    let options = sampled_max(2).with_error_norm(ErrorNorm::sampled_max_with_reference(20.0));
     let result = run(
         &FiberEngine,
         &problem,

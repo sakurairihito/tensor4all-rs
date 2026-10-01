@@ -152,7 +152,7 @@ pub(super) struct Counters {
 }
 
 impl Counters {
-    fn add(counter: &Cell<usize>, amount: usize) {
+    pub(super) fn add(counter: &Cell<usize>, amount: usize) {
         counter.set(counter.get().saturating_add(amount));
     }
 }

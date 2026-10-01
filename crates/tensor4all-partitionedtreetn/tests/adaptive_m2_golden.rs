@@ -2,7 +2,8 @@
 //!
 //! The scenarios below mirror the M2 test scenarios. Their outputs were
 //! recorded on the unmodified M2 driver and committed in
-//! `tests/golden/adaptive_m2.json`, in two classes:
+//! `tests/golden/adaptive_m2.json`; since M3 they run under
+//! `ErrorNorm::SampledMax`, which must reproduce them. Two classes:
 //!
 //! - **discrete outputs**, compared exactly: projector keys and their
 //!   canonical order, zero projectors, split count, function evaluations and
@@ -42,6 +43,7 @@ use tensor4all_core::{ColMajorArrayRef, CommonScalar, IndexLike, TensorElement};
 use tensor4all_partitionedtreetn::adaptive_interpolation::{
     PatchedInterpolationOptions, PatchedInterpolationResult,
 };
+use tensor4all_partitionedtreetn::ErrorNorm;
 use tensor4all_treetci::TreeTciInterpolator;
 use tensor4all_treetn::interpolation::{
     InterpolationError, InterpolationOutcome, InterpolationProblem, InterpolationTermination,
@@ -108,11 +110,12 @@ struct Scenario {
     engine: Engine,
 }
 
-/// Options with a given max-norm reference scale and relative tolerance.
+/// M2 options (`ErrorNorm::SampledMax`) with a given max-norm reference
+/// and relative tolerance.
 fn options_with(cap: usize, rtol: f64, scale: f64) -> PatchedInterpolationOptions {
-    PatchedInterpolationOptions::new(cap)
-        .with_rtol(rtol)
-        .with_reference_scale(scale)
+    sampled_max(cap)
+        .with_tolerance(tol(rtol))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(scale))
 }
 
 fn dense_scenarios() -> Vec<Scenario> {
@@ -197,7 +200,7 @@ fn dense_scenarios() -> Vec<Scenario> {
             _ if p[1] == 5 => -3.0,
             _ => 0.0,
         })),
-        options: PatchedInterpolationOptions::new(2).with_n_initial_pivots(1),
+        options: sampled_max(2).with_n_initial_pivots(1),
         pivots: vec![vec![1, 0]],
         engine: Engine::Dense(Fault::None),
     });
@@ -249,7 +252,7 @@ fn dense_scenarios() -> Vec<Scenario> {
         name: "dense_iteration_limit",
         problem: chain3(),
         function: Function::Real(Box::new(|p: &[usize]| dyadic_product(p, 0))),
-        options: PatchedInterpolationOptions::new(4).with_reference_scale(2.0),
+        options: sampled_max(4).with_error_norm(ErrorNorm::sampled_max_with_reference(2.0)),
         pivots: vec![],
         engine: Engine::Dense(Fault::IterationLimit),
     });
@@ -434,13 +437,12 @@ fn capture(
             "nodes": layouts,
         }));
         accepted_floating.push(json!({
-            "error_estimate": record.error_estimate,
+            "error_estimate": record.engine_error_estimate,
             "max_sample_magnitude": record.max_sample_magnitude,
             "nodes": values,
         }));
     }
-    let zero: Vec<Vec<(usize, usize)>> = report
-        .zero_projectors
+    let zero: Vec<Vec<(usize, usize)>> = zero_projectors(report)
         .iter()
         .map(|projector| projector_key(projector, problem))
         .collect();
@@ -458,7 +460,7 @@ fn capture(
                 .collect::<Vec<_>>(),
         },
         "floating": {
-            "reference_scale": report.reference_scale,
+            "reference_scale": max_reference(report),
             "accepted": accepted_floating,
             "engine_calls": calls
                 .iter()
@@ -668,6 +670,10 @@ fn m2_golden_outputs_are_reproduced() {
         assert_eq!(expected["name"], scenario.name);
         let (actual, calls) = run_scenario(scenario);
         assert_screened(scenario.name, &calls);
+        // Parse the actual record through the same text round trip as the
+        // committed one, so that the JSON float parser cannot add a
+        // difference of its own.
+        let actual: Value = serde_json::from_str(&actual.to_string()).unwrap();
         assert_matches_golden(expected, &actual);
     }
 }

@@ -14,7 +14,7 @@ use super::layout::SiteLayout;
 use super::sampling::{
     build_candidates, mix64, patch_candidates, patch_seeds, PatchDomain, SplitMix64,
 };
-use super::{complete_pivots, PatchedInterpolationOptions};
+use super::{active_pivots, added_pivots, complete_points, PatchedInterpolationOptions};
 use crate::{PartitionedTreeTN, PartitionedTreeTNError, Projector, SubDomainTreeTN};
 
 // ---------------------------------------------------------------------------
@@ -383,7 +383,7 @@ fn chain_layout() -> (SiteLayout<usize>, Vec<DynIndex>) {
         topology,
         node_sites,
         &no_pivots(3),
-        &PatchedInterpolationOptions::new(2),
+        &PatchedInterpolationOptions::new(2).with_error_norm(crate::ErrorNorm::sampled_max()),
     )
     .unwrap();
     (layout, sites)
@@ -611,26 +611,43 @@ fn completed_pivots_carry_the_fixed_coordinates() {
     let dims = [2, 3, 4];
     let fixed = [None, Some(2), None];
     let active = [0, 2];
-    assert!(complete_pivots(None, &fixed, &active, &dims)
-        .unwrap()
-        .is_empty());
+    assert!(active_pivots(None, &active, &dims).unwrap().is_empty());
     let pivots = ColMajorArray::new(vec![1, 3, 0, 0], vec![2, 2]).unwrap();
+    let local = active_pivots(Some(&pivots), &active, &dims).unwrap();
+    assert_eq!(local, [vec![1, 3], vec![0, 0]]);
     assert_eq!(
-        complete_pivots(Some(&pivots), &fixed, &active, &dims).unwrap(),
+        complete_points(&local, &fixed),
         [vec![1, 2, 3], vec![0, 2, 0]]
     );
     let one_d = ColMajorArray::new(vec![1, 3], vec![2]).unwrap();
-    assert!(complete_pivots(Some(&one_d), &fixed, &active, &dims)
+    assert!(active_pivots(Some(&one_d), &active, &dims)
         .unwrap_err()
         .contains("expected a 2D array"));
     let rows = ColMajorArray::new(vec![1, 1, 1], vec![3, 1]).unwrap();
-    assert!(complete_pivots(Some(&rows), &fixed, &active, &dims)
+    assert!(active_pivots(Some(&rows), &active, &dims)
         .unwrap_err()
         .contains("3 rows"));
     let range = ColMajorArray::new(vec![1, 4], vec![2, 1]).unwrap();
-    assert!(complete_pivots(Some(&range), &fixed, &active, &dims)
+    assert!(active_pivots(Some(&range), &active, &dims)
         .unwrap_err()
         .contains("coordinate 4"));
+}
+
+#[test]
+fn added_pivots_put_worst_points_first_and_drop_known_points() {
+    let base: HashSet<Vec<usize>> = [vec![0, 0], vec![1, 1]].into_iter().collect();
+    let worst = [vec![2, 2], vec![1, 1], vec![3, 3]];
+    let outcome = [vec![3, 3], vec![0, 0], vec![4, 4], vec![5, 5]];
+    // Base candidates and repeats are dropped; the list stops at the limit.
+    assert_eq!(
+        added_pivots(&base, &worst, &outcome, 3),
+        [vec![2, 2], vec![3, 3], vec![4, 4]]
+    );
+    assert_eq!(
+        added_pivots(&base, &worst, &outcome, 10),
+        [vec![2, 2], vec![3, 3], vec![4, 4], vec![5, 5]]
+    );
+    assert!(added_pivots(&base, &[], &[], 3).is_empty());
 }
 
 // ---------------------------------------------------------------------------

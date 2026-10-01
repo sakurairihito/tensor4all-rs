@@ -9,7 +9,7 @@ use tensor4all_treetn::interpolation::{validate_layout, InterpolationError, Inte
 use tensor4all_treetn::NodeNameNetwork;
 
 use super::{invalid, PatchedInterpolationError, PatchedInterpolationOptions};
-use crate::Projector;
+use crate::{ErrorNorm, L2Reference, Projector};
 
 /// The validated layout of the problem.
 pub(super) struct SiteLayout<V>
@@ -28,6 +28,9 @@ where
     pub(super) edges: Vec<(V, V)>,
     /// Positions fixed by successive splits.
     pub(super) split_order: Vec<usize>,
+    /// `|X|` as `f64`; finite under `ErrorNorm::L2`, possibly infinite
+    /// under `SampledMax`.
+    pub(super) domain_points: f64,
 }
 
 impl<V> SiteLayout<V>
@@ -51,6 +54,25 @@ where
         let split_order = resolve_patch_order(&options.patch_order, &sites)?;
         validate_options(options)?;
         validate_initial_pivots(initial_pivots, &dims)?;
+        let domain_points: f64 = dims.iter().map(|&dim| dim as f64).product();
+        if let ErrorNorm::L2 { reference, .. } = options.error_norm {
+            if !domain_points.is_finite() {
+                return Err(invalid(format!(
+                    "the domain has more points than f64 can represent (a product of {} site \
+                     dimensions); ErrorNorm::L2 needs a finite point count; use \
+                     ErrorNorm::sampled_max() for this domain",
+                    dims.len()
+                )));
+            }
+            if reference == L2Reference::Required && options.tolerance.rtol > 0.0 && sites.len() > 1
+            {
+                return Err(invalid(
+                    "ErrorNorm::L2 needs a reference norm when tolerance.rtol > 0 and the root \
+                     patch has more than one site; give L2Reference::Given(norm), set rtol = 0 \
+                     with a positive atol, or opt into L2Reference::MonteCarlo",
+                ));
+            }
+        }
 
         let mut node_positions = Vec::with_capacity(node_sites.len());
         let mut site_nodes = Vec::with_capacity(sites.len());
@@ -81,6 +103,7 @@ where
             site_nodes,
             edges,
             split_order,
+            domain_points,
         })
     }
 
@@ -152,18 +175,32 @@ fn resolve_patch_order(
 fn validate_options(
     options: &PatchedInterpolationOptions,
 ) -> Result<(), PatchedInterpolationError> {
-    if !options.rtol.is_finite() || options.rtol < 0.0 {
-        return Err(invalid(format!(
-            "rtol must be finite and nonnegative, got {}",
-            options.rtol
-        )));
-    }
-    if let Some(scale) = options.reference_scale {
-        if !scale.is_finite() || scale <= 0.0 {
+    let tolerance = options.tolerance;
+    for (name, value) in [("rtol", tolerance.rtol), ("atol", tolerance.atol)] {
+        if !value.is_finite() || value < 0.0 {
             return Err(invalid(format!(
-                "reference_scale must be finite and positive, got {scale}"
+                "tolerance.{name} must be finite and nonnegative, got {value}"
             )));
         }
+    }
+    match options.error_norm {
+        ErrorNorm::SampledMax {
+            max_reference: Some(scale),
+            ..
+        } if !scale.is_finite() || scale <= 0.0 => {
+            return Err(invalid(format!(
+                "max_reference of ErrorNorm::SampledMax must be finite and positive, got {scale}"
+            )));
+        }
+        ErrorNorm::L2 {
+            reference: L2Reference::Given(norm),
+            ..
+        } if !norm.is_finite() || norm <= 0.0 => {
+            return Err(invalid(format!(
+                "the reference norm of L2Reference::Given must be finite and positive, got {norm}"
+            )));
+        }
+        _ => {}
     }
     if options.max_bond_dim < 2 {
         return Err(invalid(format!(
@@ -177,6 +214,12 @@ fn validate_options(
     }
     if options.max_patches == Some(0) {
         return Err(invalid("max_patches must be positive when given"));
+    }
+    if options.verification.samples < 2 {
+        return Err(invalid(format!(
+            "verification.samples must be at least 2, got {}",
+            options.verification.samples
+        )));
     }
     Ok(())
 }

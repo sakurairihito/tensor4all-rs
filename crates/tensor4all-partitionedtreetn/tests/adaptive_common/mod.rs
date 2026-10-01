@@ -15,21 +15,53 @@ use tensor4all_core::{
     ColMajorArray, ColMajorArrayRef, CommonScalar, DynIndex, IdxTensor, IndexLike, TensorElement,
 };
 use tensor4all_partitionedtreetn::adaptive_interpolation::{
-    patched_interpolate, PatchedInterpolationError, PatchedInterpolationOptions,
-    PatchedInterpolationResult,
+    patched_interpolate, GlobalL2Error, NormReport, PatchedInterpolationError,
+    PatchedInterpolationOptions, PatchedInterpolationReport, PatchedInterpolationResult,
+    GLOBAL_ROUNDING_MARGIN,
 };
-use tensor4all_partitionedtreetn::Projector;
+use tensor4all_partitionedtreetn::{ErrorNorm, ErrorTolerance, Projector};
 use tensor4all_treetn::interpolation::{
     InterpolationError, InterpolationProblem, TreeInterpolator,
 };
 use tensor4all_treetn::NodeNameNetwork;
 
 /// Accuracy bound of accepted patches against a dense reference, in units of
-/// `rtol * reference_scale`. The acceptance criterion is the engine's sampled
+/// `rtol * max_reference` (under `ErrorNorm::SampledMax`). The acceptance criterion is the engine's sampled
 /// error estimate, not a verified bound, so the tests allow this margin.
 pub(crate) const ACCURACY_FACTOR: f64 = 10.0;
 
 pub(crate) type Name = String;
+
+// ---------------------------------------------------------------------------
+// Options and report accessors
+// ---------------------------------------------------------------------------
+
+/// Options with the M2 criterion (`ErrorNorm::sampled_max()`).
+pub(crate) fn sampled_max(max_bond_dim: usize) -> PatchedInterpolationOptions {
+    PatchedInterpolationOptions::new(max_bond_dim).with_error_norm(ErrorNorm::sampled_max())
+}
+
+/// A relative tolerance without an absolute floor.
+pub(crate) fn tol(rtol: f64) -> ErrorTolerance {
+    ErrorTolerance { rtol, atol: 0.0 }
+}
+
+/// The max-norm reference of a `SampledMax` run.
+pub(crate) fn max_reference(report: &PatchedInterpolationReport) -> f64 {
+    match report.norm {
+        NormReport::SampledMax { max_reference, .. } => max_reference,
+        ref other => panic!("expected a SampledMax report, got {other:?}"),
+    }
+}
+
+/// The projectors of the zero patches, in report order.
+pub(crate) fn zero_projectors(report: &PatchedInterpolationReport) -> Vec<Projector> {
+    report
+        .zero_patches
+        .iter()
+        .map(|record| record.projector.clone())
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Problems
@@ -314,7 +346,8 @@ pub(crate) fn check_invariants(
     };
     let report = &result.report;
     let accepted: Vec<&Projector> = report.accepted.iter().map(|r| &r.projector).collect();
-    for list in [accepted.clone(), report.zero_projectors.iter().collect()] {
+    let zeros = zero_projectors(report);
+    for list in [accepted.clone(), zeros.iter().collect()] {
         let paths: Vec<_> = list
             .iter()
             .map(|projector| path_of(projector, &split_order, problem))
@@ -324,11 +357,7 @@ pub(crate) fn check_invariants(
             "not canonical: {paths:?}"
         );
     }
-    let all: Vec<&Projector> = accepted
-        .iter()
-        .copied()
-        .chain(report.zero_projectors.iter())
-        .collect();
+    let all: Vec<&Projector> = accepted.iter().copied().chain(zeros.iter()).collect();
     for (i, left) in all.iter().enumerate() {
         for right in &all[i + 1..] {
             assert!(
@@ -445,7 +474,7 @@ pub(crate) fn assert_accurate<T>(
     T: CommonScalar + TensorElement,
 {
     let (residual, _) = dense_residual(result, problem, f);
-    let bound = ACCURACY_FACTOR * rtol * result.report.reference_scale;
+    let bound = ACCURACY_FACTOR * rtol * max_reference(&result.report);
     assert!(residual <= bound, "residual {residual} exceeds {bound}");
 }
 
@@ -552,30 +581,131 @@ pub(crate) fn fingerprint(
         .collect()
 }
 
+/// Whether two values agree within `GLOBAL_ROUNDING_MARGIN`.
+fn within_margin(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() <= GLOBAL_ROUNDING_MARGIN * a.abs().max(b.abs()),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// The norm reports of two runs agree: bitwise except the fields exempt from
+/// the determinism claim, which agree within `GLOBAL_ROUNDING_MARGIN`;
+/// `rounding_limited` is compared only away from its threshold.
+pub(crate) fn assert_same_norm(a: &NormReport, b: &NormReport) {
+    match (a, b) {
+        (
+            NormReport::L2 {
+                reference_rms: ra,
+                source: sa,
+                tau: ta,
+                error: ea,
+                ..
+            },
+            NormReport::L2 {
+                reference_rms: rb,
+                source: sb,
+                tau: tb,
+                error: eb,
+                ..
+            },
+        ) => {
+            assert_eq!(ra.map(f64::to_bits), rb.map(f64::to_bits));
+            assert_eq!(sa, sb);
+            assert_eq!(ta.to_bits(), tb.to_bits());
+            assert_eq!(ea.domain_points.to_bits(), eb.domain_points.to_bits());
+            assert_eq!(
+                ea.certified_fraction.to_bits(),
+                eb.certified_fraction.to_bits()
+            );
+            assert!(within_margin(ea.approximation_rms, eb.approximation_rms));
+            match (&ea.global, &eb.global) {
+                (
+                    GlobalL2Error::Certified {
+                        rms_error: xa,
+                        rounding_allowance_rms: aa,
+                        rounding_limited: la,
+                        relative_error_bound: ba,
+                        ..
+                    },
+                    GlobalL2Error::Certified {
+                        rms_error: xb,
+                        rounding_allowance_rms: ab,
+                        rounding_limited: lb,
+                        relative_error_bound: bb,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(xa.to_bits(), xb.to_bits());
+                    assert!(within_margin(*aa, *ab));
+                    assert!(within_margin(*ba, *bb));
+                    let near_threshold = aa.is_some_and(|aa| within_margin(Some(aa), Some(*ta)));
+                    if !near_threshold {
+                        assert_eq!(la, lb);
+                    }
+                }
+                (
+                    GlobalL2Error::Audited {
+                        rms_error_estimate: xa,
+                        mean_square_rel_std_error: sa,
+                        relative_bound_estimate: ba,
+                        ..
+                    },
+                    GlobalL2Error::Audited {
+                        rms_error_estimate: xb,
+                        mean_square_rel_std_error: sb,
+                        relative_bound_estimate: bb,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(xa.to_bits(), xb.to_bits());
+                    assert_eq!(sa.to_bits(), sb.to_bits());
+                    assert!(within_margin(*ba, *bb));
+                }
+                (x, y) => assert_eq!(x, y),
+            }
+        }
+        (x, y) => assert_eq!(x, y),
+    }
+}
+
 /// Two runs are identical: the same records in the same order, the same
 /// counts, and bitwise-identical stored patches (same legs in the same
-/// positional order, same raw column-major data).
+/// positional order, same raw column-major data). The fields exempt from the
+/// determinism claim are compared as in [`assert_same_norm`].
 pub(crate) fn assert_same_run(
     problem: &Problem,
     first: &PatchedInterpolationResult<Name>,
     second: &PatchedInterpolationResult<Name>,
 ) {
     let (a, b) = (&first.report, &second.report);
-    assert_eq!(a.reference_scale, b.reference_scale);
+    assert_eq!(a.tolerance, b.tolerance);
+    assert_same_norm(&a.norm, &b.norm);
     assert_eq!(a.splits, b.splits);
     assert_eq!(a.function_evaluations, b.function_evaluations);
     assert_eq!(a.cache_hits, b.cache_hits);
-    assert_eq!(a.zero_projectors, b.zero_projectors);
+    assert_eq!(a.measurement_evaluations, b.measurement_evaluations);
+    assert_eq!(a.audit_evaluations, b.audit_evaluations);
+    assert_eq!(a.verification_failures, b.verification_failures);
+    assert_eq!(a.engine_retries, b.engine_retries);
+    assert_eq!(a.zero_patches, b.zero_patches);
     assert_eq!(a.accepted.len(), b.accepted.len());
     for (x, y) in a.accepted.iter().zip(&b.accepted) {
         assert_eq!(x.projector, y.projector);
         assert_eq!(x.termination, y.termination);
-        assert_eq!(x.error_estimate.to_bits(), y.error_estimate.to_bits());
+        assert_eq!(
+            x.engine_error_estimate.to_bits(),
+            y.engine_error_estimate.to_bits()
+        );
         assert_eq!(
             x.max_sample_magnitude.to_bits(),
             y.max_sample_magnitude.to_bits()
         );
         assert_eq!(x.max_bond_dim, y.max_bond_dim);
+        assert_eq!(x.retries_used, y.retries_used);
+        assert_eq!(x.acceptance, y.acceptance);
+        assert_eq!(x.audit, y.audit);
     }
     assert_eq!(first.partition.len(), second.partition.len());
     assert_eq!(fingerprint(first, problem), fingerprint(second, problem));

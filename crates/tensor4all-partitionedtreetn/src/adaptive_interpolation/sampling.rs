@@ -21,6 +21,14 @@ const PATH_DOMAIN: u64 = 0x7472_6565_7061_7463;
 const CANDIDATE_STREAM: u64 = 0x6361_6e64_6964_6174;
 /// Stream selector of the engine sub-seed.
 const ENGINE_STREAM: u64 = 0x656e_6769_6e65_7365;
+/// Stream selector of the zero-screen measurement ("zeroscrn").
+const ZERO_SCREEN_STREAM: u64 = 0x7a65_726f_7363_726e;
+/// Stream selector of the verification measurements ("verifyst").
+const VERIFY_STREAM: u64 = 0x7665_7269_6679_7374;
+/// Stream selector of the audit measurement ("auditstr").
+const AUDIT_STREAM: u64 = 0x6175_6469_7473_7472;
+/// Stream selector of the Monte Carlo reference estimate ("scalestr").
+const SCALE_STREAM: u64 = 0x7363_616c_6573_7472;
 /// Random attempts per missing candidate before the column-major fallback.
 const ATTEMPTS_PER_CANDIDATE: usize = 20;
 /// Random attempts added to every patch before the column-major fallback.
@@ -65,15 +73,55 @@ pub(super) fn mix64(value: u64) -> u64 {
     SplitMix64::new(value).next_u64()
 }
 
-/// The candidate and engine sub-seeds of a patch.
+/// The sub-seeds and measurement streams of a patch.
 ///
 /// The root seed is mixed with the patch path, a sequence of (position in the
-/// derived site order, coordinate) pairs in split order. The encoding uses no
-/// index identities, so it does not depend on how the split sites were chosen.
+/// derived site order, coordinate) pairs in split order, into the path state
+/// `s`. The encoding uses no index identities, so it does not depend on how
+/// the split sites were chosen. Every stream depends only on the root seed,
+/// the path, and the stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PatchSeeds {
+    /// The path state `s`.
+    pub(super) state: u64,
+    /// `mix(s ^ CANDIDATE_STREAM)`.
     pub(super) candidates: u64,
+    /// `mix(s ^ ENGINE_STREAM)`, the seed of engine run 0.
     pub(super) engine: u64,
+}
+
+impl PatchSeeds {
+    /// Engine seed of run `attempt`: the M2 engine seed for run 0, then
+    /// `mix(engine ^ attempt)`.
+    pub(super) fn engine_run(&self, attempt: usize) -> u64 {
+        if attempt == 0 {
+            self.engine
+        } else {
+            mix64(self.engine ^ attempt as u64)
+        }
+    }
+
+    /// Stream of the zero-screen measurement, `mix(s ^ ZERO_SCREEN_STREAM)`.
+    pub(super) fn zero_screen(&self) -> u64 {
+        mix64(self.state ^ ZERO_SCREEN_STREAM)
+    }
+
+    /// Stream of the verification of engine run `attempt`,
+    /// `mix(mix(s ^ VERIFY_STREAM) ^ attempt)`.
+    pub(super) fn verify(&self, attempt: usize) -> u64 {
+        mix64(mix64(self.state ^ VERIFY_STREAM) ^ attempt as u64)
+    }
+
+    /// Stream of the audit, `mix(s ^ AUDIT_STREAM)`.
+    pub(super) fn audit(&self) -> u64 {
+        mix64(self.state ^ AUDIT_STREAM)
+    }
+
+    /// Stream of the Monte Carlo reference estimate (root only),
+    /// `mix(s ^ SCALE_STREAM)`.
+    pub(super) fn scale(&self) -> u64 {
+        mix64(self.state ^ SCALE_STREAM)
+    }
 }
 
 pub(super) fn patch_seeds(root_seed: u64, path: &[(usize, usize)]) -> PatchSeeds {
@@ -85,9 +133,40 @@ pub(super) fn patch_seeds(root_seed: u64, path: &[(usize, usize)]) -> PatchSeeds
         },
     );
     PatchSeeds {
+        state,
         candidates: mix64(state ^ CANDIDATE_STREAM),
         engine: mix64(state ^ ENGINE_STREAM),
     }
+}
+
+/// `count` uniform points of a patch with the given active dimensions, drawn
+/// with replacement from the stream seeded with `seed`: each coordinate in
+/// active-site order with Lemire's draw. Column-major `[n_active, count]`.
+pub(super) fn uniform_points(active_dims: &[usize], count: usize, seed: u64) -> Vec<usize> {
+    let mut rng = SplitMix64::new(seed);
+    let mut points = Vec::with_capacity(active_dims.len().saturating_mul(count));
+    for _ in 0..count {
+        points.extend(
+            active_dims
+                .iter()
+                .map(|&dim| rng.below(dim as u64) as usize),
+        );
+    }
+    points
+}
+
+/// Every point of a patch with the given active dimensions, column-major
+/// (first active site fastest). The caller bounds the count.
+pub(super) fn all_points(active_dims: &[usize]) -> Vec<usize> {
+    let count: usize = active_dims.iter().product();
+    let mut points = Vec::with_capacity(active_dims.len() * count);
+    for mut linear in 0..count {
+        for &dim in active_dims {
+            points.push(linear % dim);
+            linear /= dim;
+        }
+    }
+    points
 }
 
 /// Candidate pivots of a patch in active coordinates.

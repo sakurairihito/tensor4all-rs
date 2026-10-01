@@ -24,6 +24,7 @@
 
 pub mod adaptive_interpolation;
 mod error;
+mod error_norm;
 mod partitioned_tree_tn;
 mod patching;
 mod projector;
@@ -31,6 +32,7 @@ pub mod reconstruction;
 mod subdomain_tree_tn;
 
 pub use error::{PartitionedTreeTNError, Result};
+pub use error_norm::{ErrorNorm, ErrorTolerance, L2Reference};
 pub use partitioned_tree_tn::PartitionedTreeTN;
 pub use patching::{
     add_with_patching, contract_adaptive, truncate_adaptive, PatchSplitStrategy, PatchingOptions,

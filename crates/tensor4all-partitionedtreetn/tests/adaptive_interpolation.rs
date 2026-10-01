@@ -16,10 +16,9 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex, Index, IndexLike, TagSet};
 use tensor4all_partitionedtreetn::adaptive_interpolation::{
-    patched_interpolate, PatchedInterpolationError, PatchedInterpolationOptions,
-    PatchedInterpolationResult,
+    patched_interpolate, PatchedInterpolationError, PatchedInterpolationResult,
 };
-use tensor4all_partitionedtreetn::Projector;
+use tensor4all_partitionedtreetn::{ErrorNorm, Projector};
 use tensor4all_treetn::interpolation::{
     validate_layout, InterpolationError, InterpolationTermination,
 };
@@ -44,14 +43,14 @@ fn branched_topology_is_a_genuine_tree_with_a_degree_three_node() {
 /// splits once at `split` and every child converges with rank one.
 fn assert_single_split(problem: &Problem, split: &DynIndex) {
     let f = switch_on(problem.position(split));
-    let options = PatchedInterpolationOptions::new(2)
-        .with_rtol(1e-12)
-        .with_reference_scale(10.0)
+    let options = sampled_max(2)
+        .with_tolerance(tol(1e-12))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0))
         .with_patch_order(vec![split.clone()]);
     let result = run(&DenseEngine::new(), problem, &f, &[], &options).unwrap();
     let report = &result.report;
     assert_eq!(report.splits, 1);
-    assert!(report.zero_projectors.is_empty());
+    assert!(zero_projectors(report).is_empty());
     assert_eq!(report.accepted.len(), split.dim());
     for (value, record) in report.accepted.iter().enumerate() {
         assert_eq!(
@@ -101,9 +100,9 @@ fn splits_until_every_site_of_a_node_is_fixed() {
     let (p0, p1) = (problem.position(&d0), problem.position(&d1));
     // Fixing d0 alone leaves two product functions; fixing both leaves one.
     let f = move |point: &[usize]| product(point, 2 * point[p0] + point[p1]);
-    let options = PatchedInterpolationOptions::new(2)
-        .with_rtol(1e-12)
-        .with_reference_scale(10.0)
+    let options = sampled_max(2)
+        .with_tolerance(tol(1e-12))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0))
         .with_patch_order(vec![d0.clone(), d1.clone()]);
     let engine = DenseEngine::new();
     let result = run(&engine, &problem, &f, &[], &options).unwrap();
@@ -120,14 +119,14 @@ fn splits_until_every_site_of_a_node_is_fixed() {
 fn single_node_topology_runs_the_engine_on_several_sites() {
     let problem = single_node(&[3, 4]);
     let f = |p: &[usize]| (1 + p[0] * p[1]) as f64;
-    let options = PatchedInterpolationOptions::new(2);
+    let options = sampled_max(2);
     let engine = DenseEngine::new();
     let result = run(&engine, &problem, &f, &[vec![2, 3]], &options).unwrap();
     assert_eq!(result.report.splits, 0);
     assert_eq!(result.report.accepted.len(), 1);
     assert_eq!(engine.seen().len(), 1);
     // The root scale is pinned from the candidates, which include (2, 3).
-    assert_eq!(result.report.reference_scale, 7.0);
+    assert_eq!(max_reference(&result.report), 7.0);
     let (residual, _) = dense_residual(&result, &problem, &f);
     assert!(residual < 1e-12);
 }
@@ -137,13 +136,13 @@ fn iteration_limit_splits_like_the_bond_cap() {
     let problem = chain3();
     let f = |p: &[usize]| product(p, 0);
     let engine = DenseEngine::with_fault(Fault::IterationLimit);
-    let options = PatchedInterpolationOptions::new(4).with_reference_scale(2.0);
+    let options = sampled_max(4).with_error_norm(ErrorNorm::sampled_max_with_reference(2.0));
     let result = run(&engine, &problem, &f, &[], &options).unwrap();
     // Root and both children split; the grandchildren are exact.
     assert_eq!(result.report.splits, 3);
     assert_eq!(result.report.accepted.len(), 4);
     assert_eq!(engine.seen().len(), 3);
-    assert_accurate(&result, &problem, &f, options.rtol);
+    assert_accurate(&result, &problem, &f, options.tolerance.rtol);
 }
 
 #[test]
@@ -163,9 +162,9 @@ fn site_identity_uses_the_full_index() {
         [base.clone(), primed.clone(), tagged.clone()]
     );
     let f = switch_on(1);
-    let options = PatchedInterpolationOptions::new(2)
-        .with_rtol(1e-12)
-        .with_reference_scale(10.0)
+    let options = sampled_max(2)
+        .with_tolerance(tol(1e-12))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0))
         .with_patch_order(vec![primed.clone()]);
     let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
     assert_eq!(result.report.accepted.len(), 2);
@@ -202,9 +201,9 @@ fn reports_are_in_canonical_path_order() {
             product(p, p[1])
         }
     };
-    let options = PatchedInterpolationOptions::new(2)
-        .with_rtol(1e-12)
-        .with_reference_scale(10.0);
+    let options = sampled_max(2)
+        .with_tolerance(tol(1e-12))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0));
     let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
     let (s0, s1) = (problem.site("n0", 0), problem.site("n1", 0));
     let projectors: Vec<Projector> = result
@@ -231,13 +230,13 @@ fn vanishing_regions_are_reported_as_zero_patches() {
     let (j0, a0) = (problem.site("j", 0), problem.site("a", 0));
     let (pj, pa) = (problem.position(&j0), problem.position(&a0));
     let f = move |p: &[usize]| if p[pj] == 0 { 0.0 } else { product(p, p[pa]) };
-    let options = PatchedInterpolationOptions::new(2)
-        .with_rtol(1e-12)
-        .with_reference_scale(10.0)
+    let options = sampled_max(2)
+        .with_tolerance(tol(1e-12))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0))
         .with_patch_order(vec![j0.clone(), a0.clone()]);
     let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
     assert_eq!(
-        result.report.zero_projectors,
+        zero_projectors(&result.report),
         [Projector::from_pairs([(j0.clone(), 0)]).unwrap()]
     );
     assert_eq!(result.report.accepted.len(), 3);
@@ -265,23 +264,23 @@ fn one_site_patches_below_the_root_are_evaluated_exactly() {
         _ if p[1] == 5 => -3.0,
         _ => 0.0,
     };
-    let options = PatchedInterpolationOptions::new(2).with_n_initial_pivots(1);
+    let options = sampled_max(2).with_n_initial_pivots(1);
     let engine = DenseEngine::new();
     let result = run(&engine, &problem, &f, &[vec![1, 0]], &options).unwrap();
     let report = &result.report;
     // The scale is pinned from the single root candidate, f(1, 0) = 1.
-    assert_eq!(report.reference_scale, 1.0);
+    assert_eq!(max_reference(report), 1.0);
     assert_eq!(report.splits, 1);
     assert_eq!(engine.seen().len(), 1);
     assert_eq!(
-        report.zero_projectors,
+        zero_projectors(report),
         [Projector::from_pairs([(s.clone(), 0)]).unwrap()]
     );
     assert_eq!(report.accepted.len(), 2);
     let sparse = &report.accepted[1];
     assert_eq!(sparse.projector.get(&s), Some(2));
     assert_eq!(sparse.termination, InterpolationTermination::Converged);
-    assert_eq!(sparse.error_estimate, 0.0);
+    assert_eq!(sparse.engine_error_estimate, 0.0);
     assert_eq!(sparse.max_sample_magnitude, 3.0);
     assert_eq!(sparse.max_bond_dim, 1);
     // All 24 points were needed and each was evaluated once.
@@ -294,11 +293,11 @@ fn one_site_patches_below_the_root_are_evaluated_exactly() {
 fn a_one_site_root_pins_the_scale_from_its_exact_values() {
     let problem = single_node(&[8]);
     let f = |p: &[usize]| if p[0] == 5 { -4.0 } else { 0.0 };
-    let options = PatchedInterpolationOptions::new(2).with_n_initial_pivots(1);
+    let options = sampled_max(2).with_n_initial_pivots(1);
     let engine = DenseEngine::new();
     let result = run(&engine, &problem, &f, &[], &options).unwrap();
     assert!(engine.seen().is_empty());
-    assert_eq!(result.report.reference_scale, 4.0);
+    assert_eq!(max_reference(&result.report), 4.0);
     assert_eq!(result.report.accepted.len(), 1);
     assert_eq!(result.report.accepted[0].max_sample_magnitude, 4.0);
     assert_eq!(result.report.function_evaluations, 8);
@@ -310,23 +309,16 @@ fn a_one_site_root_pins_the_scale_from_its_exact_values() {
 fn an_all_zero_exact_root_gives_an_empty_partition() {
     let problem = single_node(&[3]);
     let zero = |_: &[usize]| 0.0;
-    let result = run(
-        &DenseEngine::new(),
-        &problem,
-        &zero,
-        &[],
-        &PatchedInterpolationOptions::new(2),
-    )
-    .unwrap();
+    let result = run(&DenseEngine::new(), &problem, &zero, &[], &sampled_max(2)).unwrap();
     assert!(result.partition.is_empty());
     assert!(result.report.accepted.is_empty());
-    assert_eq!(result.report.zero_projectors, [Projector::new()]);
-    assert_eq!(result.report.reference_scale, 0.0);
+    assert_eq!(zero_projectors(&result.report), [Projector::new()]);
+    assert_eq!(max_reference(&result.report), 0.0);
 
-    let given = PatchedInterpolationOptions::new(2).with_reference_scale(2.0);
+    let given = sampled_max(2).with_error_norm(ErrorNorm::sampled_max_with_reference(2.0));
     let result = run(&DenseEngine::new(), &problem, &zero, &[], &given).unwrap();
     assert!(result.partition.is_empty());
-    assert_eq!(result.report.reference_scale, 2.0);
+    assert_eq!(max_reference(&result.report), 2.0);
 }
 
 #[test]
@@ -334,14 +326,7 @@ fn an_exact_root_keeps_nodes_without_sites() {
     // The site-free node "a" gets a dimension-one link to the node "b".
     let problem = Problem::new(&[("a", &[]), ("b", &[4])], &[("a", "b")]);
     let f = |p: &[usize]| 1.0 + p[0] as f64;
-    let result = run(
-        &DenseEngine::new(),
-        &problem,
-        &f,
-        &[],
-        &PatchedInterpolationOptions::new(2),
-    )
-    .unwrap();
+    let result = run(&DenseEngine::new(), &problem, &f, &[], &sampled_max(2)).unwrap();
     let data = result.partition.to_treetn().unwrap();
     assert_eq!(data.node_count(), 2);
     assert_eq!(data.link_dims(), [1]);
@@ -355,24 +340,20 @@ fn a_zero_root_that_needs_the_engine_uses_the_given_scale_or_fails() {
     let problem = branched();
     let zero = |_: &[usize]| 0.0;
     let engine = DenseEngine::new();
-    let options = PatchedInterpolationOptions::new(2).with_reference_scale(1.0);
+    let options = sampled_max(2).with_error_norm(ErrorNorm::sampled_max_with_reference(1.0));
     let result = run(&engine, &problem, &zero, &[], &options).unwrap();
     assert!(result.partition.is_empty());
-    assert_eq!(result.report.zero_projectors, [Projector::new()]);
+    assert_eq!(zero_projectors(&result.report), [Projector::new()]);
     assert_eq!(result.report.function_evaluations, 5);
     assert!(engine.seen().is_empty());
 
     let message = expect_invalid(
-        run(
-            &engine,
-            &problem,
-            &zero,
-            &[],
-            &PatchedInterpolationOptions::new(2),
-        ),
+        run(&engine, &problem, &zero, &[], &sampled_max(2)),
         "cannot be pinned",
     );
-    assert!(message.contains("pass reference_scale or initial pivots"));
+    assert!(
+        message.contains("give ErrorNorm::sampled_max_with_reference(max_abs) or initial pivots")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -406,9 +387,9 @@ fn complex_patches_have_one_dtype() {
         .map(|_| rng.random_range(0.0..std::f64::consts::TAU))
         .collect();
     let f = move |p: &[usize]| Complex64::from_polar(product(p, p[pj]), phases[p[pj]]);
-    let options = PatchedInterpolationOptions::new(2)
-        .with_rtol(1e-12)
-        .with_reference_scale(10.0)
+    let options = sampled_max(2)
+        .with_tolerance(tol(1e-12))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0))
         .with_patch_order(vec![j0]);
     let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
     assert_eq!(result.report.accepted.len(), 2);
@@ -421,15 +402,8 @@ fn complex_exact_patches_have_one_dtype() {
     // An exact root on two nodes: the site-free node holds a complex one.
     let problem = Problem::new(&[("a", &[]), ("b", &[4])], &[("a", "b")]);
     let g = |p: &[usize]| Complex64::new(p[0] as f64, 1.0);
-    let result = run(
-        &DenseEngine::new(),
-        &problem,
-        &g,
-        &[],
-        &PatchedInterpolationOptions::new(2),
-    )
-    .unwrap();
-    assert_eq!(result.report.reference_scale, 10.0_f64.sqrt());
+    let result = run(&DenseEngine::new(), &problem, &g, &[], &sampled_max(2)).unwrap();
+    assert_eq!(max_reference(&result.report), 10.0_f64.sqrt());
     assert_all_complex(&result);
     let (residual, _) = dense_residual(&result, &problem, &g);
     assert_eq!(residual, 0.0);
@@ -443,7 +417,7 @@ fn complex_exact_patches_have_one_dtype() {
     let f = move |p: &[usize]| {
         Complex64::from_polar(product(p, 2 * p[0] + p[1]), phases[2 * p[0] + p[1]])
     };
-    let options = PatchedInterpolationOptions::new(2).with_reference_scale(10.0);
+    let options = sampled_max(2).with_error_norm(ErrorNorm::sampled_max_with_reference(10.0));
     let result = run(&DenseEngine::new(), &problem, &f, &[], &options).unwrap();
     assert_eq!(result.report.splits, 3);
     assert_eq!(result.report.accepted.len(), 4);
@@ -468,9 +442,9 @@ fn recycling_run(recycle: bool) -> (ChildPivots, ChildPivots) {
     let s0 = problem.site("n0", 0);
     // Rank two at the root and in both children; exact grandchildren.
     let f = |p: &[usize]| product(p, 2 * p[0] + p[1]);
-    let options = PatchedInterpolationOptions::new(2)
-        .with_rtol(1e-12)
-        .with_reference_scale(10.0)
+    let options = sampled_max(2)
+        .with_tolerance(tol(1e-12))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0))
         .with_n_initial_pivots(1)
         .with_seed(3)
         .with_recycle_pivots(recycle);
@@ -523,9 +497,9 @@ fn runs_are_deterministic_and_seeds_depend_on_the_patch() {
     let (j0, a0) = (problem.site("j", 0), problem.site("a", 0));
     let (pj, pa) = (problem.position(&j0), problem.position(&a0));
     let f = move |p: &[usize]| product(p, p[pj] + 2 * p[pa]);
-    let options = PatchedInterpolationOptions::new(2)
-        .with_rtol(1e-12)
-        .with_reference_scale(20.0)
+    let options = sampled_max(2)
+        .with_tolerance(tol(1e-12))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(20.0))
         .with_seed(99)
         .with_patch_order(vec![j0, a0]);
     let first_engine = DenseEngine::new();
@@ -552,8 +526,8 @@ fn runs_are_deterministic_and_seeds_depend_on_the_patch() {
 fn engine_requests_of_sampled_points_hit_the_cache() {
     let problem = branched();
     let f = switch_on(problem.position(&problem.site("j", 0)));
-    let options = PatchedInterpolationOptions::new(2)
-        .with_reference_scale(10.0)
+    let options = sampled_max(2)
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0))
         .with_patch_order(vec![problem.site("j", 0)]);
     let engine = DenseEngine::new();
     let result = run(&engine, &problem, &f, &[], &options).unwrap();
@@ -574,8 +548,8 @@ fn a_partial_order_can_run_out_of_split_sites() {
     let (j0, a0) = (problem.site("j", 0), problem.site("a", 0));
     // f depends on a0 but patch_order only lists j0.
     let f = switch_on(problem.position(&a0));
-    let options = PatchedInterpolationOptions::new(2)
-        .with_reference_scale(10.0)
+    let options = sampled_max(2)
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0))
         .with_patch_order(vec![j0.clone()]);
     match run(&DenseEngine::new(), &problem, &f, &[], &options) {
         Err(PatchedInterpolationError::NoSplitIndexLeft { projector }) => {
@@ -591,8 +565,8 @@ fn max_patches_limits_the_processed_patches() {
     let a0 = problem.site("a", 0);
     let f = switch_on(problem.position(&a0));
     // One root and three children.
-    let options = PatchedInterpolationOptions::new(2)
-        .with_reference_scale(10.0)
+    let options = sampled_max(2)
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(10.0))
         .with_patch_order(vec![a0]);
     assert!(run(
         &DenseEngine::new(),
@@ -640,7 +614,7 @@ fn run_faulty(
     engine: &DenseEngine,
     evaluate: impl Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<f64>> + Send + Sync,
 ) -> Result<PatchedInterpolationResult<Name>, PatchedInterpolationError> {
-    let options = PatchedInterpolationOptions::new(2).with_reference_scale(1.0);
+    let options = sampled_max(2).with_error_norm(ErrorNorm::sampled_max_with_reference(1.0));
     run_with(engine, problem, evaluate, &[], &options)
 }
 
@@ -707,7 +681,7 @@ fn malformed_pivots_fail_only_when_recycled() {
     let problem = chain3();
     let f = |p: &[usize]| product(p, 2 * p[0] + p[1]);
     let engine = DenseEngine::with_fault(Fault::BadPivots);
-    let options = PatchedInterpolationOptions::new(2).with_reference_scale(10.0);
+    let options = sampled_max(2).with_error_norm(ErrorNorm::sampled_max_with_reference(10.0));
     assert!(run(&engine, &problem, &f, &[], &options).is_ok());
     let (_, source) = expect_interpolation(run(
         &engine,
@@ -787,7 +761,7 @@ fn invalid_layouts_are_rejected_before_any_evaluation() {
                 node_sites,
                 ColMajorArray::new(vec![], vec![n_sites, 0]).unwrap(),
                 never,
-                &PatchedInterpolationOptions::new(2),
+                &sampled_max(2),
             ),
             needle,
         );
@@ -801,7 +775,7 @@ fn invalid_options_and_pivots_are_rejected_before_any_evaluation() {
     let site = problem.site("only", 0);
     let mut resized = site.clone();
     resized.dim = 4;
-    let base = PatchedInterpolationOptions::new(2);
+    let base = sampled_max(2);
     let option_cases = [
         (
             base.clone().with_patch_order(vec![DynIndex::new_dyn(3)]),
@@ -816,21 +790,31 @@ fn invalid_options_and_pivots_are_rejected_before_any_evaluation() {
                 .with_patch_order(vec![site.clone(), site.clone()]),
             "more than once",
         ),
-        (base.clone().with_rtol(-1e-3), "rtol"),
-        (base.clone().with_rtol(f64::NAN), "rtol"),
-        (base.clone().with_rtol(f64::INFINITY), "rtol"),
-        (base.clone().with_reference_scale(0.0), "reference_scale"),
-        (base.clone().with_reference_scale(-1.0), "reference_scale"),
+        (base.clone().with_tolerance(tol(-1e-3)), "rtol"),
+        (base.clone().with_tolerance(tol(f64::NAN)), "rtol"),
+        (base.clone().with_tolerance(tol(f64::INFINITY)), "rtol"),
         (
-            base.clone().with_reference_scale(f64::NAN),
-            "reference_scale",
+            base.clone()
+                .with_error_norm(ErrorNorm::sampled_max_with_reference(0.0)),
+            "max_reference",
         ),
         (
-            base.clone().with_reference_scale(f64::INFINITY),
-            "reference_scale",
+            base.clone()
+                .with_error_norm(ErrorNorm::sampled_max_with_reference(-1.0)),
+            "max_reference",
         ),
-        (PatchedInterpolationOptions::new(0), "max_bond_dim"),
-        (PatchedInterpolationOptions::new(1), "max_bond_dim"),
+        (
+            base.clone()
+                .with_error_norm(ErrorNorm::sampled_max_with_reference(f64::NAN)),
+            "max_reference",
+        ),
+        (
+            base.clone()
+                .with_error_norm(ErrorNorm::sampled_max_with_reference(f64::INFINITY)),
+            "max_reference",
+        ),
+        (sampled_max(0), "max_bond_dim"),
+        (sampled_max(1), "max_bond_dim"),
         (base.clone().with_n_initial_pivots(0), "n_initial_pivots"),
         (base.clone().with_max_patches(0), "max_patches"),
     ];
@@ -903,9 +887,9 @@ fn an_overflowing_absolute_tolerance_is_reported_for_the_root() {
     let problem = branched();
     let f = switch_on(problem.position(&problem.site("a", 0)));
     // Both factors are finite, but their product is not.
-    let options = PatchedInterpolationOptions::new(2)
-        .with_rtol(1e300)
-        .with_reference_scale(1e300);
+    let options = sampled_max(2)
+        .with_tolerance(tol(1e300))
+        .with_error_norm(ErrorNorm::sampled_max_with_reference(1e300));
     let (projector, source) =
         expect_interpolation(run(&DenseEngine::new(), &problem, &f, &[], &options));
     assert!(projector.is_empty());
@@ -917,7 +901,7 @@ fn an_overflowing_absolute_tolerance_is_reported_for_the_root() {
 fn converged_outcomes_at_the_cap_are_engine_errors() {
     let problem = branched();
     let f = switch_on(problem.position(&problem.site("a", 0)));
-    let options = PatchedInterpolationOptions::new(2).with_reference_scale(10.0);
+    let options = sampled_max(2).with_error_norm(ErrorNorm::sampled_max_with_reference(10.0));
     let engine = DenseEngine::with_fault(Fault::ConvergedAtCap);
     let (projector, source) = expect_interpolation(run(&engine, &problem, &f, &[], &options));
     assert!(projector.is_empty());
@@ -963,14 +947,14 @@ fn expect_magnitude_overflow(
 
 #[test]
 fn overflowing_magnitudes_are_rejected_before_they_pin_a_scale() {
-    // An exact root without reference_scale would pin an infinite scale.
+    // An exact root without max_reference would pin an infinite scale.
     let problem = single_node(&[3]);
     let projector = expect_magnitude_overflow(run(
         &DenseEngine::new(),
         &problem,
         &overflow_at(vec![1]),
         &[],
-        &PatchedInterpolationOptions::new(2),
+        &sampled_max(2),
     ));
     assert!(projector.is_empty());
 
@@ -982,7 +966,7 @@ fn overflowing_magnitudes_are_rejected_before_they_pin_a_scale() {
         &problem,
         &overflow_at(bad.clone()),
         &[bad],
-        &PatchedInterpolationOptions::new(2),
+        &sampled_max(2),
     ));
     assert!(projector.is_empty());
 
@@ -990,7 +974,7 @@ fn overflowing_magnitudes_are_rejected_before_they_pin_a_scale() {
     // exact child s = 2 meets the value.
     let problem = Problem::new(&[("s", &[3]), ("t", &[8])], &[("s", "t")]);
     let s = problem.site("s", 0);
-    let options = PatchedInterpolationOptions::new(2)
+    let options = sampled_max(2)
         .with_n_initial_pivots(1)
         .with_patch_order(vec![s.clone()]);
     let projector = expect_magnitude_overflow(run(

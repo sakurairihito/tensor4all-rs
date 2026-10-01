@@ -1,11 +1,10 @@
 //! Adaptive patched interpolation of a function on a tree.
 //!
 //! [`patched_interpolate`] runs a tree interpolation engine (any
-//! [`TreeInterpolator`]) on the whole domain of a function. Wherever the
-//! engine does not converge strictly below the bond cap, it fixes the next
-//! site of a given order and retries on every child region. The result is a
-//! [`PartitionedTreeTN`] with disjoint, eagerly masked patches, together with
-//! a [`PatchedInterpolationReport`].
+//! [`TreeInterpolator`]) on the whole domain of a function. Wherever a patch
+//! cannot be accepted, it fixes the next site of a given order and retries on
+//! every child region. The result is a [`PartitionedTreeTN`] with disjoint,
+//! eagerly masked patches, together with a [`PatchedInterpolationReport`].
 //!
 //! # Derivation notice
 //!
@@ -16,67 +15,146 @@
 //! 2023 Ritter.Marc and contributors), through the chain driver of the
 //! deprecated `tensor4all-partitionedtt` crate. See
 //! `LICENSE-TCIALGORITHMS-MIT` in this crate. The tree generalization, the
-//! evaluation cache, the sampled-zero policy, and the re-embedding of fixed
-//! sites are original to this crate.
+//! evaluation cache, the sampled-zero policy, the re-embedding of fixed
+//! sites, and the L2 error contract are original to this crate.
+//!
+//! # Error contract
+//!
+//! The accuracy requirement is [`PatchedInterpolationOptions::error_norm`]
+//! with [`PatchedInterpolationOptions::tolerance`]:
+//!
+//! - [`ErrorNorm::L2`] (the default): the unweighted discrete L2 error over
+//!   the whole domain `X`, `E^2 = sum over x of |f(x) - f~(x)|^2`, against
+//!   the allowance `delta = max(atol, rtol * S)` for a reference L2 norm `S`
+//!   of `f` ([`L2Reference`]). The driver keeps it in root-mean-square units:
+//!   `tau = delta / sqrt(|X|)` is pinned once and every accepted or zero
+//!   patch `P` must satisfy `rms_P(f - f~_P) <= tau`, which sums to
+//!   `E <= delta` over the disjoint patches. Zero patches are charged like
+//!   any other patch. The engine receives the absolute tolerance `tau`.
+//! - [`ErrorNorm::SampledMax`]: the M2 criterion, the engine's sampled error
+//!   estimate against `max(atol, rtol * max_reference)`, with `max_reference`
+//!   a function value. No measurement runs; it is not a verified bound and
+//!   makes no L2 claim.
+//! - [`ErrorNorm::MaxAbs`] and [`ErrorNorm::WeightedL2`] are placeholders that
+//!   fail with [`PatchedInterpolationError::UnsupportedNorm`] before any
+//!   evaluation.
+//!
+//! **What "verified" means.** Under L2 a patch error is verified when it was
+//! measured from values of `f` at points chosen independently of the
+//! approximation, by one of three methods ([`MeasurementMethod`]):
+//! `Exact` (the patch was built from all its values), `Exhaustive` (the
+//! residual was evaluated at every point: exact up to rounding, a
+//! certificate), or `Sampled` (fresh uniform points). A sampled acceptance
+//! measurement is only a decision statistic: it is conditioned on the
+//! acceptance it decided, and a residual concentrated on unsampled points is
+//! missed. With [`VerificationOptions::audit`], an independent audit sample
+//! drawn after the decision gives an unbiased estimate with a standard error;
+//! it is never a bound. No finite sample bounds the L2 error of a black-box
+//! function.
+//!
+//! The report's [`GlobalL2Error`] says what the run can claim:
+//!
+//! - `Certified` when every contribution is exact or exhaustive:
+//!   `E <= delta (1 + GLOBAL_ROUNDING_MARGIN) + MEASUREMENT_ROUNDING_FACTOR *
+//!   eps * ||f~||`, an absolute bound with respect to the allowance used, up
+//!   to a first-order model of the evaluation rounding (not a proven bound).
+//!   `rounding_limited` says when that rounding term is at least `tau`.
+//!   `relative_error_bound` bounds `E / ||f||` from the computable side,
+//!   `E / ||f|| <= E / (||f~|| - E)`, with conservative margins; it is `None`
+//!   when the denominator is not positive.
+//! - `Audited` when every sampled contribution has an audit: an estimate of
+//!   `E` with its standard error, and a plug-in estimate of the relative
+//!   bound.
+//! - `AcceptanceOnly` otherwise: the combined acceptance statistics, neither a
+//!   bound nor an estimate; no relative statement exists.
+//!
+//! `approximation_rms` (and with it the rounding term, the flag, and the
+//! relative fields) is `None` when the norm of some patch exceeds about
+//! `1.34e154`, where `TreeTN::log_norm` overflows.
 //!
 //! # Algorithm
 //!
-//! 1. The inputs are validated before any evaluation; the topology and site
-//!    checks are those of [`validate_layout`](tensor4all_treetn::interpolation::validate_layout).
+//! 1. The inputs are validated before any evaluation: the norm first, then
+//!    the topology and sites (those of
+//!    [`validate_layout`](tensor4all_treetn::interpolation::validate_layout)),
+//!    `patch_order`, the tolerance, the reference, the other options, the
+//!    verification options, the initial pivots, and under L2 the domain size
+//!    and whether a reference is required.
 //! 2. Patches are processed in FIFO order, starting from the whole domain.
+//!    The reference is pinned at the root and never changes.
 //! 3. Each patch owns an evaluation cache of its points; a split hands every
-//!    cached value to the child that contains it, so no point is evaluated
-//!    twice.
+//!    cached value (measured values included) to the child that contains it,
+//!    so no point is evaluated twice.
 //! 4. A patch with at most one active (unfixed) site is evaluated exactly and
-//!    needs no engine. Otherwise the candidate pivots of the patch are
-//!    sampled; if every sample is exactly zero the patch is a zero patch,
-//!    reported in [`PatchedInterpolationReport::zero_projectors`] and omitted
-//!    from the partition. This is a finite-sampling policy: a function that is
-//!    nonzero only on a few points needs initial pivots in its support.
-//! 5. The engine runs on the active sites with the absolute tolerance
-//!    `rtol * reference_scale`. A [`InterpolationTermination::Converged`]
-//!    outcome is accepted; any other verdict splits the patch at the next
-//!    unfixed site of [`PatchedInterpolationOptions::patch_order`].
-//! 6. An accepted network gets every fixed site re-attached to its node by a
-//!    one-hot factor of the patch scalar type.
-//!
-//! # Error criterion
-//!
-//! Acceptance uses the engine's sampled error estimate compared with
-//! `rtol * reference_scale`. It is not a verified error bound and makes no
-//! claim about the L2 error of the result.
+//!    needs no engine or measurement. Otherwise the candidate pivots of the
+//!    patch are sampled. If every sample is exactly zero, the zero
+//!    approximation is measured under L2 (and accepted as a zero patch if it
+//!    fits, otherwise its largest measured points join the candidates) or
+//!    accepted directly under `SampledMax`. Zero patches are reported in
+//!    [`PatchedInterpolationReport::zero_patches`] and omitted from the
+//!    partition.
+//! 5. The engine runs on the active sites. A
+//!    [`InterpolationTermination::Converged`] outcome strictly below the bond
+//!    cap is re-embedded (every fixed site re-attached by a one-hot factor)
+//!    and, under L2, measured on the stored network: exhaustively when the
+//!    patch has at most `max(max_exhaustive_points, samples)` points,
+//!    otherwise on `samples` fresh uniform points. It is accepted when
+//!    `rms <= tau`.
+//! 6. A failed verification reruns the engine (up to
+//!    [`VerificationOptions::retries`] times) with the worst measured points
+//!    and the outcome's pivots added to the initial pivots; then the patch
+//!    splits at the next unfixed site of
+//!    [`PatchedInterpolationOptions::patch_order`], passing the worst points
+//!    to the children. Any other verdict splits the patch directly.
 //!
 //! # Randomness and determinism
 //!
-//! Every patch derives two sub-seeds from [`PatchedInterpolationOptions::seed`]
+//! Every patch derives its sub-seeds from [`PatchedInterpolationOptions::seed`]
 //! and its path, the (position in the derived site order, coordinate) pairs
-//! of its fixed sites: one for its random candidate pivots and one for the
-//! engine. The generator is SplitMix64, and a coordinate in `0..d` is drawn
-//! with Lemire's unbiased multiply-shift method with rejection. Unlike other
-//! randomized algorithms of this workspace, the driver offers no API taking a
-//! caller-owned `&mut R`: one shared stream would make the randomness of a
-//! patch depend on the processing order. For a fixed seed, a deterministic
-//! evaluator, and a deterministic engine, the report and every stored node
-//! tensor (values and positional axis order) are identical across runs. The
-//! stored patches are `TreeTN`s, so what is derived from them may still differ
+//! of its fixed sites: one for its random candidate pivots, one per engine
+//! run, and one stream each for the zero screen, every verification, the
+//! audit, and (at the root) the Monte Carlo reference. The generator is
+//! SplitMix64, and a coordinate in `0..d` is drawn with Lemire's unbiased
+//! multiply-shift method with rejection. Unlike other randomized algorithms
+//! of this workspace, the driver offers no API taking a caller-owned
+//! `&mut R`: one shared stream would make the randomness of a patch depend on
+//! the processing order.
+//!
+//! For a fixed seed, a deterministic evaluator, and a deterministic engine,
+//! the report and every stored node tensor (values and positional axis order)
+//! are identical across runs, provided every measured network value is
+//! reproducible. Each measurement uses a fresh `TreeTNCachedEvaluator`
+//! centered at the smallest node name, the default hint, and fixed-size
+//! chunks. On trees where every node carries exactly one site (`f64` or
+//! `Complex64`) the evaluator's raw kernels are bitwise reproducible across
+//! threads. On other trees (a site-free node or a node with several sites)
+//! its generic path can differ at rounding level between threads and
+//! processes, so an L2 acceptance near `tau` may then differ between runs;
+//! this is an open evaluator issue (open question 8 of
+//! `docs/design/tree-patching-error-contract.md`). The bitwise claim never
+//! covers `approximation_rms` and the fields derived from it. The stored
+//! patches are `TreeTN`s, so what is derived from them may still differ
 //! across runs, for a single patch as for the whole partition, on any topology
-//! ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)): materializing
-//! (`to_dense`, `contract_to_tensor`, [`PartitionedTreeTN::to_treetn`]) in axis
-//! order and at rounding level, and the iteration order of `external_indices`,
-//! `site_space`, and `neighbors`.
+//! ([issue #791](https://github.com/tensor4all/tensor4all-rs/issues/791)):
+//! materializing (`to_dense`, `contract_to_tensor`,
+//! [`PartitionedTreeTN::to_treetn`]) in axis order and at rounding level, and
+//! the iteration order of `external_indices`, `site_space`, and `neighbors`.
 //!
 //! # Examples
 //!
 //! Interpolate `f(x) = 1 / (1 + x)` on eight points, `x = b0 + 2 b1 + 4 b2`,
-//! with one binary site per node of a three-node chain. A bond cap of two
-//! only accepts rank-one patches, so the domain is split twice.
+//! with one binary site per node of a three-node chain, under the default
+//! verified L2 norm with a known reference norm. A bond cap of two only
+//! accepts rank-one patches, so the domain is split twice; every patch ends
+//! up exact, so the global error is certified.
 //!
 //! ```
 //! use std::collections::BTreeMap;
 //! use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex, IdxTensor};
 //! use tensor4all_partitionedtreetn::adaptive_interpolation::{
-//!     patched_interpolate, PatchedInterpolationOptions,
+//!     patched_interpolate, GlobalL2Error, PatchedInterpolationOptions,
 //! };
+//! use tensor4all_partitionedtreetn::{ErrorNorm, ErrorTolerance, L2Reference};
 //! use tensor4all_treetci::TreeTciInterpolator;
 //! use tensor4all_treetn::NodeNameNetwork;
 //!
@@ -90,11 +168,15 @@
 //! let node_sites: BTreeMap<usize, Vec<DynIndex>> =
 //!     (0..3).map(|node| (node, vec![sites[node].clone()])).collect();
 //!
+//! let values: Vec<f64> = (0..8).map(|x| 1.0 / (1.0 + x as f64)).collect();
+//! let norm = values.iter().map(|v| v * v).sum::<f64>().sqrt();
 //! let f = |point: &[usize]| 1.0 / (1.0 + (point[0] + 2 * point[1] + 4 * point[2]) as f64);
 //! let evaluate = |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
 //!     Ok(batch.data().chunks(3).map(f).collect())
 //! };
-//! let options = PatchedInterpolationOptions::new(2).with_rtol(1e-12);
+//! let options = PatchedInterpolationOptions::new(2)
+//!     .with_error_norm(ErrorNorm::l2(L2Reference::Given(norm)))
+//!     .with_tolerance(ErrorTolerance { rtol: 1e-12, atol: 0.0 });
 //! let result = patched_interpolate(
 //!     &TreeTciInterpolator::default(),
 //!     topology,
@@ -108,27 +190,28 @@
 //! assert_eq!(result.report.splits, 3);
 //! assert_eq!(result.partition.len(), 4);
 //! assert_eq!(result.report.function_evaluations, 8);
+//! let error = result.report.norm.l2_error().unwrap();
+//! assert!(matches!(error.global, GlobalL2Error::Certified { rms_error, .. } if rms_error == 0.0));
 //!
-//! // Compare with the dense function once: materialize, subtract, maxabs.
-//! let values: Vec<f64> = (0..8).map(|x| 1.0 / (1.0 + x as f64)).collect();
+//! // Compare with the dense function once: materialize, subtract, norm.
 //! let reference = IdxTensor::from_dense(sites.clone(), values)?;
 //! let dense = result.partition.to_treetn()?.contract_to_tensor()?;
-//! assert!(dense.sub(&reference)?.maxabs()? < 1e-12);
+//! assert!(dense.sub(&reference)?.norm()? <= 1e-12 * norm);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 mod cache;
 mod embed;
 mod layout;
+mod options;
+mod report;
 mod sampling;
-// Used by the tests only until the L2 measurement lands.
 #[cfg(test)]
 mod tests;
-#[cfg_attr(not(test), allow(dead_code))]
 mod verify;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -138,400 +221,26 @@ use tensor4all_core::{
     ColMajorArray, ColMajorArrayRef, CommonScalar, DynIndex, IdxTensor, TensorElement,
 };
 use tensor4all_treetn::interpolation::{
-    InterpolationError, InterpolationProblem, InterpolationTermination, TreeInterpolator,
+    InterpolationError, InterpolationOutcome, InterpolationProblem, InterpolationTermination,
+    TreeInterpolator,
 };
 use tensor4all_treetn::{NodeNameNetwork, TreeTN};
 
 use crate::error::PartitionedTreeTNError;
-use crate::{PartitionedTreeTN, Projector, SubDomainTreeTN};
+use crate::{ErrorNorm, L2Reference, PartitionedTreeTN, Projector, SubDomainTreeTN};
 
 use cache::{Counters, PatchCache, PatchSampler};
 use layout::SiteLayout;
-use sampling::{patch_candidates, patch_seeds, PatchDomain};
+use sampling::{patch_candidates, patch_seeds, PatchDomain, PatchSeeds};
+use verify::{Contribution, MeasureError, MeasureTarget, Measured, PointPlan};
 
-/// Options of [`patched_interpolate`].
-///
-/// Built with [`PatchedInterpolationOptions::new`], which takes the required
-/// bond cap and sets every other field to its default, and refined with the
-/// `with_*` builders. There is no `Default`: the bond cap has no sensible
-/// default. The fields are validated by [`patched_interpolate`].
-///
-/// `rtol` and `max_bond_dim` trade off: a tighter tolerance or a smaller cap
-/// produces more, smaller patches. When in doubt, keep the defaults, pass a
-/// known `reference_scale`, and choose the cap from the rank the engine can
-/// afford per patch.
-///
-/// # Examples
-///
-/// ```
-/// use tensor4all_core::DynIndex;
-/// use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
-///
-/// let first = DynIndex::new_dyn(2);
-/// let options = PatchedInterpolationOptions::new(16)
-///     .with_rtol(1e-6)
-///     .with_reference_scale(2.0)
-///     .with_patch_order(vec![first.clone()])
-///     .with_recycle_pivots(true);
-/// assert_eq!(options.max_bond_dim, 16);
-/// assert_eq!(options.rtol, 1e-6);
-/// assert_eq!(options.reference_scale, Some(2.0));
-/// assert_eq!(options.patch_order, vec![first]);
-/// assert_eq!(options.n_initial_pivots, 5);
-/// assert!(options.recycle_pivots);
-/// assert_eq!(options.max_patches, None);
-/// ```
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct PatchedInterpolationOptions {
-    /// Relative tolerance. The engine's absolute tolerance is
-    /// `rtol * reference_scale`. Finite and nonnegative; `0` splits until
-    /// every patch is represented exactly. Default `1e-8`.
-    pub rtol: f64,
-    /// Scale used for every patch. `None` (the default) pins it to the
-    /// largest magnitude among the root patch's candidate samples (or its
-    /// exact values when the root has at most one site), a sampled lower bound
-    /// on `max |f|`. For a localized function that makes the tolerance tighter
-    /// than intended, so passing a known scale is recommended. Finite and
-    /// positive when given.
-    pub reference_scale: Option<f64>,
-    /// Bond cap of every patch, at least 2. A patch is accepted only when the
-    /// engine converges with a rank strictly below the cap. Required; a
-    /// smaller cap means more, smaller patches.
-    pub max_bond_dim: usize,
-    /// Sites fixed when a patch splits, in order, by full index identity.
-    /// A partial order is allowed: a patch that does not converge after every
-    /// listed site is fixed fails with
-    /// [`PatchedInterpolationError::NoSplitIndexLeft`]. Empty (the default)
-    /// means every site in the derived site order
-    /// ([`InterpolationProblem::derive_site_order`]). For quantics grids, list
-    /// the most significant bits first.
-    pub patch_order: Vec<DynIndex>,
-    /// Target number of distinct initial pivots per patch, at least 1.
-    /// Compatible user (and recycled) pivots come first and random points of
-    /// the patch fill the rest. Default `5`.
-    pub n_initial_pivots: usize,
-    /// Seed each child with the pivots of the parent's outcome. Default
-    /// `false`.
-    pub recycle_pivots: bool,
-    /// Root seed of every per-patch sub-seed. Default `0`.
-    pub seed: u64,
-    /// Limit on processed patches (accepted, zero, and split alike); `None`
-    /// (the default) means no limit, `Some(0)` is invalid.
-    pub max_patches: Option<usize>,
-}
-
-impl PatchedInterpolationOptions {
-    /// Create options with the given bond cap and the defaults of every
-    /// other field (`rtol = 1e-8`, no reference scale, the derived site
-    /// order, five initial pivots, no recycling, seed `0`, no patch limit).
-    ///
-    /// # Arguments
-    ///
-    /// * `max_bond_dim` - Bond cap of every patch; [`patched_interpolate`]
-    ///   requires at least 2.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
-    ///
-    /// let options = PatchedInterpolationOptions::new(8);
-    /// assert_eq!(options.max_bond_dim, 8);
-    /// assert_eq!(options.rtol, 1e-8);
-    /// assert_eq!(options.reference_scale, None);
-    /// assert!(options.patch_order.is_empty());
-    /// assert_eq!(options.n_initial_pivots, 5);
-    /// assert!(!options.recycle_pivots);
-    /// assert_eq!(options.seed, 0);
-    /// assert_eq!(options.max_patches, None);
-    /// ```
-    pub fn new(max_bond_dim: usize) -> Self {
-        Self {
-            rtol: 1e-8,
-            reference_scale: None,
-            max_bond_dim,
-            patch_order: Vec::new(),
-            n_initial_pivots: 5,
-            recycle_pivots: false,
-            seed: 0,
-            max_patches: None,
-        }
-    }
-
-    /// Set the relative tolerance.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
-    ///
-    /// assert_eq!(PatchedInterpolationOptions::new(4).with_rtol(1e-4).rtol, 1e-4);
-    /// ```
-    pub fn with_rtol(mut self, rtol: f64) -> Self {
-        self.rtol = rtol;
-        self
-    }
-
-    /// Set a known reference scale, typically `max |f|`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
-    ///
-    /// let options = PatchedInterpolationOptions::new(4).with_reference_scale(3.5);
-    /// assert_eq!(options.reference_scale, Some(3.5));
-    /// ```
-    pub fn with_reference_scale(mut self, reference_scale: f64) -> Self {
-        self.reference_scale = Some(reference_scale);
-        self
-    }
-
-    /// Set the order in which sites are fixed when a patch splits.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tensor4all_core::DynIndex;
-    /// use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
-    ///
-    /// let (a, b) = (DynIndex::new_dyn(2), DynIndex::new_dyn(2));
-    /// let options =
-    ///     PatchedInterpolationOptions::new(4).with_patch_order(vec![b.clone(), a.clone()]);
-    /// assert_eq!(options.patch_order, vec![b, a]);
-    /// ```
-    pub fn with_patch_order(mut self, patch_order: Vec<DynIndex>) -> Self {
-        self.patch_order = patch_order;
-        self
-    }
-
-    /// Set the target number of initial pivots per patch.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
-    ///
-    /// let options = PatchedInterpolationOptions::new(4).with_n_initial_pivots(12);
-    /// assert_eq!(options.n_initial_pivots, 12);
-    /// ```
-    pub fn with_n_initial_pivots(mut self, n_initial_pivots: usize) -> Self {
-        self.n_initial_pivots = n_initial_pivots;
-        self
-    }
-
-    /// Enable or disable pivot recycling.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
-    ///
-    /// assert!(PatchedInterpolationOptions::new(4).with_recycle_pivots(true).recycle_pivots);
-    /// ```
-    pub fn with_recycle_pivots(mut self, recycle_pivots: bool) -> Self {
-        self.recycle_pivots = recycle_pivots;
-        self
-    }
-
-    /// Set the root seed.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
-    ///
-    /// assert_eq!(PatchedInterpolationOptions::new(4).with_seed(42).seed, 42);
-    /// ```
-    pub fn with_seed(mut self, seed: u64) -> Self {
-        self.seed = seed;
-        self
-    }
-
-    /// Limit the number of processed patches.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tensor4all_partitionedtreetn::adaptive_interpolation::PatchedInterpolationOptions;
-    ///
-    /// let options = PatchedInterpolationOptions::new(4).with_max_patches(100);
-    /// assert_eq!(options.max_patches, Some(100));
-    /// ```
-    pub fn with_max_patches(mut self, max_patches: usize) -> Self {
-        self.max_patches = Some(max_patches);
-        self
-    }
-}
-
-/// The record of one accepted patch.
-///
-/// # Examples
-///
-/// ```
-/// use std::collections::BTreeMap;
-/// use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex};
-/// use tensor4all_partitionedtreetn::adaptive_interpolation::{
-///     patched_interpolate, PatchedInterpolationOptions,
-/// };
-/// use tensor4all_treetci::TreeTciInterpolator;
-/// use tensor4all_treetn::interpolation::InterpolationTermination;
-/// use tensor4all_treetn::NodeNameNetwork;
-///
-/// // A single node with one site of dimension 4 is evaluated exactly.
-/// let site = DynIndex::new_dyn(4);
-/// let mut topology = NodeNameNetwork::new();
-/// topology.add_node(0usize)?;
-/// let result = patched_interpolate(
-///     &TreeTciInterpolator::default(),
-///     topology,
-///     BTreeMap::from([(0usize, vec![site])]),
-///     ColMajorArray::new(vec![], vec![1, 0])?,
-///     |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
-///         Ok(batch.data().iter().map(|&x| x as f64 - 1.0).collect())
-///     },
-///     &PatchedInterpolationOptions::new(2),
-/// )?;
-/// let record = &result.report.accepted[0];
-/// assert!(record.projector.is_empty());
-/// assert_eq!(record.termination, InterpolationTermination::Converged);
-/// assert_eq!(record.error_estimate, 0.0);
-/// assert_eq!(record.max_sample_magnitude, 2.0);
-/// assert_eq!(record.max_bond_dim, 1);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct PatchRecord {
-    /// Projector of the patch (its fixed sites).
-    pub projector: Projector,
-    /// The engine's verdict; always
-    /// [`InterpolationTermination::Converged`] for an accepted patch.
-    pub termination: InterpolationTermination,
-    /// The engine's raw error estimate, `0` for an exactly evaluated patch.
-    pub error_estimate: f64,
-    /// Largest sampled magnitude of the patch reported by the engine, or the
-    /// largest exact value of an exactly evaluated patch.
-    pub max_sample_magnitude: f64,
-    /// Largest bond dimension of the patch network (one for an exactly
-    /// evaluated patch).
-    pub max_bond_dim: usize,
-}
-
-/// Summary of one [`patched_interpolate`] run.
-///
-/// `accepted` and `zero_projectors` are sorted by patch path, the
-/// lexicographic order of the (position in the derived site order,
-/// coordinate) pairs of the fixed sites in split order; this canonical order
-/// does not depend on the processing order. Accepted and zero projectors are
-/// pairwise disjoint and together cover the domain.
-///
-/// # Examples
-///
-/// ```
-/// use std::collections::BTreeMap;
-/// use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex};
-/// use tensor4all_partitionedtreetn::adaptive_interpolation::{
-///     patched_interpolate, PatchedInterpolationOptions,
-/// };
-/// use tensor4all_treetci::TreeTciInterpolator;
-/// use tensor4all_treetn::NodeNameNetwork;
-///
-/// // f(a, b) is b^2 for a = 0 and 1 + b for a = 1: rank two. With a cap of
-/// // two the domain splits once at `a`; both halves are evaluated exactly.
-/// let (a, b) = (DynIndex::new_dyn(2), DynIndex::new_dyn(3));
-/// let mut topology = NodeNameNetwork::new();
-/// topology.add_node(0usize)?;
-/// topology.add_node(1usize)?;
-/// topology.add_edge(&0, &1)?;
-/// let node_sites = BTreeMap::from([(0usize, vec![a.clone()]), (1, vec![b.clone()])]);
-/// let f = |p: &[usize]| if p[0] == 1 { 1.0 + p[1] as f64 } else { (p[1] * p[1]) as f64 };
-/// let result = patched_interpolate(
-///     &TreeTciInterpolator::default(),
-///     topology,
-///     node_sites,
-///     ColMajorArray::new(vec![1, 2], vec![2, 1])?,
-///     |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
-///         Ok(batch.data().chunks(2).map(f).collect())
-///     },
-///     &PatchedInterpolationOptions::new(2).with_reference_scale(4.0),
-/// )?;
-/// let report = &result.report;
-/// assert_eq!(report.reference_scale, 4.0);
-/// assert_eq!(report.splits, 1);
-/// assert_eq!(report.accepted.len(), 2);
-/// assert!(report.zero_projectors.is_empty());
-/// assert_eq!(report.accepted[0].projector.get(&a), Some(0));
-/// assert_eq!(report.accepted[1].projector.get(&a), Some(1));
-/// // Six points in total, each evaluated once.
-/// assert_eq!(report.function_evaluations, 6);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct PatchedInterpolationReport {
-    /// The reference scale used for every patch: the given one, or the one
-    /// pinned from the root patch (`0` when the root is an all-zero exact
-    /// patch and no scale was given).
-    pub reference_scale: f64,
-    /// Records of the accepted patches, in canonical path order.
-    pub accepted: Vec<PatchRecord>,
-    /// Projectors of the zero patches, in canonical path order. They are not
-    /// part of the partition, which treats an absent patch as zero.
-    pub zero_projectors: Vec<Projector>,
-    /// Number of patches that were split.
-    pub splits: usize,
-    /// Number of points passed to the evaluator.
-    pub function_evaluations: usize,
-    /// Number of requested points served from a patch cache instead of the
-    /// evaluator.
-    pub cache_hits: usize,
-}
-
-/// Result of [`patched_interpolate`].
-///
-/// # Examples
-///
-/// ```
-/// use std::collections::BTreeMap;
-/// use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex};
-/// use tensor4all_partitionedtreetn::adaptive_interpolation::{
-///     patched_interpolate, PatchedInterpolationOptions,
-/// };
-/// use tensor4all_treetci::TreeTciInterpolator;
-/// use tensor4all_treetn::NodeNameNetwork;
-///
-/// // f vanishes everywhere: the root is a zero patch and the partition is empty.
-/// let site = DynIndex::new_dyn(3);
-/// let mut topology = NodeNameNetwork::new();
-/// topology.add_node(0usize)?;
-/// let result = patched_interpolate(
-///     &TreeTciInterpolator::default(),
-///     topology,
-///     BTreeMap::from([(0usize, vec![site])]),
-///     ColMajorArray::new(vec![], vec![1, 0])?,
-///     |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
-///         Ok(vec![0.0; batch.shape()[1]])
-///     },
-///     &PatchedInterpolationOptions::new(2),
-/// )?;
-/// assert!(result.partition.is_empty());
-/// assert_eq!(result.report.zero_projectors.len(), 1);
-/// assert_eq!(result.report.reference_scale, 0.0);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[derive(Debug)]
-pub struct PatchedInterpolationResult<V>
-where
-    V: Clone + Hash + Eq + Send + Sync + Debug,
-{
-    /// The accepted patches. Zero patches are absent (an absent patch is
-    /// zero), so an all-zero function gives an empty partition.
-    pub partition: PartitionedTreeTN<V>,
-    /// Summary of the run.
-    pub report: PatchedInterpolationReport,
-}
+pub use options::{PatchedInterpolationOptions, VerificationOptions};
+pub use report::{
+    GlobalL2Error, L2ErrorReport, L2Measurement, L2ReferenceSource, MaxReferenceSource,
+    MeasurementMethod, NormReport, PatchRecord, PatchedInterpolationReport,
+    PatchedInterpolationResult, ZeroPatchRecord, GLOBAL_ROUNDING_MARGIN,
+    MEASUREMENT_ROUNDING_FACTOR,
+};
 
 /// Error returned by [`patched_interpolate`].
 ///
@@ -542,43 +251,67 @@ where
 /// use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex};
 /// use tensor4all_partitionedtreetn::adaptive_interpolation::{
 ///     patched_interpolate, PatchedInterpolationError, PatchedInterpolationOptions,
+///     PatchedInterpolationResult,
 /// };
+/// use tensor4all_partitionedtreetn::ErrorNorm;
 /// use tensor4all_treetci::TreeTciInterpolator;
 /// use tensor4all_treetn::NodeNameNetwork;
 ///
-/// let mut topology = NodeNameNetwork::new();
-/// topology.add_node(0usize)?;
-/// let error = patched_interpolate(
-///     &TreeTciInterpolator::default(),
-///     topology,
-///     BTreeMap::from([(0usize, vec![DynIndex::new_dyn(2)])]),
-///     ColMajorArray::new(vec![], vec![1, 0])?,
-///     |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
-///         Ok(vec![1.0; batch.shape()[1]])
-///     },
-///     // A cap of one could only accept patches nonzero on a single node.
-///     &PatchedInterpolationOptions::new(1),
-/// )
-/// .unwrap_err();
+/// let run = |options: &PatchedInterpolationOptions|
+///  -> Result<PatchedInterpolationResult<usize>, PatchedInterpolationError> {
+///     let mut topology = NodeNameNetwork::new();
+///     topology.add_node(0usize).unwrap();
+///     patched_interpolate(
+///         &TreeTciInterpolator::default(),
+///         topology,
+///         BTreeMap::from([(0usize, vec![DynIndex::new_dyn(2)])]),
+///         ColMajorArray::new(vec![], vec![1, 0]).unwrap(),
+///         |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
+///             Ok(vec![1.0; batch.shape()[1]])
+///         },
+///         options,
+///     )
+/// };
+/// // A cap of one could only accept patches nonzero on a single node.
+/// let error = run(&PatchedInterpolationOptions::new(1)).unwrap_err();
 /// assert!(matches!(error, PatchedInterpolationError::InvalidInput { .. }));
 /// assert!(error.to_string().contains("max_bond_dim"));
-/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// // A placeholder norm fails before any other check.
+/// let options = PatchedInterpolationOptions::new(1).with_error_norm(ErrorNorm::MaxAbs);
+/// assert!(matches!(
+///     run(&options).unwrap_err(),
+///     PatchedInterpolationError::UnsupportedNorm { norm: ErrorNorm::MaxAbs }
+/// ));
 /// ```
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PatchedInterpolationError {
-    /// The inputs or options are invalid, or the reference scale cannot be
-    /// pinned. Reported before any evaluation, except the unpinnable scale.
+    /// The inputs or options are invalid, or a reference cannot be pinned.
+    /// Reported before any evaluation, except an unpinnable reference (a
+    /// zero `SampledMax` root sample, or a zero Monte Carlo estimate with
+    /// `atol = 0`).
     #[error("invalid patched interpolation input: {message}")]
     InvalidInput {
         /// The violated condition and, where possible, the remedy.
         message: String,
     },
-    /// Sampling or interpolating one patch failed: the evaluator failed or
-    /// returned a wrong number of values, a non-finite value, or a value
-    /// whose magnitude overflows ([`InterpolationError::Evaluator`]); or the
-    /// engine failed, returned an outcome that does not match the problem, or
-    /// reported `Converged` with a rank that reaches the bond cap
+    /// The selected norm is a placeholder without an implementation.
+    /// Reported before any evaluation and before every other check; the
+    /// driver never falls back to another norm.
+    #[error(
+        "the error norm {norm:?} is not implemented; use ErrorNorm::L2 (the default) or \
+         ErrorNorm::SampledMax"
+    )]
+    UnsupportedNorm {
+        /// The requested norm.
+        norm: ErrorNorm,
+    },
+    /// Sampling, interpolating, or measuring one patch failed: the evaluator
+    /// failed or returned a wrong number of values, a non-finite value, or a
+    /// value whose magnitude overflows ([`InterpolationError::Evaluator`]); or
+    /// the engine failed, returned an outcome that does not match the problem,
+    /// reported `Converged` with a rank that reaches the bond cap, or returned
+    /// a network with a non-finite value at a measured point
     /// ([`InterpolationError::Engine`]).
     #[error("interpolation of the patch {projector:?} failed: {source}")]
     Interpolation {
@@ -604,6 +337,21 @@ pub enum PatchedInterpolationError {
     NoSplitIndexLeft {
         /// Projector of the patch that could not be split.
         projector: Projector,
+    },
+    /// A patch converged below the cap, but its measured L2 error still
+    /// exceeded its allowance after the retries, and every site of
+    /// `patch_order` is already fixed in it.
+    #[error(
+        "the measured L2 error of the patch {projector:?} (rms {}) exceeds its allowance and \
+         every site of patch_order is fixed; list more sites in patch_order, raise rtol or atol, \
+         or check the reference norm",
+        measurement.rms
+    )]
+    VerificationFailed {
+        /// Projector of the patch.
+        projector: Projector,
+        /// Its last failed measurement.
+        measurement: L2Measurement,
     },
     /// A resource limit of the options was exceeded.
     #[error(
@@ -639,7 +387,7 @@ impl From<PartitionedTreeTNError> for PatchedInterpolationError {
 /// * `initial_pivots` - Column-major `[n_sites, n_pivots]` array of
 ///   full-domain points in site order; zero columns are allowed. Each patch
 ///   starts from those compatible with it. Pivots where the function is large
-///   make the sampled scale and the zero screening reliable.
+///   make the zero screening reliable.
 /// * `evaluate` - Batch evaluator. It receives a column-major
 ///   `[n_sites, n_points]` array of full-domain points in site order and
 ///   returns one finite value per point, with a finite magnitude.
@@ -652,25 +400,36 @@ impl From<PartitionedTreeTNError> for PatchedInterpolationError {
 ///
 /// # Errors
 ///
+/// - [`PatchedInterpolationError::UnsupportedNorm`] first, before any other
+///   check, for [`ErrorNorm::MaxAbs`] and [`ErrorNorm::WeightedL2`].
 /// - [`PatchedInterpolationError::InvalidInput`] before any evaluation when
-///   [`validate_layout`](tensor4all_treetn::interpolation::validate_layout) rejects the topology or sites (with its message), a
-///   `patch_order` entry is not a site of the problem (full identity and
-///   dimension) or is repeated, `rtol` is negative or not finite,
-///   `reference_scale` is not finite and positive, `max_bond_dim < 2`,
-///   `n_initial_pivots == 0`, `max_patches == Some(0)`, or `initial_pivots` is
-///   not a 2D array with one row per site and in-range coordinates; and when
-///   no `reference_scale` is given and every candidate sample of a root that
-///   needs the engine is exactly zero.
+///   [`validate_layout`](tensor4all_treetn::interpolation::validate_layout)
+///   rejects the topology or sites (with its message); a `patch_order` entry
+///   is not a site of the problem (full identity and dimension) or is
+///   repeated; `tolerance.rtol` or `tolerance.atol` is negative or not
+///   finite; a given reference (`max_reference` or `L2Reference::Given`) is
+///   not finite and positive; `max_bond_dim < 2`; `n_initial_pivots == 0`;
+///   `max_patches == Some(0)`; `verification.samples < 2`; `initial_pivots`
+///   is not a 2D array with one row per site and in-range coordinates; under
+///   L2, the domain's point count is not finite in `f64`, or the reference is
+///   [`L2Reference::Required`] while `rtol > 0` and the root has more than
+///   one site. After the root sample: under `SampledMax` without a
+///   `max_reference`, every candidate sample of a root that needs the engine
+///   is exactly zero; under L2 with [`L2Reference::MonteCarlo`], the
+///   estimate is zero and `atol = 0`.
 /// - [`PatchedInterpolationError::Interpolation`] when the evaluator fails,
 ///   returns a wrong number of values, or returns a value with a non-finite
-///   component or with finite components whose magnitude overflows (a
-///   complex value near the largest float in both parts)
+///   component or with finite components whose magnitude overflows
 ///   ([`InterpolationError::Evaluator`]); when the engine fails (including
 ///   [`InterpolationError::AllSamplesZero`] after screening); or when an
-///   engine outcome does not match the problem or reports `Converged` at a
-///   bond dimension not strictly below the cap ([`InterpolationError::Engine`]).
+///   engine outcome does not match the problem, reports `Converged` at a
+///   bond dimension not strictly below the cap, or evaluates to a non-finite
+///   value at a measured point ([`InterpolationError::Engine`]).
 /// - [`PatchedInterpolationError::NoSplitIndexLeft`] when a patch does not
 ///   converge and every site of `patch_order` is fixed.
+/// - [`PatchedInterpolationError::VerificationFailed`] when a converged
+///   patch fails its L2 measurement after the retries and every site of
+///   `patch_order` is fixed.
 /// - [`PatchedInterpolationError::ResourceLimit`] when more than
 ///   `max_patches` patches would be processed.
 /// - [`PatchedInterpolationError::Partition`] when building a patch network
@@ -679,15 +438,17 @@ impl From<PartitionedTreeTNError> for PatchedInterpolationError {
 /// # Examples
 ///
 /// A branched tree whose junction `"c"` has degree three and carries no
-/// site. `f` vanishes where the leaf site `x` is zero; that half is reported
-/// as a zero patch instead of stored.
+/// site. `f` vanishes where the leaf site `x` is zero; that half is a zero
+/// patch, measured exhaustively. Every patch here has at most 1024 points,
+/// so the run is certified.
 ///
 /// ```
 /// use std::collections::BTreeMap;
 /// use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex, IdxTensor};
 /// use tensor4all_partitionedtreetn::adaptive_interpolation::{
-///     patched_interpolate, PatchedInterpolationOptions,
+///     patched_interpolate, GlobalL2Error, MeasurementMethod, PatchedInterpolationOptions,
 /// };
+/// use tensor4all_partitionedtreetn::{ErrorNorm, ErrorTolerance, L2Reference};
 /// use tensor4all_treetci::TreeTciInterpolator;
 /// use tensor4all_treetn::NodeNameNetwork;
 ///
@@ -707,8 +468,11 @@ impl From<PartitionedTreeTNError> for PatchedInterpolationError {
 /// ]);
 /// // Site order [x, y, z]; f = x (1 + y + z)^2 has rank three across the y edge.
 /// let f = |p: &[usize]| (p[0] * (1 + p[1] + p[2]).pow(2)) as f64;
+/// let values: Vec<f64> = (0..18).map(|k| f(&[k % 2, (k / 2) % 3, k / 6])).collect();
+/// let norm = values.iter().map(|v| v * v).sum::<f64>().sqrt();
 /// let options = PatchedInterpolationOptions::new(3)
-///     .with_reference_scale(25.0)
+///     .with_error_norm(ErrorNorm::l2(L2Reference::Given(norm)))
+///     .with_tolerance(ErrorTolerance { rtol: 1e-10, atol: 0.0 })
 ///     .with_patch_order(vec![x.clone(), y.clone()]);
 /// let result = patched_interpolate(
 ///     &TreeTciInterpolator::default(),
@@ -720,13 +484,16 @@ impl From<PartitionedTreeTNError> for PatchedInterpolationError {
 ///     },
 ///     &options,
 /// )?;
-/// assert_eq!(result.report.zero_projectors.len(), 1);
-/// assert_eq!(result.report.zero_projectors[0].get(&x), Some(0));
+/// let zero = &result.report.zero_patches[0];
+/// assert_eq!(zero.projector.get(&x), Some(0));
+/// assert_eq!(zero.acceptance.as_ref().unwrap().method, MeasurementMethod::Exhaustive);
+/// let error = result.report.norm.l2_error().unwrap();
+/// assert!(matches!(error.global, GlobalL2Error::Certified { .. }));
+/// let delta = result.report.norm.delta().unwrap();
 ///
-/// let values: Vec<f64> = (0..18).map(|k| f(&[k % 2, (k / 2) % 3, k / 6])).collect();
 /// let reference = IdxTensor::from_dense(vec![x, y, z], values)?;
 /// let dense = result.partition.to_treetn()?.contract_to_tensor()?;
-/// assert!(dense.sub(&reference)?.maxabs()? < 10.0 * options.rtol * 25.0);
+/// assert!(dense.sub(&reference)?.norm()? <= delta + 1e-12 * norm);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn patched_interpolate<T, V, E, F>(
@@ -743,18 +510,32 @@ where
     E: TreeInterpolator<T> + Sync,
     F: Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<T>> + Send + Sync,
 {
+    if matches!(
+        options.error_norm,
+        ErrorNorm::MaxAbs | ErrorNorm::WeightedL2
+    ) {
+        return Err(PatchedInterpolationError::UnsupportedNorm {
+            norm: options.error_norm,
+        });
+    }
     let layout = SiteLayout::validated(topology, node_sites, &initial_pivots, options)?;
-    Driver {
+    let driver = Driver {
         engine,
         evaluate: &evaluate,
         layout,
         initial_pivots,
         options,
-        reference_scale: Cell::new(options.reference_scale),
+        max_reference: Cell::new(None),
+        l2: Cell::new(None),
         counters: Counters::default(),
+        measurement_evaluations: Cell::new(0),
+        audit_evaluations: Cell::new(0),
+        verification_failures: Cell::new(0),
+        engine_retries: Cell::new(0),
         scalar: PhantomData,
-    }
-    .run()
+    };
+    driver.pin_references_known_in_advance();
+    driver.run()
 }
 
 fn invalid(message: impl Into<String>) -> PatchedInterpolationError {
@@ -772,6 +553,18 @@ struct Patch<T> {
     cache: PatchCache<T>,
     /// Full-domain pivots recycled from the parent's outcome.
     recycled: Vec<Vec<usize>>,
+    /// Full-domain worst points of the parent's last failed measurement.
+    worst: Vec<Vec<usize>>,
+}
+
+/// An accepted patch: its record, network, and `|P|`.
+struct Accepted<V>
+where
+    V: Clone + Hash + Eq + Send + Sync + Debug,
+{
+    record: PatchRecord,
+    subdomain: SubDomainTreeTN<V>,
+    patch_points: f64,
 }
 
 /// What processing one patch produced.
@@ -779,9 +572,36 @@ enum Verdict<T, V>
 where
     V: Clone + Hash + Eq + Send + Sync + Debug,
 {
-    Accepted(Box<(PatchRecord, SubDomainTreeTN<V>)>),
-    Zero,
+    Accepted(Box<Accepted<V>>),
+    Zero(ZeroPatchRecord, f64),
     Split(Vec<Patch<T>>),
+}
+
+/// The pinned L2 reference and allowance.
+#[derive(Clone, Copy, Debug)]
+struct L2Pin {
+    reference_rms: Option<f64>,
+    source: L2ReferenceSource,
+    tau: f64,
+}
+
+/// A failed verification: its measurement and its worst points in active
+/// coordinates.
+struct Failure {
+    measurement: L2Measurement,
+    worst: Vec<Vec<usize>>,
+}
+
+/// What a split needs from the processing of its patch.
+struct SplitInput<'a, V>
+where
+    V: Clone + Hash + Eq + Send + Sync + Debug,
+{
+    path: Vec<(usize, usize)>,
+    fixed: &'a [Option<usize>],
+    active: &'a [usize],
+    outcome: &'a InterpolationOutcome<V>,
+    failure: Option<Failure>,
 }
 
 fn max_magnitude<T: CommonScalar>(values: &[T]) -> f64 {
@@ -807,6 +627,13 @@ fn engine_error(projector: &Projector, message: String) -> PatchedInterpolationE
     }
 }
 
+fn measure_error(projector: &Projector, error: MeasureError) -> PatchedInterpolationError {
+    match error {
+        MeasureError::Evaluator(source) => evaluator_error(projector, source),
+        MeasureError::Network(message) => engine_error(projector, message),
+    }
+}
+
 /// A violated internal invariant, reported as a construction failure.
 fn internal(source: impl Into<anyhow::Error>) -> PatchedInterpolationError {
     PatchedInterpolationError::Partition {
@@ -816,10 +643,9 @@ fn internal(source: impl Into<anyhow::Error>) -> PatchedInterpolationError {
     }
 }
 
-/// Complete an outcome's active-site pivots with the fixed coordinates.
-fn complete_pivots(
+/// An outcome's pivots in active coordinates, checked for shape and range.
+fn active_pivots(
     pivots: Option<&ColMajorArray<usize>>,
-    fixed: &[Option<usize>],
     active: &[usize],
     dims: &[usize],
 ) -> Result<Vec<Vec<usize>>, String> {
@@ -838,23 +664,54 @@ fn complete_pivots(
             active.len()
         ));
     }
-    let mut points = Vec::with_capacity(n_cols);
-    for column in 0..n_cols {
-        let mut point: Vec<usize> = fixed.iter().map(|fixed| fixed.unwrap_or(0)).collect();
-        let local = pivots.column(column).unwrap_or_default();
-        for (&position, &value) in active.iter().zip(local) {
-            if value >= dims[position] {
-                return Err(format!(
-                    "the outcome pivot {column} has coordinate {value} for a site of \
-                     dimension {}",
-                    dims[position]
-                ));
+    (0..n_cols)
+        .map(|column| {
+            let local = pivots.column(column).unwrap_or_default();
+            for (&position, &value) in active.iter().zip(local) {
+                if value >= dims[position] {
+                    return Err(format!(
+                        "the outcome pivot {column} has coordinate {value} for a site of \
+                         dimension {}",
+                        dims[position]
+                    ));
+                }
             }
-            point[position] = value;
-        }
-        points.push(point);
-    }
-    Ok(points)
+            Ok(local.to_vec())
+        })
+        .collect()
+}
+
+/// Complete active-coordinate points with the fixed coordinates.
+fn complete_points(points: &[Vec<usize>], fixed: &[Option<usize>]) -> Vec<Vec<usize>> {
+    points
+        .iter()
+        .map(|local| {
+            let mut active = local.iter().copied();
+            fixed
+                .iter()
+                .map(|fixed| fixed.or_else(|| active.next()).unwrap_or_default())
+                .collect()
+        })
+        .collect()
+}
+
+/// The added initial pivots of a rerun: the worst points of the failed run,
+/// then its outcome pivots, without points already among the base
+/// candidates or earlier in the list, truncated to `limit`.
+fn added_pivots(
+    base: &HashSet<Vec<usize>>,
+    worst: &[Vec<usize>],
+    outcome_pivots: &[Vec<usize>],
+    limit: usize,
+) -> Vec<Vec<usize>> {
+    let mut seen = base.clone();
+    worst
+        .iter()
+        .chain(outcome_pivots)
+        .filter(|point| seen.insert((*point).clone()))
+        .take(limit)
+        .cloned()
+        .collect()
 }
 
 /// State of one [`patched_interpolate`] run.
@@ -867,9 +724,15 @@ where
     layout: SiteLayout<V>,
     initial_pivots: ColMajorArray<usize>,
     options: &'a PatchedInterpolationOptions,
-    /// The given scale, or the one pinned from the root patch.
-    reference_scale: Cell<Option<f64>>,
+    /// SampledMax: the given reference, or the one pinned from the root.
+    max_reference: Cell<Option<(f64, MaxReferenceSource)>>,
+    /// L2: the pinned reference and allowance.
+    l2: Cell<Option<L2Pin>>,
     counters: Counters,
+    measurement_evaluations: Cell<usize>,
+    audit_evaluations: Cell<usize>,
+    verification_failures: Cell<usize>,
+    engine_retries: Cell<usize>,
     scalar: PhantomData<T>,
 }
 
@@ -880,12 +743,70 @@ where
     E: TreeInterpolator<T>,
     F: Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<T>>,
 {
+    fn is_l2(&self) -> bool {
+        matches!(self.options.error_norm, ErrorNorm::L2 { .. })
+    }
+
+    /// Pin the references that do not depend on the root before any
+    /// evaluation: a given L2 norm, no L2 reference when `rtol = 0`, and a
+    /// given `max_reference`.
+    fn pin_references_known_in_advance(&self) {
+        let tolerance = self.options.tolerance;
+        match self.options.error_norm {
+            ErrorNorm::L2 {
+                reference: L2Reference::Given(norm),
+                ..
+            } => {
+                self.pin_l2(
+                    Some(norm / self.layout.domain_points.sqrt()),
+                    L2ReferenceSource::Given,
+                );
+            }
+            ErrorNorm::L2 { .. } if tolerance.rtol == 0.0 => {
+                self.pin_l2(None, L2ReferenceSource::NotNeeded);
+            }
+            ErrorNorm::SampledMax {
+                max_reference: Some(scale),
+                ..
+            } => self
+                .max_reference
+                .set(Some((scale, MaxReferenceSource::Given))),
+            _ => {}
+        }
+    }
+
+    /// Pin the L2 reference and `tau`, unless already pinned:
+    /// `tau = max(atol / sqrt(|X|), rtol * reference_rms)`.
+    fn pin_l2(&self, reference_rms: Option<f64>, source: L2ReferenceSource) {
+        if self.l2.get().is_some() {
+            return;
+        }
+        let tolerance = self.options.tolerance;
+        let floor = tolerance.atol / self.layout.domain_points.sqrt();
+        let tau = match reference_rms {
+            Some(rms) => floor.max(tolerance.rtol * rms),
+            None => floor,
+        };
+        self.l2.set(Some(L2Pin {
+            reference_rms,
+            source,
+            tau,
+        }));
+    }
+
+    fn l2_pin(&self) -> Result<L2Pin, PatchedInterpolationError> {
+        self.l2
+            .get()
+            .ok_or_else(|| internal(anyhow::anyhow!("the L2 reference is not pinned")))
+    }
+
     fn run(self) -> Result<PatchedInterpolationResult<V>, PatchedInterpolationError> {
         let mut queue = VecDeque::from([Patch {
             path: Vec::new(),
             fixed: vec![None; self.layout.sites.len()],
             cache: PatchCache::new(self.layout.dims.clone()),
             recycled: Vec::new(),
+            worst: Vec::new(),
         }]);
         let mut processed = 0usize;
         let mut splits = 0usize;
@@ -904,11 +825,8 @@ where
             let path = patch.path.clone();
             let projector = self.layout.projector(&path)?;
             match self.process(patch, &projector)? {
-                Verdict::Accepted(entry) => {
-                    let (record, subdomain) = *entry;
-                    accepted.push((path, record, subdomain));
-                }
-                Verdict::Zero => zeros.push((path, projector)),
+                Verdict::Accepted(entry) => accepted.push((path, *entry)),
+                Verdict::Zero(record, patch_points) => zeros.push((path, record, patch_points)),
                 Verdict::Split(children) => {
                     splits += 1;
                     queue.extend(children);
@@ -919,20 +837,101 @@ where
         // Canonical order: lexicographic over the (position, coordinate) path.
         accepted.sort_by(|left, right| left.0.cmp(&right.0));
         zeros.sort_by(|left, right| left.0.cmp(&right.0));
-        let (records, subdomains): (Vec<_>, Vec<_>) = accepted
-            .into_iter()
-            .map(|(_, record, subdomain)| (record, subdomain))
-            .unzip();
+        let norm = self.norm_report(&accepted, &zeros)?;
+        let mut records = Vec::with_capacity(accepted.len());
+        let mut subdomains = Vec::with_capacity(accepted.len());
+        for (_, entry) in accepted {
+            records.push(entry.record);
+            subdomains.push(entry.subdomain);
+        }
         let partition = PartitionedTreeTN::from_disjoint_subdomains(subdomains)?;
         Ok(PatchedInterpolationResult {
             partition,
             report: PatchedInterpolationReport {
-                reference_scale: self.reference_scale.get().unwrap_or(0.0),
+                tolerance: self.options.tolerance,
+                norm,
                 accepted: records,
-                zero_projectors: zeros.into_iter().map(|(_, projector)| projector).collect(),
+                zero_patches: zeros.into_iter().map(|(_, record, _)| record).collect(),
                 splits,
                 function_evaluations: self.counters.evaluations.get(),
                 cache_hits: self.counters.cache_hits.get(),
+                measurement_evaluations: self.measurement_evaluations.get(),
+                audit_evaluations: self.audit_evaluations.get(),
+                verification_failures: self.verification_failures.get(),
+                engine_retries: self.engine_retries.get(),
+            },
+        })
+    }
+
+    /// The norm part of the report. Under L2 the global error and the
+    /// approximation norm are combined in canonical path order.
+    #[allow(clippy::type_complexity)]
+    fn norm_report(
+        &self,
+        accepted: &[(Vec<(usize, usize)>, Accepted<V>)],
+        zeros: &[(Vec<(usize, usize)>, ZeroPatchRecord, f64)],
+    ) -> Result<NormReport, PatchedInterpolationError> {
+        if !self.is_l2() {
+            let (max_reference, source) = self
+                .max_reference
+                .get()
+                .unwrap_or((0.0, MaxReferenceSource::ExactRoot));
+            return Ok(NormReport::SampledMax {
+                max_reference,
+                source,
+                engine_tolerance: self.options.tolerance.allowance(max_reference),
+            });
+        }
+        let pin = self.l2_pin()?;
+        let domain_points = self.layout.domain_points;
+        let missing = || internal(anyhow::anyhow!("an L2 patch has no acceptance measurement"));
+
+        // Accepted and zero patches merged in canonical path order.
+        let mut contributions: Vec<(&[(usize, usize)], Contribution<'_>)> = Vec::new();
+        for (path, entry) in accepted {
+            contributions.push((
+                path,
+                Contribution {
+                    patch_points: entry.patch_points,
+                    acceptance: entry.record.acceptance.as_ref().ok_or_else(missing)?,
+                    audit: entry.record.audit.as_ref(),
+                },
+            ));
+        }
+        for (path, record, patch_points) in zeros {
+            contributions.push((
+                path,
+                Contribution {
+                    patch_points: *patch_points,
+                    acceptance: record.acceptance.as_ref().ok_or_else(missing)?,
+                    audit: record.audit.as_ref(),
+                },
+            ));
+        }
+        contributions.sort_by(|left, right| left.0.cmp(right.0));
+        let contributions: Vec<Contribution<'_>> =
+            contributions.into_iter().map(|(_, c)| c).collect();
+
+        let approximation_rms = verify::approximation_rms(
+            accepted.iter().map(|(_, entry)| {
+                (
+                    entry.subdomain.data().clone().log_norm(),
+                    entry.patch_points,
+                )
+            }),
+            domain_points,
+        );
+        let (global, certified_fraction) =
+            verify::global_error(&contributions, domain_points, pin.tau, approximation_rms);
+        Ok(NormReport::L2 {
+            reference_rms: pin.reference_rms,
+            source: pin.source,
+            tau: pin.tau,
+            error: L2ErrorReport {
+                domain_points,
+                global,
+                certified_fraction,
+                approximation_rms,
             },
         })
     }
@@ -952,6 +951,92 @@ where
         }
     }
 
+    /// Measure `f - f~` (or `f` for the zero approximation) on a patch and
+    /// count its new evaluations as measurement (and audit) evaluations.
+    fn measure(
+        &self,
+        sampler: &PatchSampler<'_, T, F>,
+        target: &MeasureTarget<'_, V>,
+        plan: PointPlan,
+        audit: bool,
+        projector: &Projector,
+    ) -> Result<Measured, PatchedInterpolationError> {
+        let before = self.counters.evaluations.get();
+        let measured = verify::measure(sampler, target, plan);
+        let added = self.counters.evaluations.get() - before;
+        Counters::add(&self.measurement_evaluations, added);
+        if audit {
+            Counters::add(&self.audit_evaluations, added);
+        }
+        measured.map_err(|error| measure_error(projector, error))
+    }
+
+    /// The audit of a sampled acceptance, if enabled. Audit points never
+    /// become pivots: the patch is accepted, and its cache is dropped.
+    fn audit(
+        &self,
+        sampler: &PatchSampler<'_, T, F>,
+        target: &MeasureTarget<'_, V>,
+        acceptance: &L2Measurement,
+        seeds: &PatchSeeds,
+        projector: &Projector,
+    ) -> Result<Option<L2Measurement>, PatchedInterpolationError> {
+        if acceptance.method != MeasurementMethod::Sampled || !self.options.verification.audit {
+            return Ok(None);
+        }
+        let plan = PointPlan::Sampled {
+            count: self.options.verification.samples,
+            seed: seeds.audit(),
+        };
+        let audit = self.measure(sampler, target, plan, true, projector)?;
+        Ok(Some(audit.measurement))
+    }
+
+    /// The measurement plan of a patch with the given point count.
+    fn plan(&self, patch_count: usize, seed: u64) -> PointPlan {
+        let verification = self.options.verification;
+        PointPlan::for_patch(
+            patch_count,
+            verification.samples,
+            verification.max_exhaustive_points,
+            seed,
+        )
+    }
+
+    /// Pin the L2 reference of a root that needs the engine from a Monte
+    /// Carlo estimate on the root's reference stream.
+    fn pin_monte_carlo(
+        &self,
+        sampler: &PatchSampler<'_, T, F>,
+        zero_target: &MeasureTarget<'_, V>,
+        seeds: &PatchSeeds,
+        projector: &Projector,
+    ) -> Result<(), PatchedInterpolationError> {
+        let samples = self.options.verification.samples;
+        let plan = PointPlan::Sampled {
+            count: samples,
+            seed: seeds.scale(),
+        };
+        // The residual of the zero approximation is |f|.
+        let estimate = self.measure(sampler, zero_target, plan, false, projector)?;
+        let reference_rms = estimate.measurement.rms;
+        if reference_rms == 0.0 && self.options.tolerance.atol == 0.0 {
+            return Err(invalid(format!(
+                "the Monte Carlo reference norm is zero: all {samples} uniform root samples are \
+                 exactly zero; give L2Reference::Given(norm), a positive tolerance.atol, or \
+                 more verification.samples"
+            )));
+        }
+        self.pin_l2(
+            Some(reference_rms),
+            L2ReferenceSource::MonteCarlo {
+                samples,
+                mean_square_rel_std_error: estimate.measurement.mean_square_rel_std_error,
+            },
+        );
+        Ok(())
+    }
+
     fn process(
         &self,
         patch: Patch<T>,
@@ -962,6 +1047,7 @@ where
             fixed,
             cache,
             recycled,
+            worst,
         } = patch;
         let layout = &self.layout;
         let active: Vec<usize> = (0..layout.sites.len())
@@ -970,66 +1056,135 @@ where
         if active.len() <= 1 {
             return self.exact_patch(&fixed, &active, cache, projector);
         }
+        let active_dims: Vec<usize> = active.iter().map(|&p| layout.dims[p]).collect();
+        let patch_points: f64 = active_dims.iter().map(|&dim| dim as f64).product();
 
         let seeds = patch_seeds(self.options.seed, &path);
+        let domain = PatchDomain {
+            dims: &layout.dims,
+            fixed: &fixed,
+            active: &active,
+            layout: cache.layout(),
+        };
+        let patch_count = domain.point_count();
+        // User pivots come first inside `patch_candidates`; then the recycled
+        // pivots and the parent's worst points, each kept once.
+        let prior: Vec<Vec<usize>> = recycled.into_iter().chain(worst).collect();
         let candidates = patch_candidates(
-            &PatchDomain {
-                dims: &layout.dims,
-                fixed: &fixed,
-                active: &active,
-                layout: cache.layout(),
-            },
+            &domain,
             &self.initial_pivots,
-            &recycled,
+            &prior,
             self.options.n_initial_pivots,
             seeds.candidates,
         );
         let sampler = self.sampler(&fixed, active.len(), cache);
+        let zero_target = MeasureTarget {
+            network: None,
+            sites: &layout.sites,
+            fixed: &fixed,
+            active_dims: &active_dims,
+            patch_points,
+        };
+        if self.is_l2() && self.l2.get().is_none() {
+            self.pin_monte_carlo(&sampler, &zero_target, &seeds, projector)?;
+        }
         let shape = [active.len(), candidates.count];
         let batch = ColMajorArrayRef::new(&candidates.points, &shape).map_err(internal)?;
         let samples = sampler
             .sample(batch)
             .map_err(|source| evaluator_error(projector, source))?;
         let largest = max_magnitude(&samples);
-        let scale = match self.reference_scale.get() {
-            Some(scale) => scale,
-            None if largest == 0.0 => {
-                return Err(invalid(format!(
-                    "the reference scale cannot be pinned: all {} candidate samples of the root \
-                     patch are exactly zero; pass reference_scale or initial pivots in the \
-                     support of the function",
-                    candidates.count
-                )));
+        let mut base: Vec<Vec<usize>> = candidates
+            .points
+            .chunks(active.len())
+            .map(<[usize]>::to_vec)
+            .collect();
+        let limit = self.options.max_bond_dim - 1;
+
+        let tolerance = if self.is_l2() {
+            let tau = self.l2_pin()?.tau;
+            if largest == 0.0 {
+                // Zero screen: measure the zero approximation.
+                let plan = self.plan(patch_count, seeds.zero_screen());
+                let screen = self.measure(&sampler, &zero_target, plan, false, projector)?;
+                if screen.measurement.rms <= tau {
+                    let audit = self.audit(
+                        &sampler,
+                        &zero_target,
+                        &screen.measurement,
+                        &seeds,
+                        projector,
+                    )?;
+                    let record = ZeroPatchRecord {
+                        projector: projector.clone(),
+                        acceptance: Some(screen.measurement),
+                        audit,
+                    };
+                    return Ok(Verdict::Zero(record, patch_points));
+                }
+                // The measured points with f != 0, largest |f| first, join
+                // the base candidates; they are cached. Every candidate
+                // sample is zero, so none of them is a candidate already.
+                base.extend(screen.worst_points(0.0, limit));
             }
-            None => {
-                self.reference_scale.set(Some(largest));
-                largest
+            tau
+        } else {
+            let scale = match self.max_reference.get() {
+                Some((scale, _)) => scale,
+                None if largest == 0.0 => {
+                    return Err(invalid(format!(
+                        "the max_reference of ErrorNorm::SampledMax cannot be pinned: all {} \
+                         candidate samples of the root patch are exactly zero; give \
+                         ErrorNorm::sampled_max_with_reference(max_abs) or initial pivots in \
+                         the support of the function",
+                        candidates.count
+                    )));
+                }
+                None => {
+                    self.max_reference
+                        .set(Some((largest, MaxReferenceSource::MaxOfRootCandidates)));
+                    largest
+                }
+            };
+            if largest == 0.0 {
+                let record = ZeroPatchRecord {
+                    projector: projector.clone(),
+                    acceptance: None,
+                    audit: None,
+                };
+                return Ok(Verdict::Zero(record, patch_points));
             }
+            self.options.tolerance.allowance(scale)
         };
-        if largest == 0.0 {
-            return Ok(Verdict::Zero);
-        }
 
         let interpolation_error = |source| PatchedInterpolationError::Interpolation {
             projector: projector.clone(),
             source,
         };
-        let problem = InterpolationProblem::new(
-            layout.topology.clone(),
-            layout.active_node_sites(&fixed),
-            ColMajorArray::new(candidates.points, vec![active.len(), candidates.count])
-                .map_err(internal)?,
-            self.options.rtol * scale,
-            NonZeroUsize::new(self.options.max_bond_dim),
-            seeds.engine,
-        )
-        .map_err(interpolation_error)?;
-        let outcome = self
-            .engine
-            .interpolate(&problem, |batch| sampler.sample(batch))
+        let base_set: HashSet<Vec<usize>> = base.iter().cloned().collect();
+        let retries = self.options.verification.retries;
+        let mut added: Vec<Vec<usize>> = Vec::new();
+        let mut failure: Option<Failure> = None;
+        let mut attempt = 0usize;
+        let outcome = loop {
+            let initial: Vec<usize> = base.iter().chain(&added).flatten().copied().collect();
+            let n_initial = base.len() + added.len();
+            let problem = InterpolationProblem::new(
+                layout.topology.clone(),
+                layout.active_node_sites(&fixed),
+                ColMajorArray::new(initial, vec![active.len(), n_initial]).map_err(internal)?,
+                tolerance,
+                NonZeroUsize::new(self.options.max_bond_dim),
+                seeds.engine_run(attempt),
+            )
             .map_err(interpolation_error)?;
-
-        if outcome.termination == InterpolationTermination::Converged {
+            let outcome = self
+                .engine
+                .interpolate(&problem, |batch| sampler.sample(batch))
+                .map_err(interpolation_error)?;
+            if outcome.termination != InterpolationTermination::Converged {
+                break outcome;
+            }
             embed::check_outcome_layout(&outcome.network, layout, &fixed)
                 .map_err(|message| engine_error(projector, message))?;
             let subdomain = self.subdomain(&outcome.network, &fixed, projector)?;
@@ -1045,35 +1200,122 @@ where
                     ),
                 ));
             }
-            let record = PatchRecord {
+            let mut record = PatchRecord {
                 projector: projector.clone(),
                 termination: outcome.termination,
-                error_estimate: outcome.error_estimate,
+                engine_error_estimate: outcome.error_estimate,
                 max_sample_magnitude: outcome.max_sample_magnitude,
                 max_bond_dim: subdomain.max_bond_dim(),
+                retries_used: attempt,
+                acceptance: None,
+                audit: None,
             };
-            return Ok(Verdict::Accepted(Box::new((record, subdomain))));
-        }
+            if !self.is_l2() {
+                return Ok(accepted(record, subdomain, patch_points));
+            }
 
+            // Verify the re-embedded patch that would be stored.
+            let target = MeasureTarget {
+                network: Some(subdomain.data()),
+                sites: &layout.sites,
+                fixed: &fixed,
+                active_dims: &active_dims,
+                patch_points,
+            };
+            let plan = self.plan(patch_count, seeds.verify(attempt));
+            let measured = self.measure(&sampler, &target, plan, false, projector)?;
+            if measured.measurement.rms <= tolerance {
+                record.audit =
+                    self.audit(&sampler, &target, &measured.measurement, &seeds, projector)?;
+                record.acceptance = Some(measured.measurement);
+                return Ok(accepted(record, subdomain, patch_points));
+            }
+            Counters::add(&self.verification_failures, 1);
+            let worst = measured.worst_points(tolerance, limit);
+            if attempt < retries {
+                let pivots = active_pivots(outcome.pivots.as_ref(), &active, &layout.dims)
+                    .map_err(|message| engine_error(projector, message))?;
+                added = added_pivots(&base_set, &worst, &pivots, limit);
+                failure = Some(Failure {
+                    measurement: measured.measurement,
+                    worst,
+                });
+                Counters::add(&self.engine_retries, 1);
+                attempt += 1;
+                continue;
+            }
+            failure = Some(Failure {
+                measurement: measured.measurement,
+                worst,
+            });
+            break outcome;
+        };
+        self.split(
+            SplitInput {
+                path,
+                fixed: &fixed,
+                active: &active,
+                outcome: &outcome,
+                failure,
+            },
+            sampler,
+            projector,
+        )
+    }
+
+    /// Split a patch that was not accepted.
+    fn split(
+        &self,
+        input: SplitInput<'_, V>,
+        sampler: PatchSampler<'_, T, F>,
+        projector: &Projector,
+    ) -> Result<Verdict<T, V>, PatchedInterpolationError> {
+        let SplitInput {
+            path,
+            fixed,
+            active,
+            outcome,
+            failure,
+        } = input;
+        let layout = &self.layout;
         let Some(&split_position) = layout
             .split_order
             .iter()
             .find(|&&position| fixed[position].is_none())
         else {
-            return Err(PatchedInterpolationError::NoSplitIndexLeft {
-                projector: projector.clone(),
+            return Err(match failure {
+                Some(failure) if outcome.termination == InterpolationTermination::Converged => {
+                    PatchedInterpolationError::VerificationFailed {
+                        projector: projector.clone(),
+                        measurement: failure.measurement,
+                    }
+                }
+                _ => PatchedInterpolationError::NoSplitIndexLeft {
+                    projector: projector.clone(),
+                },
             });
         };
         let recycled = if self.options.recycle_pivots {
-            complete_pivots(outcome.pivots.as_ref(), &fixed, &active, &layout.dims)
-                .map_err(|message| engine_error(projector, message))?
+            let pivots = active_pivots(outcome.pivots.as_ref(), active, &layout.dims)
+                .map_err(|message| engine_error(projector, message))?;
+            complete_points(&pivots, fixed)
         } else {
             Vec::new()
         };
+        let worst = failure
+            .map(|failure| complete_points(&failure.worst, fixed))
+            .unwrap_or_default();
         let slot = active
             .iter()
             .position(|&position| position == split_position)
             .ok_or_else(|| internal(anyhow::anyhow!("the split site is not active")))?;
+        let inside = |points: &[Vec<usize>], value: usize| -> Vec<Vec<usize>> {
+            points
+                .iter()
+                .filter(|point| point[split_position] == value)
+                .cloned()
+                .collect()
+        };
         let children = sampler
             .cache
             .into_inner()
@@ -1083,17 +1325,14 @@ where
             .map(|(value, cache)| {
                 let mut child_path = path.clone();
                 child_path.push((split_position, value));
-                let mut child_fixed = fixed.clone();
+                let mut child_fixed = fixed.to_vec();
                 child_fixed[split_position] = Some(value);
                 Patch {
                     path: child_path,
                     fixed: child_fixed,
                     cache,
-                    recycled: recycled
-                        .iter()
-                        .filter(|point| point[split_position] == value)
-                        .cloned()
-                        .collect(),
+                    recycled: inside(&recycled, value),
+                    worst: inside(&worst, value),
                 }
             })
             .collect();
@@ -1120,22 +1359,51 @@ where
             .sample(batch)
             .map_err(|source| evaluator_error(projector, source))?;
         let largest = max_magnitude(&values);
-        if self.reference_scale.get().is_none() {
-            self.reference_scale.set(Some(largest));
-        }
+        let patch_points = n_points as f64;
+        let acceptance = if self.is_l2() {
+            // Only the root can be exact before the reference is pinned; the
+            // network multiplies the exact values by one-hot factors, so the
+            // error is exactly zero and no measurement runs.
+            self.pin_l2(
+                Some(verify::rms_of(values.iter().map(|value| value.abs_val()))),
+                L2ReferenceSource::ExactRoot,
+            );
+            Some(L2Measurement {
+                method: MeasurementMethod::Exact,
+                points: n_points,
+                patch_points,
+                rms: 0.0,
+                mean_square_rel_std_error: 0.0,
+                max_residual: 0.0,
+            })
+        } else {
+            if self.max_reference.get().is_none() {
+                self.max_reference
+                    .set(Some((largest, MaxReferenceSource::ExactRoot)));
+            }
+            None
+        };
         if largest == 0.0 {
-            return Ok(Verdict::Zero);
+            let record = ZeroPatchRecord {
+                projector: projector.clone(),
+                acceptance,
+                audit: None,
+            };
+            return Ok(Verdict::Zero(record, patch_points));
         }
         let network = embed::exact_active_network(&self.layout, active, values)?;
         let subdomain = self.subdomain(&network, fixed, projector)?;
         let record = PatchRecord {
             projector: projector.clone(),
             termination: InterpolationTermination::Converged,
-            error_estimate: 0.0,
+            engine_error_estimate: 0.0,
             max_sample_magnitude: largest,
             max_bond_dim: subdomain.max_bond_dim(),
+            retries_used: 0,
+            acceptance,
+            audit: None,
         };
-        Ok(Verdict::Accepted(Box::new((record, subdomain))))
+        Ok(accepted(record, subdomain, patch_points))
     }
 
     /// Re-embed the fixed sites into an active-site network and wrap the
@@ -1153,4 +1421,19 @@ where
             None,
         )?)
     }
+}
+
+fn accepted<T, V>(
+    record: PatchRecord,
+    subdomain: SubDomainTreeTN<V>,
+    patch_points: f64,
+) -> Verdict<T, V>
+where
+    V: Clone + Hash + Eq + Send + Sync + Debug,
+{
+    Verdict::Accepted(Box::new(Accepted {
+        record,
+        subdomain,
+        patch_points,
+    }))
 }
