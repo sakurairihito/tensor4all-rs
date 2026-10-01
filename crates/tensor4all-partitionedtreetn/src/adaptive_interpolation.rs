@@ -121,8 +121,11 @@ mod cache;
 mod embed;
 mod layout;
 mod sampling;
+// Used by the tests only until the L2 measurement lands.
 #[cfg(test)]
 mod tests;
+#[cfg_attr(not(test), allow(dead_code))]
+mod verify;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
