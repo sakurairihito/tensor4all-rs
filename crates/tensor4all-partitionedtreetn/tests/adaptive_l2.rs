@@ -1336,8 +1336,11 @@ fn unbounded_exhaustive_limits_never_measure_an_overflowing_patch_exhaustively()
 
 /// A point list that fits a `Vec` by length but cannot be reserved is
 /// `InvalidInput` naming the verification options, reported during the
-/// measurement, after the root's candidates were evaluated.
+/// measurement, after the root's candidates were evaluated. The scenario
+/// needs a 64-bit address space: on narrower targets the list length already
+/// exceeds `Vec` capacity and is rejected before any evaluation.
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn an_unreservable_measurement_point_list_is_invalid_input_after_evaluations() {
     // 2^50 points of 50 binary sites: the exhaustive list holds 50 * 2^50
     // entries (about 4.5e17 bytes). That fits a Vec's byte limit, but no

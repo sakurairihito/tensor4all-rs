@@ -21,6 +21,24 @@ pub(super) fn point_list_capacity(n_active: usize, count: usize) -> Option<usize
     (bytes <= isize::MAX as usize).then_some(entries)
 }
 
+/// An empty point list with room reserved for `count` points of `n_coords`
+/// coordinates each. `what` names the list in the error message ("sample",
+/// "exhaustive", ...). Returns an error if the list length cannot be
+/// represented in a `Vec` or the reservation fails.
+pub(super) fn reserve_point_list(
+    n_coords: usize,
+    count: usize,
+    what: &str,
+) -> Result<Vec<usize>, String> {
+    let capacity = point_list_capacity(n_coords, count)
+        .ok_or_else(|| format!("{what} point-list length exceeds Vec capacity"))?;
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(capacity)
+        .map_err(|error| format!("could not reserve {what} point list: {error}"))?;
+    Ok(points)
+}
+
 /// SplitMix64 increment (the golden-ratio gamma).
 const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 /// Domain separator mixed into the root seed before absorbing a patch path.
@@ -156,12 +174,7 @@ pub(super) fn uniform_points(
     count: usize,
     seed: u64,
 ) -> Result<Vec<usize>, String> {
-    let capacity = point_list_capacity(active_dims.len(), count)
-        .ok_or_else(|| "sample point-list length exceeds Vec capacity".to_owned())?;
-    let mut points = Vec::new();
-    points
-        .try_reserve_exact(capacity)
-        .map_err(|error| format!("could not reserve sampled point list: {error}"))?;
+    let mut points = reserve_point_list(active_dims.len(), count, "sample")?;
     let mut rng = SplitMix64::new(seed);
     for _ in 0..count {
         points.extend(
@@ -178,12 +191,7 @@ pub(super) fn uniform_points(
 /// is the patch's point count. Returns an error if the point list cannot be
 /// represented or reserved.
 pub(super) fn all_points(active_dims: &[usize], count: usize) -> Result<Vec<usize>, String> {
-    let capacity = point_list_capacity(active_dims.len(), count)
-        .ok_or_else(|| "exhaustive point-list length exceeds Vec capacity".to_owned())?;
-    let mut points = Vec::new();
-    points
-        .try_reserve_exact(capacity)
-        .map_err(|error| format!("could not reserve exhaustive point list: {error}"))?;
+    let mut points = reserve_point_list(active_dims.len(), count, "exhaustive")?;
     for mut linear in 0..count {
         for &dim in active_dims {
             points.push(linear % dim);

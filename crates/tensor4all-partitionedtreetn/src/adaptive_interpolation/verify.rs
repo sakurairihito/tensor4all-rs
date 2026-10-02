@@ -24,7 +24,7 @@ use super::report::{
     GlobalL2Error, L2Measurement, MeasurementMethod, GLOBAL_ROUNDING_MARGIN,
     MEASUREMENT_ROUNDING_FACTOR,
 };
-use super::sampling::{all_points, uniform_points};
+use super::sampling::{all_points, reserve_point_list, uniform_points};
 
 /// Number of points per evaluator batch of a measurement. Fixed, so that the
 /// batch composition and call history of a measurement depend only on its
@@ -184,7 +184,8 @@ where
     let approximations: Option<Vec<T>> = match target.network {
         None => None,
         Some(network) => {
-            let mut full = Vec::with_capacity(target.fixed.len() * n_points);
+            let mut full = reserve_point_list(target.fixed.len(), n_points, "full-coordinate")
+                .map_err(MeasureError::PointList)?;
             for point in flat.chunks(n_active.max(1)) {
                 let mut active = point.iter().copied();
                 full.extend(
