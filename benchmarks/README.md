@@ -111,6 +111,42 @@ complete paired case summaries, all fitted coefficients and experiment hashes.
 It localizes a candidate-frame residual without claiming a production speedup
 or resolving the downstream GW workload.
 
+#### Adaptive TreeTN patch representation (M4)
+
+`benchmark_tree_patch_representation` compares eager patches, which retain
+projected site axes, with a compact candidate that selects each projected site
+value and removes that axis. It obtains four accepted patches from the real
+`patched_interpolate` path using `TreeTciInterpolator`, then checks dense active
+values before timing `TreeTN::norm` and rank-capped `TreeTN::truncate` on chain
+and branched topologies. The branched case includes a site-free leaf. The shared
+body is in `rust/benchmark_tree_patch_representation.rs` and the crate example
+is a thin include. The fixture uses interpolation bond cap 2 and supplies one
+initial pivot for each of its four switch-coordinate states.
+
+Pre-register the comparison and adoption gate in
+[`2026-10-02-tree-patch-representation.md`](results/2026-10-02-tree-patch-representation.md)
+before collecting timings. The runner performs 10 alternating eager/eager noise
+pairs first and stops as inconclusive if the median relative gap exceeds 15%.
+It then records 10 alternating eager/compact pairs per operation and topology,
+all per-patch timings, payload sizes, conversion time, and active-slice residuals.
+Each timed sample clones a patch before the operation so truncation always sees
+the same input. A compact representation passes the recorded gate only if it
+reduces payload by at least 20%, improves truncate median by at least 10% on
+both topologies, keeps norm median regression at or below 10%, and every
+active-slice relative residual is at most `1e-12`.
+
+```bash
+T4A_BENCH_GIT_COMMIT=$(git rev-parse HEAD) \
+  cargo build --release -p tensor4all-partitionedtreetn \
+    --example benchmark_tree_patch_representation
+RAYON_NUM_THREADS=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 BLAS_NUM_THREADS=1 \
+  taskset -c 2 ./target/release/examples/benchmark_tree_patch_representation
+```
+
+The runner emits one JSON object per line. Save its complete stdout beside the
+worklog; do not replace an existing result file.
+
 #### Other Rust benchmarks
 
 ```bash

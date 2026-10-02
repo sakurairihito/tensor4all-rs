@@ -176,20 +176,31 @@ user).
 
 ### M4. Patch representation decision (M)
 
-Outcome: a measured decision between the current eager (masked) patches and a
-compact representation that removes projected site indices.
+Outcome: retain eager masked patches; the compact candidate did not meet the
+pre-registered adoption gate. The full measurements and raw JSONL are recorded
+in [`2026-10-02-tree-patch-representation.md`](../../benchmarks/results/2026-10-02-tree-patch-representation.md).
 
 Scope:
 
 - measure storage and runtime of both representations on patches produced by
   the M2 driver, with parameters matched to real downstream use (TreeTCI,
   tolerance on the order of `1e-4`), on chains and on branched trees;
-- the robustness requirements listed in the findings (site-free nodes,
-  including leaves) are tested in `tensor4all-treetn` before any adoption;
+- the site-free-node and leaf regressions listed in the findings were tested
+  and fixed in `tensor4all-treetn` on the separate branch
+  `fix/treetn-sitefree-leaf-ops`, which lands on `main` by its own pull
+  request;
 - adoption requires amending the full-site-index invariant of
   [partitioned-treetn.md](./partitioned-treetn.md).
 
-Exit: a recorded decision with the measurements.
+Decision: eager payload was 512 bytes per case versus 448 bytes compact (12.5%
+reduction). Final-source compact/eager paired median ratios for norm were
+1.0280 (chain) and 0.9450 (branched); truncation ratios were 0.9873 and 0.8894.
+Truncation active-slice residuals were `1.10e-15` and `1.19e-15`. Eager/eager
+noise medians were at most 2.09%. Compact missed the required 20% payload
+reduction; chain truncation also missed the 10% speed gate. Keep the current
+invariant; revisit if representative workloads or the cost gate change.
+
+Exit: recorded decision and raw measurements.
 
 ### M5. Split selection and overpatching control (M)
 

@@ -95,13 +95,26 @@ Verified TreeTN preconditions:
 - `TreeTN::same_topology`, checked before zip-up, compares nodes and edges
   only, not site indices.
 
-Robustness requirement (observed once, to be reproduced by a unit test before
-relying on it): truncating a TreeTN whose leaf node holds only a bond index
-failed with "Tensor must have rank >= 2". The compact form creates exactly
-such leaves when a leaf's sites are fixed.
+The site-free-leaf robustness issue was reproduced and fixed in
+`tensor4all-treetn`, on the separate branch `fix/treetn-sitefree-leaf-ops`
+(an independent TreeTN defect, so it lands on `main` by its own pull request;
+the M4 benchmark needs it for the branched case): canonicalization had counted a wide site-free leaf's bond
+dimension as a norm factor, and truncation failed when a two-site factorization
+had an empty side. Canonicalization now absorbs a rank-one leaf exactly and
+restores its edge as a dimension-one link; truncation adds a temporary
+dimension-one boundary for empty-side factorization. Regression coverage checks
+the dense norm and values, explicit and default execution contexts, and
+truncation from both orientations. The complete `tensor4all-treetn` suite
+passed 542 unit tests plus its integration tests and doctests before a later
+lint-only helper-signature cleanup; the final source then passed clippy across
+all targets and the release benchmark rerun.
 
-Adoption needs the M4 measurement on M2 patches and an amendment of the
-full-site-index invariant of [partitioned-treetn.md](./partitioned-treetn.md).
+M4 measured the compact candidate on real M2 patches but did not meet the
+pre-registered adoption gate: payload fell by only 12.5% in both cases, and the
+chain truncation gain was small. Keep the full-site-index invariant in
+[partitioned-treetn.md](./partitioned-treetn.md). The complete protocol, paired
+measurements, correctness residuals, and decision are in
+[`2026-10-02-tree-patch-representation.md`](../../benchmarks/results/2026-10-02-tree-patch-representation.md).
 
 ## 5. Avoidable overhead in patch algebra
 
