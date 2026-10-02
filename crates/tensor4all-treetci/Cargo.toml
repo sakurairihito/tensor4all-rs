@@ -29,6 +29,7 @@ thiserror.workspace = true
 petgraph.workspace = true
 num-complex.workspace = true
 rand.workspace = true
+rand_chacha.workspace = true
 tenferro-linalg.workspace = true
 tenferro-tensor.workspace = true
 tensor4all-core = { path = "../tensor4all-core", default-features = false }

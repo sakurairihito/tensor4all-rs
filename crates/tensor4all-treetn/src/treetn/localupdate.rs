@@ -616,16 +616,17 @@ where
             .validate()
             .map_err(|error| anyhow::anyhow!("Invalid factorization options: {error}"))?;
 
-        // Factorize (context-scoped when the updater carries a context).
-        let factorize_result = match &self.context {
-            Some(context) => tensor_ab
-                .factorize_in(&left_inds, &options, context)
-                .map_err(|e| anyhow::anyhow!("Factorization failed: {}", e))?,
-            None => tensor_ab
-                .factorize(&left_inds, &options)
-                .map_err(|e| anyhow::anyhow!("Factorization failed: {}", e))?,
-        };
-
+        // A site-free endpoint leaves one side of the split empty; the shared
+        // helper handles that case with a dimension-one bond.
+        let context = self.context.as_ref();
+        let factorize_result =
+            super::factorize_allowing_empty_side(&tensor_ab, &left_inds, |tensor, left| {
+                match context {
+                    Some(context) => tensor.factorize_in(left, &options, context),
+                    None => tensor.factorize(left, &options),
+                }
+                .map_err(|e| anyhow::anyhow!("Factorization failed: {}", e))
+            })?;
         let new_tensor_a = factorize_result.left;
         let new_tensor_b = factorize_result.right;
         let new_bond = factorize_result.bond_index;

@@ -34,11 +34,27 @@ where
     ///
     ///   - Always performs full canonicalization
     ///
+    /// # Site-free nodes
+    ///
+    /// A node without site indices that is swept towards the center (for
+    /// example a site-free leaf) is absorbed exactly into its neighbor: it
+    /// keeps a unit-modulus scalar, and the bond to that neighbor is replaced
+    /// by a fresh dimension-one link, whatever its original dimension. The
+    /// represented tensor is unchanged, but the old bond index is gone from
+    /// the network.
+    ///
     /// # Errors
     ///
     /// Returns an error when the operation fails (a shape or index mismatch, an
     /// SVD or non-convergence failure, or a backend failure). The network is
     /// left unchanged when an error is returned.
+    ///
+    /// Under [`CanonicalForm::LU`] and [`CanonicalForm::CI`], canonicalization
+    /// fails when a tensor that has to be factorized is zero, because a
+    /// rank-zero split has no valid bond. This applies to every node swept
+    /// towards the center, site-free leaves included. The message names the
+    /// underlying factorization cause, and the full chain stays available as
+    /// the error source. [`CanonicalForm::Unitary`] handles zero tensors.
     ///
     /// # Examples
     ///
@@ -126,11 +142,16 @@ where
     /// Canonicalize the network in-place towards the specified center using options.
     ///
     /// This is the `&mut self` version of [`Self::canonicalize`].
+    ///
     /// # Errors
     ///
-    /// Returns an error when the operation fails (a shape or index mismatch, an
-    /// /// SVD or non-convergence failure, or a backend failure).
-    ///
+    /// Returns a [`TreeTNOperationError`] in the same cases as
+    /// [`Self::canonicalize`]: a form mismatch when the network is already
+    /// canonical in a different form and `options` is not forced, a shape or
+    /// index mismatch, an SVD or non-convergence failure, a backend failure,
+    /// and, under [`CanonicalForm::LU`] and [`CanonicalForm::CI`], a zero tensor
+    /// that has to be factorized. The network is left unchanged when an error
+    /// is returned.
     pub fn canonicalize_mut(
         &mut self,
         canonical_region: impl IntoIterator<Item = V>,
@@ -161,6 +182,10 @@ where
     /// Internal implementation for canonicalization.
     ///
     /// This is the core canonicalization logic that public methods delegate to.
+    /// Under the LU and CI forms it fails on a zero tensor that has to be
+    /// factorized; the error message names the factorization cause. Edges
+    /// processed before the failure stay rewritten, so callers that promise an
+    /// unchanged network on error must work on a copy.
     pub(crate) fn canonicalize_impl(
         &mut self,
         canonical_region: impl IntoIterator<Item = V>,
@@ -172,8 +197,9 @@ where
 
     /// Context-scoped canonicalization.
     ///
-    /// Only the unitary (QR) form has a scoped path; LU/CI forms and scalar
-    /// edge normalization return typed errors instead of running.
+    /// Only the unitary (QR) form has a scoped path; LU/CI forms return
+    /// errors instead of running, so the LU/CI zero-tensor failure of
+    /// [`Self::canonicalize_impl`] cannot occur here.
     pub(crate) fn canonicalize_impl_in(
         &mut self,
         canonical_region: impl IntoIterator<Item = V>,
