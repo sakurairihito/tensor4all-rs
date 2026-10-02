@@ -294,7 +294,10 @@ pub enum PatchedInterpolationError {
     /// The inputs or options are invalid, or a reference cannot be pinned.
     /// Reported before any evaluation, except an unpinnable reference (a
     /// zero `SampledMax` root sample, or a zero Monte Carlo estimate with
-    /// `atol = 0`).
+    /// `atol = 0`) and a measurement point list that the allocator cannot
+    /// provide (`verification.samples` or `verification.max_exhaustive_points`
+    /// too large for the available memory), which surface when the
+    /// measurement is built.
     #[error("invalid patched interpolation input: {message}")]
     InvalidInput {
         /// The violated condition and, where possible, the remedy.
@@ -415,13 +418,18 @@ impl From<PartitionedTreeTNError> for PatchedInterpolationError {
 ///   finite; a given reference (`max_reference` or `L2Reference::Given`) is
 ///   not finite and positive; `max_bond_dim < 2`; `n_initial_pivots == 0`;
 ///   `max_patches == Some(0)`; `verification.samples < 2`; `initial_pivots`
-///   is not a 2D array with one row per site and in-range coordinates; under
-///   L2, the domain's point count is not finite in `f64`, or the reference is
+///   is not a 2D array with one row per site and in-range coordinates;
+///   `verification.samples` times the number of sites exceeds the capacity
+///   of a point list (its byte length must fit a `Vec`); under L2, the
+///   domain's point count is not finite in `f64`, or the reference is
 ///   [`L2Reference::Required`] while `rtol > 0` and the root has more than
 ///   one site. After the root sample: under `SampledMax` without a
 ///   `max_reference`, every candidate sample of a root that needs the engine
 ///   is exactly zero; under L2 with [`L2Reference::MonteCarlo`], the
-///   estimate is zero and `atol = 0`.
+///   estimate is zero and `atol = 0`. During a measurement, possibly after
+///   evaluations: its point list cannot be reserved (the allocator refuses
+///   `verification.samples` or, for an exhaustive measurement, up to
+///   `max(verification.max_exhaustive_points, verification.samples)` points).
 /// - [`PatchedInterpolationError::Interpolation`] when the evaluator fails,
 ///   returns a wrong number of values, or returns a value with a non-finite
 ///   component or with finite components whose magnitude overflows
@@ -634,8 +642,13 @@ fn engine_error(projector: &Projector, message: String) -> PatchedInterpolationE
 
 fn measure_error(projector: &Projector, error: MeasureError) -> PatchedInterpolationError {
     match error {
+        // The list length is bounded by `verification.samples` or
+        // `verification.max_exhaustive_points`, so the remedy is an option
+        // change: `InvalidInput`, not `ResourceLimit` (whose remedy is to
+        // raise a limit).
         MeasureError::PointList(message) => invalid(format!(
-            "could not construct the verification point list: {message}"
+            "could not construct the verification point list of the patch {projector:?}: \
+             {message}; lower verification.samples or verification.max_exhaustive_points"
         )),
         MeasureError::Evaluator(source) => evaluator_error(projector, source),
         MeasureError::Network(message) => engine_error(projector, message),
@@ -954,7 +967,9 @@ where
     /// whose bond is wider than one. `TreeTN::log_norm` overestimates the
     /// norm of such networks unless that leaf is the canonicalization center
     /// (a known `tensor4all-treetn` defect), so the approximation norm is
-    /// then reported as not computable.
+    /// then reported as not computable. Temporary: remove this guard once
+    /// the fix on the `tensor4all-treetn` branch `fix/treetn-sitefree-leaf-ops`
+    /// is on this branch (see the M3 design record for the removal plan).
     fn has_wide_site_free_leaf(&self, data: &TreeTN<IdxTensor, V>) -> bool {
         self.layout.node_positions.iter().any(|(node, positions)| {
             positions.is_empty()

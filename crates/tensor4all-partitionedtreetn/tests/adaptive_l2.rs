@@ -1335,6 +1335,44 @@ fn unbounded_exhaustive_limits_never_measure_an_overflowing_patch_exhaustively()
     );
 }
 
+/// A point list that fits a `Vec` by length but cannot be reserved is
+/// `InvalidInput` naming the verification options, reported during the
+/// measurement, after the root's candidates were evaluated.
+#[test]
+fn an_unreservable_measurement_point_list_is_invalid_input_after_evaluations() {
+    // 2^50 points of 50 binary sites: the exhaustive list holds 50 * 2^50
+    // entries (about 4.5e17 bytes). That fits a Vec's byte limit, but no
+    // 64-bit address space (at most 2^57 bytes) can provide it, so the
+    // fallible reservation fails instead of aborting.
+    let problem = chain("s", 50, 2);
+    let options = l2_given(2, 1.0, 1e-6)
+        .with_verification(VerificationOptions::new().with_max_exhaustive_points(1usize << 50));
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    // f = 0: every candidate sample is zero, so the zero screen measures the
+    // whole root exhaustively.
+    let zero = |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![0.0; batch.shape()[1]])
+    };
+    let message = expect_invalid(
+        patched_interpolate(
+            &FiberEngine,
+            problem.topology.clone(),
+            problem.node_sites.clone(),
+            no_pivots(&problem),
+            zero,
+            &options,
+        ),
+        "verification point list",
+    );
+    assert!(
+        message.contains("verification.max_exhaustive_points"),
+        "{message:?}"
+    );
+    assert!(message.contains("could not reserve exhaustive point list"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 /// `f = 1` plus spikes A (+9), B (+7), C (+5) on `single_node(&[4, 4])`.
 fn three_spikes(p: &[usize]) -> f64 {
     match p {
@@ -1444,10 +1482,14 @@ fn a_site_free_leaf_with_a_wide_bond_makes_the_approximation_norm_unavailable() 
 
 /// Minimal reproduction of a `tensor4all-treetn` defect (not fixed here):
 /// `TreeTN::log_norm` overestimates the norm when a site-free leaf that is
-/// not the smallest node name has a bond of dimension two or more.
+/// not the smallest node name has a bond of dimension two or more. The fix
+/// is on the `tensor4all-treetn` branch `fix/treetn-sitefree-leaf-ops`; once
+/// it is on this branch, un-ignore this test and follow the removal plan in
+/// the M3 design record.
 #[test]
 #[ignore = "known tensor4all-treetn defect: TreeTN::log_norm is wrong for a site-free leaf with a \
-            bond wider than one (follow-up issue to file; see the M3 design record)"]
+            bond wider than one; fixed on branch fix/treetn-sitefree-leaf-ops, un-ignore when it \
+            merges to main"]
 fn treetn_log_norm_of_a_site_free_leaf_with_a_wide_bond() {
     use tensor4all_core::{DynIndex, IdxTensor};
     use tensor4all_treetn::TreeTN;

@@ -1636,9 +1636,20 @@ text left open.
   reported as `None`, with the rounding term, the flag, and the relative
   fields (test `a_site_free_leaf_with_a_wide_bond_makes_the_approximation_norm_unavailable`).
   The rustdoc of `approximation_rms` and of the relative fields names the
-  defect. **Follow-up for the user to decide:** file a `tensor4all-treetn`
-  issue for `log_norm` with this reproduction; once fixed, the guard and the
-  ignored test can go.
+  defect. **Fix and removal plan.** The defect is fixed in
+  `tensor4all-treetn` on the branch `fix/treetn-sitefree-leaf-ops`, which is
+  not merged and not on this branch; related site-free failures in treetn
+  are tracked in issue #797. The fix reaches this branch when it merges to
+  `main` and `main` is merged here. Once it is on this branch:
+  1. un-ignore the regression test
+     `treetn_log_norm_of_a_site_free_leaf_with_a_wide_bond`;
+  2. remove the driver guard `has_wide_site_free_leaf` and the rustdoc notes
+     on the defect (on `approximation_rms`, `relative_error_bound`, and
+     `relative_bound_estimate`);
+  3. invert the guard test
+     `a_site_free_leaf_with_a_wide_bond_makes_the_approximation_norm_unavailable`
+     to expect `Some` approximation norm matching the dense norm, or remove
+     it.
 
 ### Review fixes
 
@@ -1646,9 +1657,21 @@ text left open.
   when its point count, computed with checked multiplication, exists and is
   at most `max(max_exhaustive_points, samples)`, and the point-list length and
   byte capacity fit in a `Vec`; otherwise it is sampled. Both exhaustive and
-  sampled point-list constructors use checked capacity arithmetic and
-  fallible reservation. `verification.samples` whose list cannot fit a `Vec`
-  is `InvalidInput` before any evaluation, a new validation branch.
+  sampled point-list constructors (the active-coordinate point lists only)
+  use checked capacity arithmetic and fallible reservation; a reservation
+  failure is `InvalidInput` naming `verification.samples` and
+  `verification.max_exhaustive_points`, reported during the measurement and
+  so possibly after evaluations (test
+  `an_unreservable_measurement_point_list_is_invalid_input_after_evaluations`).
+  `ResourceLimit` was not used: it reports a user-set cap that was reached,
+  with the remedy to raise it, while here the remedy is to lower an option.
+  The rest of a measurement still allocates infallibly: the full-coordinate
+  point list and the values buffer of the patch network (`network_values`),
+  the function values, and the growth of the patch cache. An exhaustive plan
+  within a huge user-set `max_exhaustive_points` is therefore bounded only
+  by the point-list reservation, not protected end to end.
+  `verification.samples` whose list cannot fit a `Vec` is `InvalidInput`
+  before any evaluation, a new validation branch.
 - **Rerun list.** A rerun receives the distinct worst points of the failed
   measurement, without the base candidates, then the outcome pivots,
   truncated to `max_bond_dim - 1` after the base candidates are dropped
@@ -1658,9 +1681,18 @@ text left open.
 ### Evidence for the open questions
 
 Gathered with small release-mode runs on the real producer (TreeTCI through
-the M3 driver), unless stated otherwise. Reproducible ignored diagnostic
-tests and their commands are in
-`crates/tensor4all-partitionedtreetn/tests/adaptive_l2_diagnostics.rs`.
+the M3 driver), unless stated otherwise. Every number below is printed by a
+committed test: the ignored diagnostics in
+`crates/tensor4all-partitionedtreetn/tests/adaptive_l2_diagnostics.rs`
+(command in its module documentation; all five were re-run together with
+`--ignored --nocapture --test-threads 1`), and for OQ8 the stage-1 unit tests
+`measurement_is_bitwise_reproducible_across_threads_on_*` in
+`src/adaptive_interpolation/verify/tests.rs`, run with
+`cargo test --release -p tensor4all-partitionedtreetn --lib
+measurement_is_bitwise_reproducible -- --include-ignored --nocapture`.
+Patch, split, and evaluation counts are deterministic; the OQ8 counts depend
+on thread scheduling and vary between runs, so they are quoted as observed
+ranges.
 The runs used a branched quantics
 tree with two six-bit variables on the branches of a site-free junction and a
 binary flag (8192 points, junction of degree three), `seed = 1`, an MSB-first
@@ -1670,48 +1702,61 @@ record evaluation counts and approximation errors, not elapsed time.
 
 - **OQ2 (budget allocation; diagnostic, not a comparison of allocations).**
   The volume-versus-norm allocation question was not directly measured. The
-  committed diagnostic reports the effective local relative tolerance
-  `tau / rms_P(f)` of the accepted patches: values ranged from 0.78 to 1.9
-  times `rtol` for the smooth function and from 0.072 `rtol` (patches at the
-  peak, close to a `sqrt(rho)` factor) to `6e5 rtol` (tails) for the localized
-  function. It describes the volume allocation only; it does not compare it
-  with a norm-proportional allocation. At `rtol = 1e-4` (`1e-6`), patches and
-  evaluations were: smooth L2, 16 (108) patches and 8192 (8192) evaluations;
-  SampledMax, 14 (86) and 6368 (8101); localized L2, 45 (99) and 6837 (8192);
+  committed diagnostic (`oq2_volume_budget_local_tolerances`, cap 4) reports
+  the effective local relative tolerance `tau / rms_P(f)` of the accepted
+  patches, in units of `rtol`: for the smooth function from 0.80 to 1.41 at
+  `rtol = 1e-4` and from 0.78 to 1.91 at `1e-6`; for the localized function
+  from 0.072 (patches at the peak, close to a `sqrt(rho)` factor) to `6.4e5`
+  (tails) at `1e-4` and from 0.072 to `1.9e6` at `1e-6`. It describes the
+  volume allocation only; it does not compare it with a norm-proportional
+  allocation. At `rtol = 1e-4` (`1e-6`), accepted patches and evaluations
+  were: smooth L2, 16 (109) patches and 8192 (8192) evaluations; SampledMax,
+  14 (86) and 6368 (8101); localized L2, 45 (100) and 6837 (8192);
   SampledMax, 22 (56) and 3531 (5745). The SampledMax numbers are a separate
   diagnostic of the change of norm at unmatched achieved accuracy: at
   `rtol = 1e-4` its localized run reached L2 relative error `1.2e-3`, while the
   L2 run reached `3.8e-5`. The small domain caps evaluations at 8192.
 - **OQ3 (reference).** Every L2 test with a root that is not exact passes
-  `L2Reference::Given` (36 uses in the test files), with 18 dense-reference
-  computations that exist only to supply it; every runnable rustdoc and guide
-  example with a non-exact root computes the norm from its dense values. The
-  Monte Carlo estimate (64 uniform samples, 10000 repetitions, the same
-  estimator outside the driver) gave `S_MC / S` within 0.91 to 1.08 (1% and
-  99% quantiles) for the smooth function, and a median of 0.53 with 10% and
-  90% quantiles 0.11 and 1.70 for the localized one: too large by more than
-  1.5 times (a looser allowance) with probability 0.14, and below half with
-  probability 0.48.
-- **OQ4 (capped outcomes).** A test-local wrapper measured every
-  `BondCapReached` outcome exhaustively against its `tau` (cap 4,
-  `rtol = 1e-4`). Of 15 capped outcomes of the smooth run, 13 fit their
-  allowance; of 44 of the localized run, 28 fit. Every one of them was split.
-  The measurement was exhaustive; under the proposal a large patch would be
-  sampled, with the selection effects described above.
-- **OQ5 (audit).** Cap 6, `rtol = 1e-4`, defaults otherwise: the audit added
-  73 of 2937 evaluations (2.5%) on the smooth function and 48 of 5019 (1.0%)
-  on the localized one. The audited relative-bound estimates were `2.25e-5` and
-  `3.19e-5` against true relative errors of `2.76e-5` and `3.20e-5`; the
-  acceptance-only statistics were `3.2e-5` and `1.5e-6` in RMS units.
-- **OQ8 and OQ9 (determinism).** The stage-1 test: on the raw-kernel tree,
-  bitwise identical measured values across six fresh threads and three
-  processes; on the generic-path tree, 5 to 198 of 768 values differ between
-  threads (largest relative difference `1.2e-16` of the largest magnitude),
-  and every thread and process gave a different digest. An L2 run with TreeTCI
-  on the extended `quantics_tree` (cap 3, 83 patches) in two fresh threads
-  gave identical patches, decisions, and stored node data (TreeTCI itself was
-  reproducible), but the acceptance `rms` differed in 55 of 83 patches, up to
-  100% relative, because those residuals are at rounding level; no decision
-  flipped, since every residual was far below `tau`. A decision can flip
-  only when a measured residual lies within the evaluation's rounding (about
-  `eps` times the network values) of `tau`.
+  `L2Reference::Given`, many with a dense-reference computation that exists
+  only to supply it; every runnable rustdoc and guide example with a
+  non-exact root computes the norm from its dense values. (Earlier counts of
+  these uses are not reproduced by a diagnostic and were removed.) The Monte
+  Carlo estimate (`oq3_monte_carlo_reference_spread`: 64 uniform samples,
+  10000 repetitions, the same estimator outside the driver) gave `S_MC / S`
+  within 0.92 to 1.08 (1% and 99% quantiles) for the smooth function, and a
+  median of 0.54 with 10% and 90% quantiles 0.12 and 1.66 for the localized
+  one: too large by more than 1.5 times (a looser allowance) with
+  probability 0.134, and below half with probability 0.469.
+- **OQ4 (capped outcomes).** A test-local wrapper
+  (`oq4_capped_outcomes_that_fit`) measured every `BondCapReached` outcome
+  exhaustively against its `tau` (cap 4, `rtol = 1e-4`). Of 15 capped
+  outcomes of the smooth run, 13 fit their allowance; of 44 of the localized
+  run, 28 fit. The runs made 15 and 44 splits: every capped outcome was
+  split, as the driver does by construction. The measurement was
+  exhaustive; under the proposal a large patch would be sampled, with the
+  selection effects described above.
+- **OQ5 (audit).** `oq5_audit_overhead`, cap 6, `rtol = 1e-4`, defaults
+  otherwise: the audit added 73 of 2937 evaluations (2.5%) on the smooth
+  function and 48 of 5019 (1.0%) on the localized one. The audited
+  relative-bound estimates were `2.25e-5` and `3.19e-5` against true
+  relative errors of `2.76e-5` and `3.20e-5`; the acceptance-only statistics
+  were `3.2e-5` and `1.5e-6` in RMS units.
+- **OQ8 and OQ9 (determinism).** The stage-1 tests, six fresh threads per
+  process, three processes: on the raw-kernel tree, all 128 measured values
+  were bitwise identical across threads, and every thread of every process
+  gave the same digest. On the generic-path tree, 4 to 193 of 768 values
+  differed from the first thread (the count varies between runs), with a
+  largest relative difference of `1.2e-16` of the largest magnitude
+  (`6.0e-17` in one process); the digests differed between most threads and
+  processes, with a few repeating (one digest occurred in two processes).
+  `oq8_generic_path_runs_across_threads`, an L2 run with TreeTCI on the
+  extended `quantics_tree` (cap 3, 83 patches, 80 splits) in two fresh
+  threads, gave identical patch and split counts and identical stored node
+  data (TreeTCI itself was reproducible), but the acceptance `rms` differed
+  in 9 of 83 patches in this run (the count varies between runs, as the
+  measured values do), because those residuals are at rounding level. The
+  diagnostic does not print the size of these differences or compare the
+  individual decisions; equal patches, splits, and node data imply that no
+  decision flipped in this run. A decision can flip only when a measured
+  residual lies within the evaluation's rounding (about `eps` times the
+  network values) of `tau`.

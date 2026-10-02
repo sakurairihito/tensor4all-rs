@@ -458,6 +458,10 @@ pub struct L2ErrorReport {
     /// relative bounds anti-conservative. The driver therefore also reports
     /// `None` when a stored patch has a site-free leaf with a bond wider than
     /// one. The engines tested here give such leaves bonds of dimension one.
+    /// The guard is temporary: the defect is fixed on the `tensor4all-treetn`
+    /// branch `fix/treetn-sitefree-leaf-ops`, and once that fix is merged
+    /// here the guard and this note are removed, and such patches report
+    /// their norm like any other.
     pub approximation_rms: Option<f64>,
 }
 
