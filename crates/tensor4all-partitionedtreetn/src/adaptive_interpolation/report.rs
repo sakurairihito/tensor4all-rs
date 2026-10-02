@@ -346,8 +346,7 @@ pub enum GlobalL2Error {
         /// E_up)` on `E / ||f||`, with `E_up = E (1 + GLOBAL_ROUNDING_MARGIN)
         /// + rounding`. `None` when the denominator is not positive or
         /// `approximation_rms` is `None`: then no relative statement exists.
-        /// The bound relies on `||f~||` from `TreeTN::log_norm`; see
-        /// [`L2ErrorReport::approximation_rms`] for its known defect.
+        /// The bound relies on `||f~||` from `TreeTN::log_norm`.
         relative_error_bound: Option<f64>,
     },
     /// Every `Sampled` contribution has an audit: an estimate, not a bound.
@@ -362,7 +361,7 @@ pub enum GlobalL2Error {
         /// estimate of `E` inserted; not an unbiased estimate of `E / ||f||`.
         /// `None` when `||f~||` does not exceed the estimated `E` or
         /// `approximation_rms` is `None`. It relies on `||f~||` from
-        /// `TreeTN::log_norm`; see [`L2ErrorReport::approximation_rms`].
+        /// `TreeTN::log_norm`.
         relative_bound_estimate: Option<f64>,
     },
     /// Some `Sampled` contribution has no audit: the combined acceptance
@@ -450,18 +449,6 @@ pub struct L2ErrorReport {
     /// covered by the bitwise determinism claim: the canonicalization it
     /// relies on is not audited for reproducibility. It feeds the report
     /// only, never a decision.
-    ///
-    /// Known `tensor4all-treetn` defect: `TreeTN::log_norm` overestimates the
-    /// norm of a network in which a node without sites and with one
-    /// neighbor (a site-free leaf), other than the canonicalization center,
-    /// has a bond wider than one; too large a `||f~||` would make the
-    /// relative bounds anti-conservative. The driver therefore also reports
-    /// `None` when a stored patch has a site-free leaf with a bond wider than
-    /// one. The engines tested here give such leaves bonds of dimension one.
-    /// The guard is temporary: the defect is fixed on the `tensor4all-treetn`
-    /// branch `fix/treetn-sitefree-leaf-ops`, and once that fix is merged
-    /// here the guard and this note are removed, and such patches report
-    /// their norm like any other.
     pub approximation_rms: Option<f64>,
 }
 

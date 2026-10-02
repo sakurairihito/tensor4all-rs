@@ -1607,49 +1607,37 @@ text left open.
   in the last place between two threads). With the dense engine, whose patches
   there have rank one, they passed in three processes, which is not a
   guarantee.
-- **Lower-layer defect, relied on by the report (not fixed here).**
-  `TreeTN::log_norm`, and with it `TreeTN::norm` (`log_norm().exp()`) and
-  `norm_squared`, overestimates the norm of a network in which a site-free
-  leaf (a node without sites and with one neighbor) that is not the
-  canonicalization center has a bond of dimension two or more. Minimal
-  reproduction (the ignored test
+- **Lower-layer defect, relied on by the report (fixed by #799).**
+  Before #799, `TreeTN::log_norm`, and with it `TreeTN::norm`
+  (`log_norm().exp()`) and `norm_squared`, overestimated the norm of a
+  network in which a site-free leaf (a node without sites and with one
+  neighbor) that is not the canonicalization center has a bond of dimension
+  two or more. Minimal reproduction (the regression test
   `treetn_log_norm_of_a_site_free_leaf_with_a_wide_bond` in
   `tests/adaptive_l2.rs`): the chain `a - b - e` with `a = [1, 0]` on its
   binary site and a dimension-one bond to `b`, `b(y, k) = [[3, 0], [0, 4]]`
   over its binary site `y` and the bond `k` (dimension two) to `e`, and the
   site-free leaf `e = [1, 1]` represents `f(x, y) = [1, 0]_x [3, 4]_y` of norm
-  5; the dense contraction gives 5, `log_norm().exp()` gives `7.0710678...`
-  (`5 sqrt(2)`). Random networks on the same chain give ratios 1.24 (bond 2)
-  and 1.40 (bond 3); a site-free leaf that is the smallest node name, a
-  site-free junction, a site-free internal node, and bonds of dimension one
-  are correct. A direct sum of patches has such leaves, so
-  `PartitionedTreeTN::to_treetn().norm()` on `branched` patches gave 213.09
-  against a dense 150.68.
+  5; the dense contraction gives 5, while the defective `log_norm().exp()`
+  gave `7.0710678...` (`5 sqrt(2)`). A direct sum of patches has such leaves,
+  so `PartitionedTreeTN::to_treetn().norm()` on `branched` patches gave
+  213.09 against a dense 150.68.
 
-  **The M3 report relies on it**: `approximation_rms` comes from
-  `log_norm` per accepted patch, and a too large `||f~||` would make
-  `relative_error_bound` and `relative_bound_estimate` anti-conservative.
-  The engines tested here (TreeTCI, the dense test engine) give site-free
-  leaves bonds of dimension one, and their patches matched the dense norms
-  exactly. The driver guards the trigger condition: when a stored patch has
-  a site-free leaf with a bond wider than one, `approximation_rms` is
-  reported as `None`, with the rounding term, the flag, and the relative
-  fields (test `a_site_free_leaf_with_a_wide_bond_makes_the_approximation_norm_unavailable`).
-  The rustdoc of `approximation_rms` and of the relative fields names the
-  defect. **Fix and removal plan.** The defect is fixed in
-  `tensor4all-treetn` on the branch `fix/treetn-sitefree-leaf-ops`, which is
-  not merged and not on this branch; related site-free failures in treetn
-  are tracked in issue #797. The fix reaches this branch when it merges to
-  `main` and `main` is merged here. Once it is on this branch:
-  1. un-ignore the regression test
-     `treetn_log_norm_of_a_site_free_leaf_with_a_wide_bond`;
-  2. remove the driver guard `has_wide_site_free_leaf` and the rustdoc notes
-     on the defect (on `approximation_rms`, `relative_error_bound`, and
-     `relative_bound_estimate`);
-  3. invert the guard test
-     `a_site_free_leaf_with_a_wide_bond_makes_the_approximation_norm_unavailable`
-     to expect `Some` approximation norm matching the dense norm, or remove
-     it.
+  The M3 report relies on `log_norm`: `approximation_rms` comes from it per
+  accepted patch, and a too large `||f~||` would make `relative_error_bound`
+  and `relative_bound_estimate` anti-conservative. While the defect was open,
+  the driver reported `approximation_rms` as `None` for a stored patch with a
+  wide site-free leaf. #799 (merged to `main` as `8379852e`, and merged into
+  this branch) fixed canonicalization, truncation, fit, swap, and zip-up on
+  site-free nodes in `tensor4all-treetn`. The removal plan has been carried
+  out: the regression test runs un-ignored; the driver guard and the rustdoc
+  notes on `approximation_rms`, `relative_error_bound`, and
+  `relative_bound_estimate` are removed; and the former guard test is now
+  `a_site_free_leaf_with_a_wide_bond_reports_the_dense_approximation_norm`,
+  which expects the approximation norm of such a patch to match the dense
+  norm. The `branched` direct-sum test also checks `to_treetn().norm()`
+  against the dense norm. Other site-free failures (`inner` and SRC
+  contraction) remain open in issue #797.
 
 ### Review fixes
 

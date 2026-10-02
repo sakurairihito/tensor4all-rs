@@ -227,7 +227,7 @@ use tensor4all_treetn::interpolation::{
     InterpolationError, InterpolationOutcome, InterpolationProblem, InterpolationTermination,
     TreeInterpolator,
 };
-use tensor4all_treetn::{NodeNameNetwork, TreeTN, TreeTNOperationError};
+use tensor4all_treetn::{NodeNameNetwork, TreeTN};
 
 use self::sampling::point_list_capacity;
 
@@ -935,16 +935,10 @@ where
 
         let approximation_rms = verify::approximation_rms(
             accepted.iter().map(|(_, entry)| {
-                let data = entry.subdomain.data();
-                let log_norm = if self.has_wide_site_free_leaf(data) {
-                    Err(TreeTNOperationError::from(anyhow::anyhow!(
-                        "a site-free leaf with a bond wider than one: TreeTN::log_norm is not \
-                         reliable there"
-                    )))
-                } else {
-                    data.clone().log_norm()
-                };
-                (log_norm, entry.patch_points)
+                (
+                    entry.subdomain.data().clone().log_norm(),
+                    entry.patch_points,
+                )
             }),
             domain_points,
         );
@@ -960,30 +954,6 @@ where
                 certified_fraction,
                 approximation_rms,
             },
-        })
-    }
-
-    /// Whether a stored patch has a node without sites and with one neighbor
-    /// whose bond is wider than one. `TreeTN::log_norm` overestimates the
-    /// norm of such networks unless that leaf is the canonicalization center
-    /// (a known `tensor4all-treetn` defect), so the approximation norm is
-    /// then reported as not computable. Temporary: remove this guard once
-    /// the fix on the `tensor4all-treetn` branch `fix/treetn-sitefree-leaf-ops`
-    /// is on this branch (see the M3 design record for the removal plan).
-    fn has_wide_site_free_leaf(&self, data: &TreeTN<IdxTensor, V>) -> bool {
-        self.layout.node_positions.iter().any(|(node, positions)| {
-            positions.is_empty()
-                && self
-                    .layout
-                    .edges
-                    .iter()
-                    .filter(|(left, right)| left == node || right == node)
-                    .count()
-                    == 1
-                && data
-                    .node_index(node)
-                    .and_then(|index| data.tensor(index))
-                    .is_some_and(|tensor| tensor.indices().iter().any(|index| index.dim > 1))
         })
     }
 

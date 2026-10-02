@@ -130,22 +130,21 @@ fn dense_engine_runs_meet_the_l2_budget() {
     };
     assert!((rms_error - combined).abs() <= GLOBAL_ROUNDING_MARGIN * combined);
     assert!(rms_error <= tau * (1.0 + GLOBAL_ROUNDING_MARGIN));
-    // The approximation norm matches the norm of the materialized partition.
-    // (`to_treetn().norm()` is not used: on this tree the direct sum has a
-    // site-free leaf with a bond of dimension two, where `TreeTN::norm`
-    // returns sqrt(2) times the true norm; see the M3 implementation report.)
+    // The approximation norm matches the norm of the materialized partition,
+    // computed densely and as a network norm. The direct sum has a site-free
+    // leaf with a bond of dimension two, which `TreeTN::norm` handles since
+    // #799.
     let approximation = error.approximation_norm().unwrap();
-    let direct = result
-        .partition
-        .to_treetn()
-        .unwrap()
-        .contract_to_tensor()
-        .unwrap()
-        .norm()
-        .unwrap();
+    let sum = result.partition.to_treetn().unwrap();
+    let direct = sum.contract_to_tensor().unwrap().norm().unwrap();
     assert!(
         (approximation - direct).abs() <= 1e-12 * direct,
         "approximation {approximation:e}, direct {direct:e}"
+    );
+    let network = sum.clone().norm().unwrap();
+    assert!(
+        (network - direct).abs() <= 1e-12 * direct,
+        "network norm {network:e}, direct {direct:e}"
     );
     assert_certified_bound(&result, &problem, &f);
 }
@@ -1450,13 +1449,15 @@ impl tensor4all_treetn::interpolation::TreeInterpolator<f64> for WideLeafEngine 
 }
 
 #[test]
-fn a_site_free_leaf_with_a_wide_bond_makes_the_approximation_norm_unavailable() {
+fn a_site_free_leaf_with_a_wide_bond_reports_the_dense_approximation_norm() {
     let problem = Problem::new(
         &[("a", &[2]), ("b", &[2]), ("e", &[])],
         &[("a", "b"), ("b", "e")],
     );
     let f = |p: &[usize]| ((1 + p[0]) * (3 + p[1])) as f64;
     let (_, norm) = dense_reference(&problem, &f);
+    // ||f|| = sqrt((1 + 4) (9 + 16)).
+    assert!((norm - 125.0f64.sqrt()).abs() < 1e-12);
     let result = run(
         &WideLeafEngine,
         &problem,
@@ -1466,30 +1467,29 @@ fn a_site_free_leaf_with_a_wide_bond_makes_the_approximation_norm_unavailable() 
     )
     .unwrap();
     let error = result.report.norm.l2_error().unwrap();
-    // The patch is exact and certified, but TreeTN::log_norm is unreliable
-    // for this network, so no norm-derived field is reported.
-    assert_eq!(error.approximation_rms, None);
+    // The patch is exact, so its TreeTN::log_norm must reproduce the dense
+    // norm although the site-free leaf `e` has a bond of dimension two.
+    let approximation_norm = error.approximation_norm().unwrap();
+    assert!(
+        (approximation_norm - norm).abs() < 1e-12 * norm,
+        "approximation norm {approximation_norm}, dense {norm}"
+    );
     assert!(matches!(
         error.global,
         GlobalL2Error::Certified {
-            rounding_allowance_rms: None,
-            rounding_limited: None,
-            relative_error_bound: None,
+            rms_error,
+            rounding_allowance_rms: Some(_),
+            rounding_limited: Some(false),
+            relative_error_bound: Some(bound),
             ..
-        }
+        } if rms_error == 0.0 && bound < 1e-12
     ));
 }
 
-/// Minimal reproduction of a `tensor4all-treetn` defect (not fixed here):
-/// `TreeTN::log_norm` overestimates the norm when a site-free leaf that is
-/// not the smallest node name has a bond of dimension two or more. The fix
-/// is on the `tensor4all-treetn` branch `fix/treetn-sitefree-leaf-ops`; once
-/// it is on this branch, un-ignore this test and follow the removal plan in
-/// the M3 design record.
+/// Regression for the `tensor4all-treetn` site-free-leaf norm defect fixed
+/// by #799: `TreeTN::log_norm` overestimated the norm when a site-free leaf
+/// that is not the smallest node name had a bond of dimension two or more.
 #[test]
-#[ignore = "known tensor4all-treetn defect: TreeTN::log_norm is wrong for a site-free leaf with a \
-            bond wider than one; fixed on branch fix/treetn-sitefree-leaf-ops, un-ignore when it \
-            merges to main"]
 fn treetn_log_norm_of_a_site_free_leaf_with_a_wide_bond() {
     use tensor4all_core::{DynIndex, IdxTensor};
     use tensor4all_treetn::TreeTN;
