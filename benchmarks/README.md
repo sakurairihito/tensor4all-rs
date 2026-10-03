@@ -159,10 +159,8 @@ MKL_NUM_THREADS=1 BLAS_NUM_THREADS=1 \
 Pre-register the workloads, the thresholds, and the decision rule in
 `results/` before collecting timings, run every configuration in at least two
 independent processes, and save the complete stdout as JSONL beside the
-protocol; do not replace an existing result file. The current protocol and
-results are
-[`2026-10-03-tree-patch-representation-realistic.md`](results/2026-10-03-tree-patch-representation-realistic.md).
-The earlier
+protocol; do not replace an existing result file. No protocol for this
+runner has been committed yet (M4 is deferred; see the roadmap). The earlier
 [`2026-10-02-tree-patch-representation.md`](results/2026-10-02-tree-patch-representation.md)
 run (bond cap 2, every patch of rank one, runner at `a85e4b42`) is a superseded
 smoke test.

@@ -95,26 +95,19 @@ Verified TreeTN preconditions:
 - `TreeTN::same_topology`, checked before zip-up, compares nodes and edges
   only, not site indices.
 
-The site-free-leaf robustness issue was reproduced and fixed in
-`tensor4all-treetn`, on the separate branch `fix/treetn-sitefree-leaf-ops`
-(an independent TreeTN defect, so it lands on `main` by its own pull request;
-the M4 benchmark needs it for the branched case): canonicalization had counted a wide site-free leaf's bond
-dimension as a norm factor, and truncation failed when a two-site factorization
-had an empty side. Canonicalization now absorbs a rank-one leaf exactly and
-restores its edge as a dimension-one link; truncation adds a temporary
-dimension-one boundary for empty-side factorization. Regression coverage checks
-the dense norm and values, explicit and default execution contexts, and
-truncation from both orientations. The complete `tensor4all-treetn` suite
-passed 542 unit tests plus its integration tests and doctests before a later
-lint-only helper-signature cleanup; the final source then passed clippy across
-all targets and the release benchmark rerun.
+The site-free-leaf robustness issue is fixed in `tensor4all-treetn` by PR #799
+(merged to `main` as 8379852e): every empty-side split (canonicalization,
+truncation, fit, swap, topology-preserving zip-up) goes through one helper,
+`factorize_allowing_empty_side`, and canonicalization replaces a site-free
+leaf's bond by a fresh dimension-one link. Remaining site-free-node failures
+(`inner`, SRC contraction, `factorize_tensor_to_treetn`) are tracked in #797;
+compact patches would create site-free nodes, so #797 is an adoption
+precondition.
 
-M4 measured the compact candidate on real M2 patches but did not meet the
-pre-registered adoption gate: payload fell by only 12.5% in both cases, and the
-chain truncation gain was small. Keep the full-site-index invariant in
-[partitioned-treetn.md](./partitioned-treetn.md). The complete protocol, paired
-measurements, correctness residuals, and decision are in
-[`2026-10-02-tree-patch-representation.md`](../../benchmarks/results/2026-10-02-tree-patch-representation.md).
+No representation decision has been made; see the M4 status in the roadmap.
+The first measurement
+([`2026-10-02-tree-patch-representation.md`](../../benchmarks/results/2026-10-02-tree-patch-representation.md))
+used rank-one patches and is superseded.
 
 ## 5. Avoidable overhead in patch algebra
 

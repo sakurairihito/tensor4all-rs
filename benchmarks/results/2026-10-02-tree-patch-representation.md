@@ -1,5 +1,13 @@
 # Adaptive TreeTN patch representation (M4)
 
+> **Superseded (2026-10-03).** This run is a smoke test, not a decision: with
+> interpolation cap 2 every accepted patch had rank one, the treetn fix it
+> measured with was an uncommitted predecessor of PR #799, and the runner did
+> not build its branched case at its own commit. No representation decision
+> is recorded; see the M4 status in
+> [`tree-adaptive-patching-roadmap.md`](../../docs/design/tree-adaptive-patching-roadmap.md).
+
+
 ## Pre-registered protocol
 
 Registered before collecting timing samples on 2026-10-02.

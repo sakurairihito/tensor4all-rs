@@ -176,31 +176,37 @@ user).
 
 ### M4. Patch representation decision (M)
 
-Outcome: retain eager masked patches; the compact candidate did not meet the
-pre-registered adoption gate. The full measurements and raw JSONL are recorded
-in [`2026-10-02-tree-patch-representation.md`](../../benchmarks/results/2026-10-02-tree-patch-representation.md).
+Status: **deferred; no decision recorded.** The first measurement
+([`2026-10-02-tree-patch-representation.md`](../../benchmarks/results/2026-10-02-tree-patch-representation.md))
+is superseded: with interpolation cap 2 every accepted patch had rank one, so
+it was a smoke test and could not support a decision. A review re-measurement
+at caps 8-32 on branched trees showed compact payload savings of 18-33% and
+truncation 17-20% faster, but at those bond dimensions timing is dominated by
+per-node overhead, so it is not decision-grade either.
 
-Scope:
+Scope (unchanged goal, corrected method):
 
 - measure storage and runtime of both representations on patches produced by
-  the M2 driver, with parameters matched to real downstream use (TreeTCI,
-  tolerance on the order of `1e-4`), on chains and on branched trees;
-- the site-free-node and leaf regressions listed in the findings were tested
-  and fixed in `tensor4all-treetn` on the separate branch
-  `fix/treetn-sitefree-leaf-ops`, which lands on `main` by its own pull
-  request;
-- adoption requires amending the full-site-index invariant of
+  the M2/M3 driver at bond dimensions matched to real downstream use (realized
+  ranks in the downstream gw-rs workloads are mostly 30-200 with a tail to
+  about 500), with TreeTCI at tolerance around `1e-4`, on chains and on
+  branched trees, under a protocol committed before any data is collected;
+- the workload must be one that patching is meant for (localized features).
+  The three-dimensional tight-binding spectral function used so far has a
+  delocalized singular surface, so fixing high-order bits lowers the patch
+  rank only slowly and it over-patches without M5;
+- preconditions for adoption: the site-free-node failures of `inner` and SRC
+  contraction (issue #797), since compact patches create site-free nodes; the
+  M6 consumers (patched addition and contraction) measured as well as norm and
+  truncation; and an amendment of the full-site-index invariant of
   [partitioned-treetn.md](./partitioned-treetn.md).
 
-Decision: eager payload was 512 bytes per case versus 448 bytes compact (12.5%
-reduction). Final-source compact/eager paired median ratios for norm were
-1.0280 (chain) and 0.9450 (branched); truncation ratios were 0.9873 and 0.8894.
-Truncation active-slice residuals were `1.10e-15` and `1.19e-15`. Eager/eager
-noise medians were at most 2.09%. Compact missed the required 20% payload
-reduction; chain truncation also missed the 10% speed gate. Keep the current
-invariant; revisit if representative workloads or the cost gate change.
+Ordering: re-measure after the patching performance defects found on
+2026-10-03 (patch-cache key allocation and hashing, cache split, engine
+adapter copy) are fixed, and with a workload chosen with M5's partition
+experiment, so the producer is representative.
 
-Exit: recorded decision and raw measurements.
+Exit: a recorded, scoped decision with raw measurements.
 
 ### M5. Split selection and overpatching control (M)
 
