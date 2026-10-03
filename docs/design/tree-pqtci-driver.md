@@ -447,8 +447,9 @@ The review kept the proposed names: `adaptive_interpolation`,
   the child re-encoded into it, so a root wider than two words reaches the
   inline keys after enough splits; the unit test
   `cache_split_re_encodes_only_when_a_word_is_freed` covers that path (the
-  129-site integration test accepts its root without a split). A child key therefore no longer equals the compact packing
-  of its own coordinates, which no caller relies on; the counters and the
+  129-site integration test accepts its root without a split). A child key
+  therefore no longer equals the compact packing of its own coordinates,
+  which no caller relies on; the counters and the
   determinism of the run are unchanged. Measured on the branched quantics
   tree workload of the tree-patching runner (L2, `rtol = 1e-4`, `eta = 0.3`,
   cap 32, release, one pinned core, all thread variables set to 1): `R = 7`
