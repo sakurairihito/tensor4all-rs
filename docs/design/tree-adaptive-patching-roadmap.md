@@ -204,7 +204,9 @@ Scope (unchanged goal, corrected method):
 Ordering: re-measure after the patching performance defects found on
 2026-10-03 (patch-cache key allocation and hashing, cache split, engine
 adapter copy) are fixed, and with a workload chosen with M5's partition
-experiment, so the producer is representative.
+experiment, so the producer is representative. The three defects are fixed on
+the patching branch (see the cache entries of the M2 implementation decisions
+and the batch translation entry of the M1 ones).
 
 Exit: a recorded, scoped decision with raw measurements.
 

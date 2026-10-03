@@ -4,6 +4,7 @@
 //! [`TreeInterpolator`](tensor4all_treetn::interpolation::TreeInterpolator)
 //! on top of [`TreeTCI2`] and [`optimize_with_proposer`].
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -450,6 +451,11 @@ struct VertexLayout<V> {
     site_dims: Vec<usize>,
     local_dims: Vec<usize>,
     edges: Vec<TreeTciEdge>,
+    /// The vertex of every site row when every vertex has at most one site
+    /// (`None` when some vertex fuses several sites). The rows then follow
+    /// the vertices in order, and a site coordinate equals the coordinate of
+    /// its vertex, whose local dimension is the site dimension.
+    site_vertices: Option<Vec<usize>>,
 }
 
 impl<V> VertexLayout<V>
@@ -505,6 +511,12 @@ where
             edges.push(TreeTciEdge::new(vertex_of(a)?, vertex_of(b)?));
         }
 
+        let site_vertices = vertex_sites.iter().all(|sites| sites.len() <= 1).then(|| {
+            (0..vertex_sites.len())
+                .filter(|&vertex| site_offsets[vertex] < site_offsets[vertex + 1])
+                .collect()
+        });
+
         Ok(Self {
             node_names,
             vertex_sites,
@@ -512,6 +524,7 @@ where
             site_dims,
             local_dims,
             edges,
+            site_vertices,
         })
     }
 
@@ -523,28 +536,65 @@ where
         self.site_dims.len()
     }
 
-    /// Split each vertex coordinate of a TreeTCI batch into site-order rows.
-    /// The result is a copy with shape `[n_sites, n_points]`.
-    fn vertex_batch_to_sites(&self, batch: GlobalIndexBatch<'_>) -> Result<Vec<usize>> {
+    /// Split each vertex coordinate of a TreeTCI batch into site-order rows,
+    /// as a `[n_sites, n_points]` batch.
+    ///
+    /// Every vertex coordinate is checked against its local dimension. When
+    /// every vertex has at most one site (`site_vertices`), the site rows are
+    /// the vertex rows without the site-free vertices: the batch itself is
+    /// returned without a copy when no vertex is site-free, and otherwise its
+    /// site rows are gathered without the column-major split. A vertex that
+    /// fuses several sites takes the general path through
+    /// [`Self::split_point`].
+    fn vertex_batch_to_sites<'b>(&self, batch: GlobalIndexBatch<'b>) -> Result<Cow<'b, [usize]>> {
+        let n_vertices = self.vertex_count();
         ensure!(
-            batch.n_sites() == self.vertex_count(),
+            batch.n_sites() == n_vertices,
             "TreeTCI batch has {} vertices, expected {}",
             batch.n_sites(),
-            self.vertex_count()
+            n_vertices
         );
         let len = self
             .n_sites()
             .checked_mul(batch.n_points())
             .ok_or_else(|| anyhow::anyhow!("site batch size overflowed usize"))?;
-        let mut sites = vec![0usize; len];
-        for (vertices, out) in batch
-            .data()
-            .chunks_exact(self.vertex_count())
-            .zip(sites.chunks_exact_mut(self.n_sites()))
-        {
-            self.split_point(vertices, out)?;
+        let Some(site_vertices) = &self.site_vertices else {
+            let mut sites = vec![0usize; len];
+            for (vertices, out) in batch
+                .data()
+                .chunks_exact(n_vertices)
+                .zip(sites.chunks_exact_mut(self.n_sites()))
+            {
+                self.split_point(vertices, out)?;
+            }
+            return Ok(Cow::Owned(sites));
+        };
+        if site_vertices.len() == n_vertices {
+            for vertices in batch.data().chunks_exact(n_vertices) {
+                self.check_vertex_point(vertices)?;
+            }
+            return Ok(Cow::Borrowed(batch.data()));
         }
-        Ok(sites)
+        let mut sites = Vec::with_capacity(len);
+        for vertices in batch.data().chunks_exact(n_vertices) {
+            self.check_vertex_point(vertices)?;
+            sites.extend(site_vertices.iter().map(|&vertex| vertices[vertex]));
+        }
+        Ok(Cow::Owned(sites))
+    }
+
+    /// Check every coordinate of one vertex point against its local
+    /// dimension.
+    fn check_vertex_point(&self, vertices: &[usize]) -> Result<()> {
+        for (vertex, (&coordinate, &local_dim)) in vertices.iter().zip(&self.local_dims).enumerate()
+        {
+            ensure!(
+                coordinate < local_dim,
+                "vertex {vertex} coordinate {coordinate} is out of range for local dimension \
+                 {local_dim}"
+            );
+        }
+        Ok(())
     }
 
     /// Write the site-order coordinates of one vertex point into `out`.

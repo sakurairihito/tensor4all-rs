@@ -173,6 +173,115 @@ fn layout_rejects_malformed_vertex_points() {
     assert!(error.to_string().contains("expected 3"));
 }
 
+/// Chain "a" - "b" - "c" with one site per node of the given dimensions, or
+/// no site where the dimension is `None`.
+fn single_site_chain_problem(dims: [Option<usize>; 3]) -> InterpolationProblem<String> {
+    let mut topology = NodeNameNetwork::new();
+    for node in ["a", "b", "c"] {
+        topology.add_node(node.to_string()).unwrap();
+    }
+    topology
+        .add_edge(&"a".to_string(), &"b".to_string())
+        .unwrap();
+    topology
+        .add_edge(&"b".to_string(), &"c".to_string())
+        .unwrap();
+    let node_sites: BTreeMap<String, Vec<DynIndex>> = ["a", "b", "c"]
+        .into_iter()
+        .zip(dims)
+        .map(|(node, dim)| {
+            (
+                node.to_string(),
+                dim.map(DynIndex::new_dyn).into_iter().collect(),
+            )
+        })
+        .collect();
+    let n_sites = dims.iter().flatten().count();
+    let pivots = ColMajorArray::new(vec![0; n_sites], vec![n_sites, 1]).unwrap();
+    InterpolationProblem::new(topology, node_sites, pivots, 0.0, None, 0).unwrap()
+}
+
+#[test]
+fn layout_passes_one_site_vertices_through_without_a_copy() {
+    let problem = single_site_chain_problem([Some(2), Some(3), Some(2)]);
+    let layout = VertexLayout::new(&problem).unwrap();
+    assert_eq!(layout.site_vertices, Some(vec![0, 1, 2]));
+
+    let data = [1, 2, 0, 0, 0, 1];
+    let batch = GlobalIndexBatch::new(&data, 3, 2).unwrap();
+    let sites = layout.vertex_batch_to_sites(batch).unwrap();
+    assert!(matches!(sites, Cow::Borrowed(_)));
+    assert_eq!(sites, vec![1, 2, 0, 0, 0, 1]);
+    // The general path gives the same rows.
+    let mut split = vec![0usize; 6];
+    for (vertices, out) in data.chunks(3).zip(split.chunks_mut(3)) {
+        layout.split_point(vertices, out).unwrap();
+    }
+    assert_eq!(*sites, *split);
+
+    // Malformed batches still fail: a coordinate out of range anywhere in
+    // the batch, and a wrong vertex count.
+    let data = [1, 2, 0, 0, 3, 1];
+    let batch = GlobalIndexBatch::new(&data, 3, 2).unwrap();
+    let error = layout.vertex_batch_to_sites(batch).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("vertex 1 coordinate 3 is out of range for local dimension 3"),
+        "{error}"
+    );
+    let data = [0, 0];
+    let batch = GlobalIndexBatch::new(&data, 2, 1).unwrap();
+    let error = layout.vertex_batch_to_sites(batch).unwrap_err();
+    assert!(error.to_string().contains("expected 3"), "{error}");
+}
+
+#[test]
+fn layout_gathers_site_rows_past_site_free_vertices() {
+    let problem = single_site_chain_problem([Some(2), None, Some(3)]);
+    let layout = VertexLayout::new(&problem).unwrap();
+    assert_eq!(layout.local_dims, vec![2, 1, 3]);
+    assert_eq!(layout.site_vertices, Some(vec![0, 2]));
+
+    let data = [1, 0, 2, 0, 0, 1];
+    let batch = GlobalIndexBatch::new(&data, 3, 2).unwrap();
+    let sites = layout.vertex_batch_to_sites(batch).unwrap();
+    assert!(matches!(sites, Cow::Owned(_)));
+    assert_eq!(sites, vec![1, 2, 0, 1]);
+    let mut split = vec![0usize; 4];
+    for (vertices, out) in data.chunks(3).zip(split.chunks_mut(2)) {
+        layout.split_point(vertices, out).unwrap();
+    }
+    assert_eq!(*sites, *split);
+
+    // The site-free vertex must have coordinate 0.
+    let data = [1, 1, 2];
+    let batch = GlobalIndexBatch::new(&data, 3, 1).unwrap();
+    let error = layout.vertex_batch_to_sites(batch).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("vertex 1 coordinate 1 is out of range for local dimension 1"),
+        "{error}"
+    );
+}
+
+#[test]
+fn layout_with_a_fused_vertex_takes_the_general_path() {
+    let problem = fused_chain_problem();
+    let layout = VertexLayout::new(&problem).unwrap();
+    assert_eq!(layout.site_vertices, None);
+    let data = [5, 0, 1];
+    let batch = GlobalIndexBatch::new(&data, 3, 1).unwrap();
+    let sites = layout.vertex_batch_to_sites(batch).unwrap();
+    assert!(matches!(sites, Cow::Owned(_)));
+    assert_eq!(sites, vec![1, 2, 1]);
+    let data = [6, 0, 1];
+    let batch = GlobalIndexBatch::new(&data, 3, 1).unwrap();
+    let error = layout.vertex_batch_to_sites(batch).unwrap_err();
+    assert!(error.to_string().contains("out of range"), "{error}");
+}
+
 #[test]
 fn call_evaluator_marks_errors_and_wrong_lengths() {
     let data = [0usize, 1, 1, 0];

@@ -339,3 +339,15 @@ side adds `TreeTciInterpolator`, `TreeTciOptimizeReport`, and
   indices, so the mock runs on a chain, a star of degree three, and a single
   node. The TreeTCI engine is tested on all topologies, including internal and
   leaf nodes without sites.
+- **Batch translation fast path.** Vertex batches are still translated to
+  site-order rows, but not always copied (a deviation from item 3 of the
+  TreeTCI implementation). When every vertex has at most one site, a site
+  coordinate equals its vertex coordinate and the site rows are the vertex
+  rows in order (the site order concatenates the node site lists in node-name
+  order, which is the vertex order). The batch is then passed to `evaluate`
+  without a copy when no vertex is site-free, and otherwise the site rows are
+  gathered past the site-free vertices without the column-major division. A
+  vertex that fuses several sites takes the general split. Every path checks
+  the batch's vertex count and every vertex coordinate against its local
+  dimension (a site-free vertex must have coordinate 0), so a malformed batch
+  still fails as an engine error before `evaluate` sees it.
