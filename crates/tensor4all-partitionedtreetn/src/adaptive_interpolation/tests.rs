@@ -7,7 +7,8 @@ use tensor4all_core::{ColMajorArray, ColMajorArrayRef, DynIndex, IdxTensor, Inde
 use tensor4all_treetn::{NodeNameNetwork, TreeTN};
 
 use super::cache::{
-    is_finite, value_defect, Counters, KeyLayout, PatchCache, PatchSampler, ValueDefect,
+    is_finite, value_defect, Counters, Entries, KeyLayout, OutOfRange, PackedKey, PatchCache,
+    PatchSampler, ValueDefect, WordMap,
 };
 use super::embed::{check_outcome_layout, embed_fixed_sites, exact_active_network};
 use super::layout::SiteLayout;
@@ -285,6 +286,178 @@ fn cache_split_hands_every_entry_to_its_child() {
     }
 }
 
+/// The key type a cache uses: 1 (`u64`), 2 (`u128`), or 3 (boxed slice).
+fn key_kind<T: Copy>(cache: &PatchCache<T>) -> usize {
+    match cache.entries() {
+        Entries::Narrow(_) => 1,
+        Entries::Double(_) => 2,
+        Entries::Wide(_) => 3,
+    }
+}
+
+#[test]
+fn cache_key_type_follows_the_word_count() {
+    // An empty layout and one word use the inline u64 key, two words the
+    // inline u128 key, and three or more words the boxed key.
+    let cases: [(Vec<usize>, usize, usize); 5] = [
+        (vec![], 0, 1),
+        (vec![2, 3], 1, 1),
+        (vec![1 << 40, 1 << 40], 2, 2),
+        (vec![1 << 43; 3], 3, 3),
+        (vec![2; 129], 3, 3),
+    ];
+    for (dims, n_words, kind) in cases {
+        let cache = PatchCache::<f64>::new(dims.clone());
+        assert_eq!(cache.layout().n_words(), n_words, "{dims:?}");
+        assert_eq!(key_kind(&cache), kind, "{dims:?}");
+    }
+}
+
+#[test]
+fn borrowed_lookups_find_owned_keys_of_every_key_type() {
+    fn check<K: PackedKey>(words: &[u64], other: &[u64]) {
+        let mut map: WordMap<K, f64> = WordMap::default();
+        map.insert(K::from_words(words), 1.5);
+        assert_eq!(K::find(&map, words), Some(&1.5));
+        assert_eq!(K::find(&map, other), None);
+        for (index, &word) in words.iter().enumerate() {
+            assert_eq!(K::from_words(words).word(index), word);
+        }
+    }
+    check::<u64>(&[0b1011], &[0b1010]);
+    check::<u128>(&[7, u64::MAX], &[7, 0]);
+    check::<Box<[u64]>>(&[1, 2, 3], &[1, 2, 4]);
+
+    // A key encoded into a reused buffer finds the entry stored under the
+    // owned key of the same point, for every key type.
+    for dims in [vec![2, 3, 2], vec![1 << 40, 1 << 40], vec![1 << 43; 3]] {
+        let mut cache = PatchCache::new(dims.clone());
+        let point: Vec<usize> = dims.iter().map(|&dim| dim - 1).collect();
+        cache.insert(cache.layout().encode(point.iter().copied()), 4.0);
+        let mut buffer = vec![0u64; cache.layout().n_words()];
+        cache.layout().encode_checked(&point, &mut buffer).unwrap();
+        assert_eq!(cache.get(&buffer), Some(4.0), "{dims:?}");
+        let origin = vec![0usize; dims.len()];
+        cache.layout().encode_checked(&origin, &mut buffer).unwrap();
+        assert_eq!(cache.get(&buffer), None, "{dims:?}");
+    }
+}
+
+#[test]
+fn checked_encoding_matches_encode_and_rejects_out_of_range_coordinates() {
+    let layout = KeyLayout::new(vec![1 << 43, 5, 1 << 43]);
+    let point = [(1usize << 43) - 1, 4, 17];
+    let mut buffer = vec![u64::MAX; layout.n_words()];
+    layout.encode_checked(&point, &mut buffer).unwrap();
+    assert_eq!(*buffer, *layout.encode(point.iter().copied()));
+    assert_eq!(
+        layout.encode_checked(&[0, 5, 0], &mut buffer),
+        Err(OutOfRange {
+            slot: 1,
+            value: 5,
+            dim: 5
+        })
+    );
+}
+
+#[test]
+fn cache_split_moves_keys_without_re_encoding() {
+    // Three 21-bit sites fit one word; removing the middle one keeps the
+    // other two at their parent word and shift.
+    let dims = [3usize, 1 << 20, 2];
+    let value = |p: &[usize]| (p[0] + 10 * p[1] + 100 * p[2]) as f64;
+    let mut cache = PatchCache::new(dims.to_vec());
+    let points: Vec<[usize; 3]> = (0..3)
+        .flat_map(|a| [(a, 0), (a, 1)])
+        .flat_map(|(a, c)| [[a, 0, c], [a, (1 << 20) - 1, c], [a, 12_345, c]])
+        .collect();
+    for point in &points {
+        cache.insert(cache.layout().encode(point.iter().copied()), value(point));
+    }
+    let parent_layout = cache.layout().clone();
+    let children = cache.split(0);
+    assert_eq!(children.len(), 3);
+    for (a, child) in children.iter().enumerate() {
+        assert_eq!(child.layout().dims(), [1 << 20, 2]);
+        assert_eq!(child.layout().n_words(), 1);
+        assert_eq!(key_kind(child), 1);
+        assert_eq!(child.len(), 6);
+        for point in points.iter().filter(|point| point[0] == a) {
+            // The child key is the parent key with the split coordinate's
+            // bits cleared.
+            let parent_key = parent_layout.encode(point.iter().copied());
+            let cleared = parent_layout.encode([0, point[1], point[2]].into_iter());
+            let child_key = child.layout().encode([point[1], point[2]].into_iter());
+            assert_eq!(child_key, cleared);
+            assert_eq!(parent_key == cleared, a == 0);
+            assert_eq!(child.get(&child_key), Some(value(point)));
+            assert_eq!(child.layout().decode(&child_key), [point[1], point[2]]);
+        }
+    }
+
+    // Splitting a moved-key child again keeps its entries reachable.
+    let grandchildren = children.into_iter().nth(2).unwrap().split(1);
+    for (c, grandchild) in grandchildren.iter().enumerate() {
+        assert_eq!(grandchild.len(), 3);
+        for b in [0, (1 << 20) - 1, 12_345] {
+            let key = grandchild.layout().encode([b].into_iter());
+            assert_eq!(grandchild.get(&key), Some(value(&[2, b, c])));
+        }
+    }
+}
+
+#[test]
+fn cache_split_re_encodes_only_when_a_word_is_freed() {
+    // 129 binary sites need three words; 128 fit two, so the children are
+    // re-encoded into the inline u128 key. Their children keep two words and
+    // move their keys.
+    let dims = vec![2usize; 129];
+    let mut cache = PatchCache::new(dims.clone());
+    let points: Vec<Vec<usize>> = (0..40)
+        .map(|seed: usize| {
+            (0..129)
+                .map(|site| (seed * 7 + site * site) % 3 % 2)
+                .collect()
+        })
+        .collect();
+    let value = |p: &[usize]| {
+        p.iter()
+            .enumerate()
+            .map(|(i, &v)| (i * v) as f64)
+            .sum::<f64>()
+    };
+    for point in &points {
+        cache.insert(cache.layout().encode(point.iter().copied()), value(point));
+    }
+    let n_entries = cache.len();
+    assert_eq!(key_kind(&cache), 3);
+    let children = cache.split(64);
+    assert_eq!(
+        children.iter().map(PatchCache::len).sum::<usize>(),
+        n_entries
+    );
+    for (coordinate, child) in children.iter().enumerate() {
+        assert_eq!(child.layout().n_words(), 2);
+        assert_eq!(key_kind(child), 2);
+        for point in points.iter().filter(|point| point[64] == coordinate) {
+            let mut rest = point.clone();
+            rest.remove(64);
+            let key = child.layout().encode(rest.iter().copied());
+            assert_eq!(child.get(&key), Some(value(point)));
+        }
+    }
+    let child = children.into_iter().next().unwrap();
+    let child_entries = child.len();
+    let grandchildren = child.split(0);
+    assert_eq!(
+        grandchildren.iter().map(PatchCache::len).sum::<usize>(),
+        child_entries
+    );
+    assert!(grandchildren
+        .iter()
+        .all(|grandchild| grandchild.layout().n_words() == 2 && key_kind(grandchild) == 2));
+}
+
 // ---------------------------------------------------------------------------
 // The patch sampler.
 // ---------------------------------------------------------------------------
@@ -400,6 +573,97 @@ fn sampler_rejects_invalid_batches_and_evaluator_results_without_caching() {
         });
         assert!(error.to_string().contains(needle), "{error} lacks {needle}");
         assert_eq!(evaluations, 0);
+    }
+}
+
+#[test]
+fn sampler_gives_the_same_values_and_counts_for_every_key_type() {
+    // One fixed site (coordinate 1) before the active sites; the value
+    // weights every active coordinate by its position.
+    let value = |active: &[usize]| {
+        active
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i + 1) as f64 * v as f64)
+            .sum::<f64>()
+    };
+    // The first active site is small, as the split below creates one child
+    // per coordinate. Splitting the two-word layout frees a word (re-encoded
+    // into a u64 key); the others move their keys.
+    for (dims, kind) in [
+        (vec![2, 3], 1),
+        (vec![3, 1 << 63], 2),
+        (vec![3, 1 << 43, 1 << 43, 1 << 43], 3),
+    ] {
+        let n_active = dims.len();
+        let corner = |pick: usize| -> Vec<usize> {
+            dims.iter()
+                .enumerate()
+                .map(|(i, &dim)| [0, 1, dim - 1][(pick + i) % 3])
+                .collect()
+        };
+        let (p1, p2, p3, p4) = (corner(0), corner(1), corner(2), vec![1; n_active]);
+        let counters = Counters::default();
+        let mut fixed = vec![Some(1)];
+        fixed.extend(std::iter::repeat_n(None, n_active));
+        let evaluate: BoxedEvaluator = Box::new(move |batch| {
+            let rows = batch.shape()[0];
+            Ok(batch
+                .data()
+                .chunks(rows)
+                .map(|point| {
+                    assert_eq!(point[0], 1);
+                    value(&point[1..])
+                })
+                .collect())
+        });
+        let sampler = PatchSampler {
+            evaluate: &evaluate,
+            fixed: &fixed,
+            n_active,
+            counters: &counters,
+            cache: RefCell::new(PatchCache::new(dims.clone())),
+        };
+        assert_eq!(key_kind(&sampler.cache.borrow()), kind);
+        let sample = |points: &[&Vec<usize>]| {
+            let data: Vec<usize> = points.iter().flat_map(|p| p.iter().copied()).collect();
+            let shape = [n_active, points.len()];
+            sampler
+                .sample(ColMajorArrayRef::new(&data, &shape).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            sample(&[&p1, &p2, &p1, &p3]),
+            [value(&p1), value(&p2), value(&p1), value(&p3)]
+        );
+        assert_eq!(
+            sample(&[&p2, &p4, &p4]),
+            [value(&p2), value(&p4), value(&p4)]
+        );
+        assert_eq!(counters.evaluations.get(), 4, "{dims:?}");
+        assert_eq!(counters.cache_hits.get(), 3, "{dims:?}");
+        assert_eq!(sampler.cache.borrow().len(), 4);
+
+        // After a split at the first active site, the child that contains
+        // `p1` serves it from the moved entries: a hit, no evaluation.
+        let children = sampler.cache.into_inner().split(0);
+        let child = children.into_iter().nth(p1[0]).unwrap();
+        let mut child_fixed = fixed.clone();
+        child_fixed[1] = Some(p1[0]);
+        let child_sampler = PatchSampler {
+            evaluate: &evaluate,
+            fixed: &child_fixed,
+            n_active: n_active - 1,
+            counters: &counters,
+            cache: RefCell::new(child),
+        };
+        let rest = &p1[1..];
+        let values = child_sampler
+            .sample(ColMajorArrayRef::new(rest, &[n_active - 1, 1]).unwrap())
+            .unwrap();
+        assert_eq!(values, [value(&p1)]);
+        assert_eq!(counters.evaluations.get(), 4, "{dims:?}");
+        assert_eq!(counters.cache_hits.get(), 4, "{dims:?}");
     }
 }
 

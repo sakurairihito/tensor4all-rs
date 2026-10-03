@@ -427,6 +427,35 @@ The review kept the proposed names: `adaptive_interpolation`,
 - **Counters.** `function_evaluations` counts the points passed to the
   evaluator; `cache_hits` counts requested points served without it, including
   repeats inside one batch.
+- **Cache keys and lookups.** Step 3's variable-length key is stored inline
+  when it has at most two words: a cache whose layout needs zero or one word
+  keys a `u64` map, two words a `u128` map, and only three or more words a
+  boxed slice. A lookup checks and packs the requested point into one buffer
+  reused across the batch and borrows it, so a cache hit allocates nothing;
+  the points new to a batch are kept in a map from key to their index among
+  the new points, and their keys move into the cache once the values pass the
+  checks. Every map hashes with a local unseeded word hasher (a
+  rotate-xor-multiply fold and the MurmurHash3 64-bit finalizer) instead of
+  SipHash, with no new dependency; the keys come from the driver and the
+  engine, so HashDoS resistance is not needed. No output depends on the
+  iteration order of a cache: a split or an insertion produces the same
+  key-to-value mapping in any order, and the reports use only counts.
+- **Cache split.** A child keeps its parent's packing with the bits of the
+  split coordinate cleared, so a split moves every entry with its key words
+  (for a boxed key, in place) instead of decoding and re-encoding it. Only
+  when a compact packing of the child's coordinates would need fewer words is
+  the child re-encoded into it, so a root wider than two words reaches the
+  inline keys after enough splits; the 129-site test domain takes that path at
+  its first split. A child key therefore no longer equals the compact packing
+  of its own coordinates, which no caller relies on; the counters and the
+  determinism of the run are unchanged. Measured on the branched quantics
+  tree workload of the tree-patching runner (L2, `rtol = 1e-4`, `eta = 0.3`,
+  cap 32, release, one pinned core, all thread variables set to 1): `R = 7`
+  went from 32.8 s to 15.6 s and `R = 8` from 95.9 s to 46.7 s, with
+  identical stored tensors, projectors, and counts; the cache cost per
+  requested point fell from about 216 ns to 69 ns (`R = 7`) and from 253 ns
+  to 84 ns (`R = 8`), and splitting from 2.2 s to 0.12 s and from 9.1 s to
+  0.49 s.
 - **Assembly.** `from_disjoint_subdomains` still checks topology, site space,
   and dtype against the first patch (linear in the patch count) and skips only
   the pairwise overlap check. Violated internal invariants, which the queue
