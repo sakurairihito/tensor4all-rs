@@ -8,9 +8,7 @@
 
 use rand::Rng;
 use tensor4all_core::{floating_zone_walk, MultiIndex, Scalar};
-use tensor4all_simplett::{
-    AbstractTensorTrain, EinsumScalar, SimpleTensorTrain, TTCache, TTScalar, Tensor3Ops,
-};
+use tensor4all_simplett::{AbstractTensorTrain, SimpleTensorTrain, TTCache, TTScalar, Tensor3Ops};
 
 use crate::error::{validate_nonnegative_finite, Result, TCIError};
 
@@ -105,7 +103,7 @@ pub trait GlobalPivotFinder {
         rng: &mut impl Rng,
     ) -> Result<Vec<MultiIndex>>
     where
-        T: Scalar + TTScalar + EinsumScalar,
+        T: Scalar + TTScalar,
         F: Fn(&MultiIndex) -> T;
 }
 
@@ -183,7 +181,7 @@ impl GlobalPivotFinder for DefaultGlobalPivotFinder {
         rng: &mut impl Rng,
     ) -> Result<Vec<MultiIndex>>
     where
-        T: Scalar + TTScalar + EinsumScalar,
+        T: Scalar + TTScalar,
         F: Fn(&MultiIndex) -> T,
     {
         validate_nonnegative_finite("abs_tol", abs_tol)?;
@@ -242,7 +240,7 @@ impl GlobalPivotFinder for DefaultGlobalPivotFinder {
                         .iter()
                         .zip(tt_values)
                         .map(|(point, tt_value)| {
-                            let error = f64::sqrt(Scalar::abs_sq(f(point) - tt_value));
+                            let error = Scalar::abs_val(f(point) - tt_value);
                             if !error.is_finite() {
                                 return Err(TCIError::InvalidOperation {
                                     message: format!(
@@ -323,7 +321,7 @@ mod tests {
                 _rng: &mut impl Rng,
             ) -> Result<Vec<MultiIndex>>
             where
-                T: Scalar + TTScalar + EinsumScalar,
+                T: Scalar + TTScalar,
                 F: Fn(&MultiIndex) -> T,
             {
                 // Always return a fixed pivot

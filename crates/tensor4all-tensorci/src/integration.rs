@@ -12,7 +12,7 @@
 use crate::error::{Result, TCIError};
 use crate::tensorci2::{crossinterpolate2, TCI2Options};
 use tensor4all_core::{MatrixLuciScalar, MultiIndex, Scalar};
-use tensor4all_simplett::{AbstractTensorTrain, EinsumScalar, TTScalar};
+use tensor4all_simplett::{AbstractTensorTrain, TTScalar};
 
 /// Gauss-Kronrod 15-point rule: nodes on [-1, 1]
 const GK15_NODES: [f64; 15] = [
@@ -534,7 +534,7 @@ pub fn integrate<T, F>(
     tci_options: TCI2Options,
 ) -> Result<T>
 where
-    T: Scalar + TTScalar + EinsumScalar + Default + MatrixLuciScalar,
+    T: Scalar + TTScalar + Default + MatrixLuciScalar,
     F: Fn(&[f64]) -> T,
 {
     tci_options.validate()?;

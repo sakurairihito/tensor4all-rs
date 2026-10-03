@@ -219,8 +219,12 @@ where
         site_indices.push(tensor.indices()[0].clone());
     }
 
-    // Candidate points: for each random start, each site coordinate swept
-    // over its full local dimension (same local search as the chain finder).
+    // Candidate points: for each random start, each site coordinate swept over
+    // its full local dimension, always around that original start. This is an
+    // axis-line scan without coordinate retention, so it does not match
+    // `DefaultGlobalPivotFinder`'s floating-zone walk (tensorci), which keeps
+    // the maximizing coordinate between site scans and repeats sweeps.
+    // Tracked in #812.
     let candidate_count = (0..n_sites)
         .try_fold(0usize, |count, site| {
             count.checked_add(state.local_dims[site])

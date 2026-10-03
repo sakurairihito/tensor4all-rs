@@ -14,8 +14,7 @@ use tensor4all_core::{
     RrLUOptions, Scalar,
 };
 use tensor4all_simplett::{
-    tensor3_zeros, try_tensor3_zeros, EinsumScalar, SimpleTensorTrain, TTScalar, Tensor3,
-    Tensor3Ops,
+    tensor3_zeros, try_tensor3_zeros, SimpleTensorTrain, TTScalar, Tensor3, Tensor3Ops,
 };
 use tensor4all_tensorbackend::{solve_matrix, transpose, Matrix};
 
@@ -1519,7 +1518,7 @@ pub fn crossinterpolate2<T, F, B>(
     options: TCI2Options,
 ) -> Result<TCI2OptimizationResult<T>>
 where
-    T: Scalar + TTScalar + EinsumScalar + Default + MatrixLuciScalar,
+    T: Scalar + TTScalar + Default + MatrixLuciScalar,
     F: Fn(&MultiIndex) -> T,
     B: Fn(&[MultiIndex]) -> Vec<T>,
 {
@@ -1632,7 +1631,7 @@ pub fn optimize_with_finder<T, F, B, G>(
     finder: G,
 ) -> Result<TCI2OptimizationResult<T>>
 where
-    T: Scalar + TTScalar + EinsumScalar + Default + MatrixLuciScalar,
+    T: Scalar + TTScalar + Default + MatrixLuciScalar,
     F: Fn(&MultiIndex) -> T,
     B: Fn(&[MultiIndex]) -> Vec<T>,
     G: GlobalPivotFinder,

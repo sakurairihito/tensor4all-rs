@@ -7,9 +7,7 @@
 
 use rand::Rng;
 use tensor4all_core::{floating_zone_walk, MultiIndex, Scalar};
-use tensor4all_simplett::{
-    AbstractTensorTrain, EinsumScalar, SimpleTensorTrain, TTCache, TTScalar, Tensor3Ops,
-};
+use tensor4all_simplett::{AbstractTensorTrain, SimpleTensorTrain, TTCache, TTScalar, Tensor3Ops};
 
 use crate::error::{Result, TCIError};
 
@@ -75,7 +73,7 @@ pub fn estimate_true_error<T, F>(
     rng: &mut impl Rng,
 ) -> Result<Vec<(MultiIndex, f64)>>
 where
-    T: Scalar + TTScalar + EinsumScalar,
+    T: Scalar + TTScalar,
     F: Fn(&MultiIndex) -> T,
 {
     let site_dims: Vec<usize> = (0..tt.len())
@@ -168,7 +166,7 @@ pub fn floating_zone<T, F>(
     early_stop_tol: f64,
 ) -> Result<(MultiIndex, f64)>
 where
-    T: Scalar + TTScalar + EinsumScalar,
+    T: Scalar + TTScalar,
     F: Fn(&MultiIndex) -> T,
 {
     if local_dims.len() != tt.len() {

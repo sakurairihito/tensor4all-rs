@@ -174,7 +174,7 @@ fn nonfinite_residuals_are_errors_instead_of_missing_pivots() {
 #[test]
 fn optimizer_propagates_custom_finder_errors() {
     use tensor4all_core::{MultiIndex, Scalar};
-    use tensor4all_simplett::{EinsumScalar, TTScalar};
+    use tensor4all_simplett::TTScalar;
     use tensor4all_tensorci::{optimize_with_finder, TCI2Options, TensorCI2};
     struct FailingFinder;
     impl GlobalPivotFinder for FailingFinder {
@@ -186,7 +186,7 @@ fn optimizer_propagates_custom_finder_errors() {
             _: &mut impl Rng,
         ) -> tensor4all_tensorci::Result<Vec<MultiIndex>>
         where
-            T: Scalar + TTScalar + EinsumScalar,
+            T: Scalar + TTScalar,
             F: Fn(&MultiIndex) -> T,
         {
             Err(TCIError::InvalidOperation {
@@ -210,4 +210,53 @@ fn optimizer_propagates_custom_finder_errors() {
     assert!(
         matches!(result, Err(TCIError::InvalidOperation { message }) if message == "finder evaluation failed")
     );
+}
+
+/// Coordinate retention must also work when the approximation has a nontrivial
+/// bond: `tt = i + j` (matrix rank 2) and the residual is `(i + 1) * j`, whose
+/// maximum `(3, 3) -> 12` is only reachable after the first coordinate move.
+/// An axis-line scan around the start reaches `(0, 3) -> 3` at best.
+#[test]
+fn retains_coordinate_moves_with_a_nontrivial_bond() {
+    use tensor4all_simplett::{tensor3_from_data, AbstractTensorTrain, Tensor3Ops};
+
+    // First site (left bond 1) over a site dimension of 4: A[x, r] = 1 for
+    // r = 0 and x for r = 1.
+    let mut first = vec![0.0; 8];
+    for x in 0..4usize {
+        first[x] = 1.0;
+        first[4 + x] = x as f64;
+    }
+    // Second site (right bond 1): B[r, y] = y for r = 0 and 1 for r = 1, so the
+    // tensor train is `tt(i, j) = i + j` with a bond dimension of two.
+    let mut second = vec![0.0; 8];
+    for y in 0..4usize {
+        second[2 * y] = y as f64;
+        second[1 + 2 * y] = 1.0;
+    }
+    let current_tt = SimpleTensorTrain::new(vec![
+        tensor3_from_data(first, 1, 4, 2).unwrap(),
+        tensor3_from_data(second, 2, 4, 1).unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(current_tt.site_tensor(0).right_dim(), 2);
+    assert_eq!(current_tt.evaluate(&[2, 3]).unwrap(), 5.0);
+
+    let input = GlobalPivotSearchInput {
+        local_dims: vec![4, 4],
+        current_tt,
+        max_sample_value: 6.0,
+        i_set: vec![vec![vec![]], vec![vec![0]]],
+        j_set: vec![vec![vec![0]], vec![vec![]]],
+    };
+    // f = i + j + (i + 1) * j, so the residual against `tt = i + j` is (i + 1) * j.
+    let f = |p: &Vec<usize>| {
+        let (i, j) = (p[0], p[1]);
+        (i + j + (i + 1) * j) as f64
+    };
+    // Threshold 5: the axis-line best from (0, 0) is 3, the walk's optimum is 12.
+    let pivots = DefaultGlobalPivotFinder::new(1, 1, 10.0)
+        .find_global_pivots(&input, &f, 0.5, &mut ZeroStream)
+        .unwrap();
+    assert_eq!(pivots, vec![vec![3, 3]]);
 }
