@@ -1590,7 +1590,7 @@ where
 /// Returns [`TCIError::InvalidConfiguration`] for invalid algorithm options or
 /// [`TCIError::InvalidPivot`] when the input state has no pivots. It also
 /// forwards errors from two-site sweeps, tensor-train conversion, callback
-/// length validation, and final one-site cleanup.
+/// length validation, global pivot search, and final one-site cleanup.
 ///
 /// # Examples
 ///
@@ -1742,7 +1742,7 @@ where
             j_set: tci.j_set.clone(),
         };
 
-        let global_pivots = finder.find_global_pivots(&input, &f, abs_tol, &mut rng);
+        let global_pivots = finder.find_global_pivots(&input, &f, abs_tol, &mut rng)?;
         let n_global = global_pivots.len();
         tci.add_global_pivots(&global_pivots)?;
         nglobal_pivots_history.push(n_global);

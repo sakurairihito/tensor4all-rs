@@ -1194,12 +1194,12 @@ fn test_custom_global_pivot_finder() {
             _f: &F,
             _abs_tol: f64,
             rng: &mut impl Rng,
-        ) -> Vec<MultiIndex>
+        ) -> Result<Vec<MultiIndex>>
         where
             T: tensor4all_core::Scalar + tensor4all_simplett::TTScalar,
             F: Fn(&MultiIndex) -> T,
         {
-            (0..self.npivots)
+            Ok((0..self.npivots)
                 .map(|_| {
                     input
                         .local_dims
@@ -1207,7 +1207,7 @@ fn test_custom_global_pivot_finder() {
                         .map(|&d| rng.random_range(0..d))
                         .collect()
                 })
-                .collect()
+                .collect())
         }
     }
 
@@ -1264,7 +1264,9 @@ fn test_custom_global_pivot_finder() {
     };
 
     let mut rng = rand::rng();
-    let pivots = finder.find_global_pivots(&input, &f, 1e-4, &mut rng);
+    let pivots = finder
+        .find_global_pivots(&input, &f, 1e-4, &mut rng)
+        .unwrap();
 
     // Custom finder should return npivots random pivots
     assert_eq!(pivots.len(), 10);
@@ -1309,13 +1311,13 @@ fn test_optimize_with_finder_invokes_custom_finder() {
             _f: &F,
             _abs_tol: f64,
             _rng: &mut impl Rng,
-        ) -> Vec<MultiIndex>
+        ) -> Result<Vec<MultiIndex>>
         where
             T: tensor4all_core::Scalar + tensor4all_simplett::TTScalar,
             F: Fn(&MultiIndex) -> T,
         {
             self.calls.set(self.calls.get() + 1);
-            vec![vec![input.local_dims[0] - 1, input.local_dims[1] - 1]]
+            Ok(vec![vec![input.local_dims[0] - 1, input.local_dims[1] - 1]])
         }
     }
 
