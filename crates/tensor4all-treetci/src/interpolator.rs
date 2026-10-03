@@ -607,12 +607,8 @@ where
             self.vertex_count(),
             self.n_sites()
         );
+        self.check_vertex_point(vertices)?;
         for (vertex, &coordinate) in vertices.iter().enumerate() {
-            ensure!(
-                coordinate < self.local_dims[vertex],
-                "vertex {vertex} coordinate {coordinate} is out of range for local dimension {}",
-                self.local_dims[vertex]
-            );
             let mut rest = coordinate;
             let rows = self.site_offsets[vertex]..self.site_offsets[vertex + 1];
             for (slot, &dim) in out[rows.clone()].iter_mut().zip(&self.site_dims[rows]) {

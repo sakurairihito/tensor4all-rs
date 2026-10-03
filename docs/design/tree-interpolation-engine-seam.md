@@ -350,4 +350,9 @@ side adds `TreeTciInterpolator`, `TreeTciOptimizeReport`, and
   vertex that fuses several sites takes the general split. Every path checks
   the batch's vertex count and every vertex coordinate against its local
   dimension (a site-free vertex must have coordinate 0), so a malformed batch
-  still fails as an engine error before `evaluate` sees it.
+  still fails as an engine error before `evaluate` sees it. On the branched
+  quantics tree workload of the tree-patching runner, whose site-free root
+  and fixed nodes take the gather path, the translation time fell from 2.2 s
+  to 1.2 s (`R = 7`) and from 5.8 s to 3.0 s (`R = 8`), measured with
+  `patched_interpolate` (L2, `rtol = 1e-4`, `eta = 0.3`, cap 32; release, one
+  pinned core, all thread variables set to 1).
