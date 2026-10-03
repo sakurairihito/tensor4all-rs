@@ -217,6 +217,18 @@ impl Hasher for WordHasher {
 /// A map keyed by packed key words.
 pub(super) type WordMap<K, V> = HashMap<K, V, BuildHasherDefault<WordHasher>>;
 
+/// Debug check of the invariant that ties an [`Entries`] variant to
+/// [`KeyLayout::n_words`]: a key type only receives word counts it holds
+/// (at most one for `u64`, two for `u128`, three or more for a boxed key).
+/// The counts come from the cache's own layout, never from caller input.
+fn debug_check_word_count(key: &str, words: &[u64], holds: fn(usize) -> bool) {
+    debug_assert!(
+        holds(words.len()),
+        "a {key} key cannot hold {} words",
+        words.len()
+    );
+}
+
 /// A packed key: inline `u64` (at most one word), inline `u128` (two
 /// words), or a boxed slice (three or more words).
 pub(super) trait PackedKey: Hash + Eq + Sized {
@@ -238,6 +250,7 @@ pub(super) trait PackedKey: Hash + Eq + Sized {
 
 impl PackedKey for u64 {
     fn from_words(words: &[u64]) -> Self {
+        debug_check_word_count("u64", words, |count| count <= 1);
         words.first().copied().unwrap_or_default()
     }
 
@@ -260,6 +273,7 @@ impl PackedKey for u64 {
 
 impl PackedKey for u128 {
     fn from_words(words: &[u64]) -> Self {
+        debug_check_word_count("u128", words, |count| count == 2);
         let low = words.first().copied().unwrap_or_default();
         let high = words.get(1).copied().unwrap_or_default();
         u128::from(low) | (u128::from(high) << 64)
@@ -284,6 +298,7 @@ impl PackedKey for u128 {
 
 impl PackedKey for Box<[u64]> {
     fn from_words(words: &[u64]) -> Self {
+        debug_check_word_count("boxed", words, |count| count >= 3);
         words.into()
     }
 

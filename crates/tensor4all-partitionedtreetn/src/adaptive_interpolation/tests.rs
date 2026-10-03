@@ -406,56 +406,158 @@ fn cache_split_moves_keys_without_re_encoding() {
     }
 }
 
+/// Every point of the grid whose coordinate at slot `i` ranges over
+/// `choices[i]`, first slot fastest.
+fn grid_points(choices: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    choices
+        .iter()
+        .fold(vec![Vec::new()], |points, slot_choices| {
+            slot_choices
+                .iter()
+                .flat_map(|&value| {
+                    points.iter().map(move |point| {
+                        let mut point = point.clone();
+                        point.push(value);
+                        point
+                    })
+                })
+                .collect()
+        })
+}
+
+/// Fill a cache over `dims` with the grid of `choices` (value: the point's
+/// index plus one half), split it at `slot`, and check that every child has
+/// the expected key type, keeps the parent's word count, holds exactly the
+/// points with its coordinate at `slot`, and returns each point's value.
+fn check_masked_split(dims: &[usize], choices: &[Vec<usize>], slot: usize, kind: usize) {
+    let points = grid_points(choices);
+    let mut cache = PatchCache::new(dims.to_vec());
+    for (index, point) in points.iter().enumerate() {
+        cache.insert(
+            cache.layout().encode(point.iter().copied()),
+            index as f64 + 0.5,
+        );
+    }
+    assert_eq!(cache.len(), points.len(), "the grid points are distinct");
+    assert_eq!(key_kind(&cache), kind);
+    let n_words = cache.layout().n_words();
+    let children = cache.split(slot);
+    assert_eq!(children.len(), dims[slot]);
+    for (coordinate, child) in children.iter().enumerate() {
+        assert_eq!(child.layout().n_words(), n_words, "keys are moved");
+        assert_eq!(key_kind(child), kind);
+        let inside: Vec<(usize, &Vec<usize>)> = points
+            .iter()
+            .enumerate()
+            .filter(|(_, point)| point[slot] == coordinate)
+            .collect();
+        assert_eq!(child.len(), inside.len(), "child {coordinate}");
+        for (index, point) in inside {
+            let mut rest = point.clone();
+            rest.remove(slot);
+            let key = child.layout().encode(rest.iter().copied());
+            assert_eq!(child.get(&key), Some(index as f64 + 0.5), "{point:?}");
+        }
+    }
+}
+
+#[test]
+fn cache_split_moves_two_word_keys_at_a_slot_in_the_second_word() {
+    // Words: [a (40 bits)], [b (40 bits), c (2 bits, shift 40), d (1 bit)].
+    // Removing c leaves two words, so the keys are moved, not re-encoded.
+    let big = 1usize << 40;
+    let layout = KeyLayout::new(vec![big, big, 3, 2]);
+    assert_eq!(layout.n_words(), 2);
+    check_masked_split(
+        &[big, big, 3, 2],
+        &[
+            vec![0, 1, big - 1],
+            vec![0, 5, big - 1],
+            vec![0, 1, 2],
+            vec![0, 1],
+        ],
+        2,
+        2,
+    );
+}
+
+#[test]
+fn cache_split_moves_wide_keys_at_a_slot_past_the_first_word() {
+    // Words: [a (43 bits)], [b (43 bits), c (2 bits, shift 43)], [d (43
+    // bits)]. Removing c leaves three words, so the boxed keys are moved.
+    let big = 1usize << 43;
+    let layout = KeyLayout::new(vec![big, big, 3, big]);
+    assert_eq!(layout.n_words(), 3);
+    check_masked_split(
+        &[big, big, 3, big],
+        &[
+            vec![0, 1, big - 1],
+            vec![0, 7, big - 1],
+            vec![0, 1, 2],
+            vec![0, big - 1],
+        ],
+        2,
+        3,
+    );
+}
+
 #[test]
 fn cache_split_re_encodes_only_when_a_word_is_freed() {
     // 129 binary sites need three words; 128 fit two, so the children are
     // re-encoded into the inline u128 key. Their children keep two words and
     // move their keys.
-    let dims = vec![2usize; 129];
-    let mut cache = PatchCache::new(dims.clone());
-    let points: Vec<Vec<usize>> = (0..40)
-        .map(|seed: usize| {
-            (0..129)
-                .map(|site| (seed * 7 + site * site) % 3 % 2)
+    let points: Vec<Vec<usize>> = (0..40u64)
+        .map(|seed| {
+            (0..129u64)
+                .map(|site| (mix64(seed * 1000 + site) & 1) as usize)
                 .collect()
         })
         .collect();
-    let value = |p: &[usize]| {
-        p.iter()
-            .enumerate()
-            .map(|(i, &v)| (i * v) as f64)
-            .sum::<f64>()
-    };
-    for point in &points {
-        cache.insert(cache.layout().encode(point.iter().copied()), value(point));
+    let distinct: HashSet<&Vec<usize>> = points.iter().collect();
+    assert_eq!(distinct.len(), points.len());
+    let value = |index: usize| index as f64 + 0.5;
+    let mut cache = PatchCache::new(vec![2usize; 129]);
+    for (index, point) in points.iter().enumerate() {
+        cache.insert(cache.layout().encode(point.iter().copied()), value(index));
     }
-    let n_entries = cache.len();
+    assert_eq!(cache.len(), points.len());
     assert_eq!(key_kind(&cache), 3);
     let children = cache.split(64);
-    assert_eq!(
-        children.iter().map(PatchCache::len).sum::<usize>(),
-        n_entries
-    );
     for (coordinate, child) in children.iter().enumerate() {
         assert_eq!(child.layout().n_words(), 2);
         assert_eq!(key_kind(child), 2);
-        for point in points.iter().filter(|point| point[64] == coordinate) {
-            let mut rest = point.clone();
+        let inside: Vec<usize> = (0..points.len())
+            .filter(|&index| points[index][64] == coordinate)
+            .collect();
+        assert!(!inside.is_empty());
+        assert_eq!(child.len(), inside.len());
+        for index in inside {
+            let mut rest = points[index].clone();
             rest.remove(64);
             let key = child.layout().encode(rest.iter().copied());
-            assert_eq!(child.get(&key), Some(value(point)));
+            assert_eq!(child.get(&key), Some(value(index)));
         }
     }
-    let child = children.into_iter().next().unwrap();
-    let child_entries = child.len();
-    let grandchildren = child.split(0);
-    assert_eq!(
-        grandchildren.iter().map(PatchCache::len).sum::<usize>(),
-        child_entries
-    );
-    assert!(grandchildren
-        .iter()
-        .all(|grandchild| grandchild.layout().n_words() == 2 && key_kind(grandchild) == 2));
+
+    // The grandchildren of the first child (site 64 fixed to 0) split at the
+    // first remaining site, moving their two-word keys.
+    let grandchildren = children.into_iter().next().unwrap().split(0);
+    for (coordinate, grandchild) in grandchildren.iter().enumerate() {
+        assert_eq!(grandchild.layout().n_words(), 2);
+        assert_eq!(key_kind(grandchild), 2);
+        let inside: Vec<usize> = (0..points.len())
+            .filter(|&index| points[index][64] == 0 && points[index][0] == coordinate)
+            .collect();
+        assert!(!inside.is_empty());
+        assert_eq!(grandchild.len(), inside.len());
+        for index in inside {
+            let mut rest = points[index].clone();
+            rest.remove(64);
+            rest.remove(0);
+            let key = grandchild.layout().encode(rest.iter().copied());
+            assert_eq!(grandchild.get(&key), Some(value(index)));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
