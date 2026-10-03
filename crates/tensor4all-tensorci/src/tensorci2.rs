@@ -14,7 +14,8 @@ use tensor4all_core::{
     RrLUOptions, Scalar,
 };
 use tensor4all_simplett::{
-    tensor3_zeros, try_tensor3_zeros, SimpleTensorTrain, TTScalar, Tensor3, Tensor3Ops,
+    tensor3_zeros, try_tensor3_zeros, EinsumScalar, SimpleTensorTrain, TTScalar, Tensor3,
+    Tensor3Ops,
 };
 use tensor4all_tensorbackend::{solve_matrix, transpose, Matrix};
 
@@ -1518,7 +1519,7 @@ pub fn crossinterpolate2<T, F, B>(
     options: TCI2Options,
 ) -> Result<TCI2OptimizationResult<T>>
 where
-    T: Scalar + TTScalar + Default + MatrixLuciScalar,
+    T: Scalar + TTScalar + EinsumScalar + Default + MatrixLuciScalar,
     F: Fn(&MultiIndex) -> T,
     B: Fn(&[MultiIndex]) -> Vec<T>,
 {
@@ -1590,7 +1591,7 @@ where
 /// Returns [`TCIError::InvalidConfiguration`] for invalid algorithm options or
 /// [`TCIError::InvalidPivot`] when the input state has no pivots. It also
 /// forwards errors from two-site sweeps, tensor-train conversion, callback
-/// length validation, and final one-site cleanup.
+/// length validation, global pivot search, and final one-site cleanup.
 ///
 /// # Examples
 ///
@@ -1631,7 +1632,7 @@ pub fn optimize_with_finder<T, F, B, G>(
     finder: G,
 ) -> Result<TCI2OptimizationResult<T>>
 where
-    T: Scalar + TTScalar + Default + MatrixLuciScalar,
+    T: Scalar + TTScalar + EinsumScalar + Default + MatrixLuciScalar,
     F: Fn(&MultiIndex) -> T,
     B: Fn(&[MultiIndex]) -> Vec<T>,
     G: GlobalPivotFinder,
@@ -1742,7 +1743,7 @@ where
             j_set: tci.j_set.clone(),
         };
 
-        let global_pivots = finder.find_global_pivots(&input, &f, abs_tol, &mut rng);
+        let global_pivots = finder.find_global_pivots(&input, &f, abs_tol, &mut rng)?;
         let n_global = global_pivots.len();
         tci.add_global_pivots(&global_pivots)?;
         nglobal_pivots_history.push(n_global);

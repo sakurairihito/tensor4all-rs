@@ -67,6 +67,20 @@ The most important parameters:
 Do not infer convergence from `errors.last()` alone. Full convergence also
 requires no recent global pivots and a stable rank history.
 
+The default global pivot finder walks the residual `|f - tt|` from random
+starts, retaining each maximizing coordinate for the next coordinate scan.
+It repeats full sweeps until the residual stops increasing, exceeds ten times
+the acceptance threshold, or reaches 100 sweeps. The acceptance threshold is
+`abs_tol * tol_margin_global_search`, where `abs_tol` includes the configured
+error normalization. Tensor-train evaluations use a shared cache and batches
+of coordinate candidates.
+
+Custom `GlobalPivotFinder` implementations return `Result<Vec<MultiIndex>>`
+and require `T: Scalar + TTScalar + EinsumScalar`; use `Ok(pivots)` for a
+successful search. `optimize_with_finder` propagates search failures. The
+`EinsumScalar` bound also applies to `crossinterpolate2`, `integrate`, and
+the adaptive interpolation entry points that call them.
+
 ### Convergence diagnostics
 
 The `errors` vector tracks the normalized bond error after each half-sweep. The algorithm converges when:

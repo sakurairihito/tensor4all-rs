@@ -18,7 +18,7 @@ use tensor4all_core::{DynIndex, IdxTensor, MatrixLuciScalar, MultiIndex, Scalar,
 use tensor4all_itensorlike::TensorTrain;
 #[cfg(feature = "adaptive-hataori-mpi")]
 use tensor4all_simplett::Tensor3Ops;
-use tensor4all_simplett::{tensor3_from_data, SimpleTensorTrain, TTScalar};
+use tensor4all_simplett::{tensor3_from_data, EinsumScalar, SimpleTensorTrain, TTScalar};
 use tensor4all_tensorbackend::StorageScalar;
 use tensor4all_tensorci::{
     crossinterpolate2, TCI2OptimizationResult, TCI2Options, TCI2Termination, TensorCI2,
@@ -518,7 +518,14 @@ pub fn adaptiveinterpolate<T, F, B>(
     options: AdaptiveInterpolateOptions,
 ) -> Result<AdaptiveInterpolationResult<T>>
 where
-    T: Scalar + TTScalar + MatrixLuciScalar + TensorElement + StorageScalar + Default + Copy,
+    T: Scalar
+        + TTScalar
+        + EinsumScalar
+        + MatrixLuciScalar
+        + TensorElement
+        + StorageScalar
+        + Default
+        + Copy,
     F: Fn(&MultiIndex) -> T,
     B: Fn(&[MultiIndex]) -> Vec<T>,
 {
@@ -593,7 +600,15 @@ pub fn adaptiveinterpolate_in<T, F, B>(
     options: AdaptiveInterpolateOptions,
 ) -> Result<AdaptiveInterpolationResult<T>>
 where
-    T: Scalar + TTScalar + MatrixLuciScalar + TensorElement + StorageScalar + Default + Copy + Send,
+    T: Scalar
+        + TTScalar
+        + EinsumScalar
+        + MatrixLuciScalar
+        + TensorElement
+        + StorageScalar
+        + Default
+        + Copy
+        + Send,
     F: Fn(&MultiIndex) -> T + Send + Sync,
     B: Fn(&[MultiIndex]) -> Vec<T> + Send + Sync,
 {
@@ -677,6 +692,7 @@ where
     C: mpi::traits::Communicator,
     T: Scalar
         + TTScalar
+        + EinsumScalar
         + MatrixLuciScalar
         + TensorElement
         + StorageScalar
@@ -857,7 +873,14 @@ fn process_patch<T, F, B>(
     options: &AdaptiveInterpolateOptions,
 ) -> Result<PatchOutcome<T>>
 where
-    T: Scalar + TTScalar + MatrixLuciScalar + TensorElement + StorageScalar + Default + Copy,
+    T: Scalar
+        + TTScalar
+        + EinsumScalar
+        + MatrixLuciScalar
+        + TensorElement
+        + StorageScalar
+        + Default
+        + Copy,
     F: Fn(&MultiIndex) -> T,
     B: Fn(&[MultiIndex]) -> Vec<T>,
 {
